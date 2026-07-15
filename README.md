@@ -1,8 +1,8 @@
 # ABSOLOOP
 
-**Verifier-first AI looping system** — bounded, auditable repair loops for
-`claude` and `codex`, where only a real shell command exiting 0 (plus an
-independent critic and a human gate) can end the mission.
+**Bounded AI looping system** — auditable repair loops for `claude` and
+`codex`, where a mission ends only when the builder reports it done with
+evidence, an independent critic finds no blocking issue, and you approve.
 
 > Private BLERBZ tooling. Blueprint: `ABSOLOOP_AI_LOOPER_SYSTEM.md` (kept
 > outside this repo).
@@ -10,17 +10,17 @@ independent critic and a human gate) can end the mission.
 ## How it works
 
 ```
-objective + verifier ──► /goal contract ──► iterate: builder → verifier
-                                                 │ (escalating thinking depth)
-                                                 ▼
-                              pass ──► clean re-run ► integrity ► critic ► human gate
-                                                 ▼
-                                             delivery (git / local / out)
+objective ──► /goal contract ──► iterate: builder works, reports done? 
+                                      │ (escalating thinking depth)
+                                      ▼
+                     done ──► integrity ► critic ► human gate
+                                      ▼
+                            delivery (git / local / out)
 ```
 
-- **Verifier-first** — the loop is over only when your command exits 0 twice
-  in a row on identical state. Effort, narratives, and plausible diffs count
-  for nothing.
+- **Evidence-gated** — a "done" claim counts only when it survives the
+  independent critic's inspection of the working tree and your approval.
+  Effort, narratives, and plausible diffs count for nothing.
 - **Adversarial acceptance** — an independent read-only critic tries to
   disprove the result; weakened tests are an automatic rejection.
 - **Bounded** — hard caps on iterations, wall clock, and dollars, with
@@ -54,7 +54,7 @@ run the command.
 One shot — scaffold and start the loop, no prompts:
 
 ```
-absoloop my-mission -o "Make all tests pass" -v "pytest -q" -d local --start
+absoloop my-mission -o "Make all tests pass" -d local --start
 ```
 
 Anything you omit is prompted for:
@@ -62,8 +62,8 @@ Anything you omit is prompted for:
 ```
 absoloop --help
 absoloop              # fully interactive (asks name, confirms, then mission)
-absoloop my-mission   # no confirmation; prompts for objective + verifier +
-                        # delivery, then offers to start the loop immediately
+absoloop my-mission   # no confirmation; prompts for objective + delivery,
+                        # then offers to start the loop immediately
 absoloop .            # adopt the directory you are already in
 ```
 
@@ -96,13 +96,13 @@ absoloop resume --extend        # follow-on run: fresh budgets, prior work as co
 ## The /goal contract
 
 Every mission gets a deterministic, programmatically generated goal definition
-(`.absoloop/goal.md`) built from the objective + verifier: the objective is
-classified (tests / bugfix / feature / refactor / perf / docs), which selects a
-tailored definition of done, strategy ladder, **and thinking escalation
-ladder**. The contract is embedded in every iteration prompt as ground truth
-for both engines, and the generation is validated — an empty objective,
-unrunnable verifier, or malformed/de-escalating ladder is flagged (and a
-broken ladder is never rendered into the contract).
+(`.absoloop/goal.md`) built from the objective: the objective is classified
+(tests / bugfix / feature / refactor / perf / docs), which selects a tailored
+definition of done, strategy ladder, **and thinking escalation ladder**. The
+contract is embedded in every iteration prompt as ground truth for both
+engines, and the generation is validated — an empty objective or a
+malformed/de-escalating ladder is flagged (and a broken ladder is never
+rendered into the contract).
 
 Long-thinking loops are driven by the generated **thinking escalation ladder**
 (`thinking_ladder` in `.absoloop/runtime.json` — the single source of truth
@@ -124,7 +124,7 @@ rebuild, or validate the contract:
 ```
 absoloop goal           # print the mission's /goal contract
 absoloop goal --regen   # regenerate it from .absoloop/runtime.json
-absoloop goal --check   # validate objective/verifier/delivery/ladder; exit 1 on problems
+absoloop goal --check   # validate objective/delivery/ladder; exit 1 on problems
 ```
 
 ## Delivery — where accepted work lands
@@ -145,7 +145,7 @@ Re-run delivery any time with `python scripts/absoloop-run --deliver-only`.
 
 ```
 absoloop status   # budgets (with progress bars), delivery, latest artifacts
-absoloop report   # agent runs with cost + summaries, verifier pass/fail,
+absoloop report   # agent runs with cost + summaries, done claims,
                   # critic verdicts, gates, delivery
 ```
 

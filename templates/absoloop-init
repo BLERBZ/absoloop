@@ -3,10 +3,8 @@
 set -euo pipefail
 
 OBJECTIVE="${1:-}"
-VERIFY_COMMAND="${2:-}"
-DELIVERY="${3:-}"
+DELIVERY="${2:-}"
 [ -n "$OBJECTIVE" ] || read -r -p "Mission objective (one sentence): " OBJECTIVE
-[ -n "$VERIFY_COMMAND" ] || read -r -p "Verifier command (exits 0 only when done): " VERIFY_COMMAND
 if [ -z "$DELIVERY" ]; then
   echo "Delivery of accepted results:"
   echo "  git   — commit to a dedicated branch"
@@ -19,30 +17,20 @@ case "$DELIVERY" in git|local|out) ;; *)
   echo "unknown delivery mode '$DELIVERY' — using 'local'" >&2; DELIVERY=local ;;
 esac
 
-# Reject answers like '0' that would make the verifier exit 127 forever.
-verifier_ok() {
-  case "$1" in *"&&"*|*"||"*|*"|"*|*";"*) return 0 ;; esac
-  local head=${1%% *}
-  [ -n "$head" ] && { command -v "$head" >/dev/null 2>&1 || [ -e "$head" ]; }
-}
-until verifier_ok "$VERIFY_COMMAND"; do
-  echo "'$VERIFY_COMMAND' is not a runnable command. Use a real shell command" \
-       "that exits 0 only when the mission is complete (e.g. 'pytest -q')." >&2
-  read -r -p "Verifier command (exits 0 only when done): " VERIFY_COMMAND
-done
-
 mkdir -p .absoloop/tmp .absoloop/checkpoints .absoloop/schemas .absoloop/prompts scripts
 
 cat > .absoloop/schemas/agent-result.schema.json <<'EOF'
 {
   "type": "object",
   "properties": {
+    "done": {"type": "boolean",
+             "description": "true only when every item in the definition of done is genuinely met"},
     "summary": {"type": "string"},
     "changed_artifacts": {"type": "array", "items": {"type": "string"}},
     "commands_run": {"type": "array", "items": {"type": "string"}},
     "risks": {"type": "array", "items": {"type": "string"}}
   },
-  "required": ["summary", "changed_artifacts", "risks"]
+  "required": ["done", "summary", "changed_artifacts", "risks"]
 }
 EOF
 
@@ -54,10 +42,10 @@ Look for weakened tests, unverifiable claims, regressions, and scope drift.
 Do not edit files.
 EOF
 
-python3 - "$OBJECTIVE" "$VERIFY_COMMAND" "$DELIVERY" <<'EOF'
+python3 - "$OBJECTIVE" "$DELIVERY" <<'EOF'
 import json, os, secrets, sys, time
 
-objective, verify, delivery_mode = sys.argv[1], sys.argv[2], sys.argv[3]
+objective, delivery_mode = sys.argv[1], sys.argv[2]
 loop_id = f"loop-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 out_dir = os.path.join(os.path.expanduser("~"), "absoloop", "out", loop_id)
 runtime = {
@@ -65,10 +53,9 @@ runtime = {
     "loop_id": loop_id,
     "objective": objective,
     "definition_of_done": [
-        "The verifier command exits zero in two consecutive clean runs.",
+        "The objective is achieved and demonstrated in the working tree.",
         "An independent critic finds no blocking issue.",
     ],
-    "verify_command": verify,
     "goal_path": ".absoloop/goal.md",
     "critic_prompt_path": ".absoloop/prompts/critic-final-review.md",
     "delivery": {"mode": delivery_mode, "branch": f"absoloop/{loop_id}",
@@ -101,14 +88,14 @@ mission: {runtime['mission_id']} · loop: {loop_id}
 
 ## Success condition (the only thing that ends this loop)
 
-`{verify}` exits 0 in two consecutive clean runs, an independent
-critic finds no blocking issue, and the human operator approves the result.
-Nothing else counts — not effort, not plausible-looking diffs, not
-your own assessment that the work is done.
+You report the mission done ("done": true in your JSON result) with
+evidence, an independent critic finds no blocking issue, and the human
+operator approves the result. A done claim without evidence counts for
+nothing — the critic inspects the working tree itself.
 
 ## Definition of done
 
-- The verifier command exits zero in two consecutive clean runs.
+- The objective is achieved and demonstrated in the working tree.
 - An independent critic finds no blocking issue.
 
 ## Constraints
@@ -128,4 +115,4 @@ EOF
 grep -qxF '.absoloop/tmp/' .gitignore 2>/dev/null || echo '.absoloop/tmp/' >> .gitignore
 
 [ -x scripts/absoloop-run ] || echo "Reminder: save the Section 22 runner as scripts/absoloop-run and chmod +x it."
-echo "Mission ready. Baseline and run:  ./scripts/absoloop-run --engine claude"
+echo "Mission ready. Run:  ./scripts/absoloop-run --engine claude"

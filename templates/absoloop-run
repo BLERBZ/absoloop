@@ -48,8 +48,8 @@ DEFAULT_THINKING_LADDER: list[dict[str, Any]] = [
     {"repeats": "3+ (final window)", "claude_keyword": "ultrathink",
      "claude_thinking_tokens": 31999, "codex_effort": "high", "budget_scale": 2.0,
      "posture": "Final window before the loop blocks. Step back to first "
-                "principles, question the verifier's assumptions, and say so in "
-                "your summary if the mission needs operator input."},
+                "principles, question your assumptions about the mission, and say "
+                "so in your summary if the mission needs operator input."},
 ]
 
 CODEX_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
@@ -87,11 +87,9 @@ class State:
     started_at: float = 0.0
     cost_usd: float = 0.0
     inexact_cost_events: int = 0
-    baseline_done: bool = False
     last_failure_fingerprint: str | None = None
     repeated_failure_count: int = 0
     latest_agent_result: str | None = None
-    latest_verifier_log: str | None = None
     latest_critic_findings: str | None = None
     latest_checkpoint: str | None = None
     stop_reason: str | None = None
@@ -115,7 +113,7 @@ def say(message: str) -> None:
 @contextlib.contextmanager
 def heartbeat(label: str, interval: float = 30.0):
     """Print a periodic heartbeat while a long blocking step runs, so a slow
-    agent or verifier never looks like a hang."""
+    agent or check never looks like a hang."""
     started = time.time()
     done = threading.Event()
 
@@ -182,7 +180,7 @@ def checkpoint(state: State, label: str) -> None:
 
 
 def normalized_fingerprint(text: str) -> str:
-    # Replace volatile-looking tokens before hashing. Extend for your verifier.
+    # Replace volatile-looking tokens before hashing.
     normalized_lines: list[str] = []
     for line in text.splitlines():
         line = line.strip()
@@ -195,12 +193,27 @@ def normalized_fingerprint(text: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+def tree_fingerprint() -> str | None:
+    """Fingerprint of the working tree's uncommitted state, used to detect
+    iterations that change nothing. None when git cannot answer."""
+    if not shutil.which("git"):
+        return None
+    status = subprocess.run(["git", "status", "--porcelain", "-uall"], cwd=ROOT,
+                            text=True, capture_output=True, check=False)
+    if status.returncode != 0:
+        return None
+    diff = subprocess.run(["git", "diff"], cwd=ROOT,
+                          text=True, capture_output=True, check=False)
+    combined = status.stdout + "\n" + diff.stdout
+    return hashlib.sha256(combined.encode("utf-8")).hexdigest()[:16]
+
+
 def run_command(command: str, log_path: pathlib.Path, timeout: int,
-                label: str = "verifier") -> subprocess.CompletedProcess[str]:
+                label: str = "check") -> subprocess.CompletedProcess[str]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     say(f"{label}: $ {command}")
     started = time.time()
-    # Verifier commands run under bash where available (macOS/Linux, Git Bash
+    # Check commands run under bash where available (macOS/Linux, Git Bash
     # on Windows); otherwise fall back to the platform shell (cmd.exe).
     bash = shutil.which("bash")
     argv: list[str] | str = [bash, "-lc", command] if bash else command
@@ -218,7 +231,7 @@ def run_command(command: str, log_path: pathlib.Path, timeout: int,
             )
     except subprocess.TimeoutExpired as exc:
         output = (exc.stdout or "") + "\n" + (exc.stderr or "")
-        log_path.write_text(output + "\nVERIFIER_TIMEOUT\n", encoding="utf-8")
+        log_path.write_text(output + "\nCHECK_TIMEOUT\n", encoding="utf-8")
         say(f"{label}: TIMED OUT after {timeout}s (log: {log_path.relative_to(ROOT)})")
         return subprocess.CompletedProcess(command, 124, exc.stdout or "", exc.stderr or "timeout")
 
@@ -239,19 +252,32 @@ def run_command(command: str, log_path: pathlib.Path, timeout: int,
     return result
 
 
-def say_agent_message(out_path: pathlib.Path, label: str) -> None:
-    """Pass the agent's own English report through to the console, so the
-    operator sees what it says it did — not just exit codes and cost.
+def agent_structured(out_path: pathlib.Path) -> dict[str, Any] | None:
+    """The agent's structured result, whichever engine produced it.
     Handles both shapes: claude's CLI payload (structured_output/result) and
     codex's ``-o`` file, which is the structured result itself."""
     try:
         payload = json.loads(out_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return
+        return None
     if not isinstance(payload, dict):
-        return
+        return None
     structured = payload.get("structured_output")
-    structured = structured if isinstance(structured, dict) else payload
+    return structured if isinstance(structured, dict) else payload
+
+
+def say_agent_message(out_path: pathlib.Path, label: str) -> None:
+    """Pass the agent's own English report through to the console, so the
+    operator sees what it says it did — not just exit codes and cost."""
+    structured = agent_structured(out_path)
+    if structured is None:
+        return
+    try:
+        payload = json.loads(out_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
     message = structured.get("summary")
     if not (isinstance(message, str) and message.strip()):
         message = payload.get("result")
@@ -276,8 +302,9 @@ def load_goal(runtime: dict[str, Any]) -> str:
     return (
         f"# /goal — {runtime['objective']}\n\n"
         "## Success condition (the only thing that ends this loop)\n\n"
-        f"`{runtime['verify_command']}` exits 0 in two consecutive clean runs and "
-        "an independent critic finds no blocking issue. Nothing else counts.\n\n"
+        "You report the mission done (\"done\": true in your JSON result), an "
+        "independent critic finds no blocking issue, and the human operator "
+        "approves the result.\n\n"
         "## Definition of done\n\n"
         + "\n".join(f"- {item}" for item in runtime.get("definition_of_done", []))
         + "\n"
@@ -287,13 +314,16 @@ def load_goal(runtime: dict[str, Any]) -> str:
 def build_iteration_prompt(
     runtime: dict[str, Any],
     state: State,
-    verifier_log: pathlib.Path | None,
     engine: str,
 ) -> str:
-    previous_failure = "No previous verifier failure; establish the baseline."
-    if verifier_log is not None and verifier_log.is_file():
-        raw = verifier_log.read_text(encoding="utf-8", errors="replace")
-        previous_failure = raw[-12000:]
+    previous_work = "This is the first iteration — start from the mission goal."
+    if state.latest_agent_result:
+        structured = agent_structured(ROOT / state.latest_agent_result)
+        if structured:
+            previous_work = (
+                "Where the previous iteration left off (its own report):\n"
+                + json.dumps(structured, indent=2)[:12000]
+            )
 
     critic_block = ""
     if state.latest_critic_findings:
@@ -343,20 +373,25 @@ Iteration: {state.iteration} of {runtime['max_iterations']} \
 ({runtime['max_iterations'] - state.iteration} remaining)
 Repeated failure count: {state.repeated_failure_count}
 
-## Current verifier evidence
+## Where the mission stands
 
-{previous_failure}
+{previous_work}
 {critic_block}{feedback_block}
 ## Required procedure
 
 1. Read the project instructions and the goal contract above.
-2. Inspect the failure before editing.
+2. Inspect the current state of the working tree before editing.
 3. Choose one bounded strategy from the goal contract's strategy ladder that
    differs from any failed repeated strategy.
 4. Make only the smallest authorized changes needed for this iteration.
-5. Run a focused check when available, but do not claim final completion.
+5. Run a focused check when available (tests, a build, the program itself)
+   and record what you ran and what it showed.
 6. Never weaken tests or acceptance criteria.
-7. Return schema-valid JSON with changed artifacts, commands, evidence, risks, and a concise decision summary.
+7. Return schema-valid JSON with changed artifacts, commands, evidence, risks,
+   and a concise decision summary. Set "done": true ONLY when every item in
+   the definition of done is genuinely met — an independent critic will
+   inspect the working tree and reject unearned claims. Otherwise set
+   "done": false and say what remains.
 
 Do not push, publish, deploy, or perform destructive/external actions —
 delivery is handled by the loop after acceptance, per the goal contract.
@@ -542,24 +577,20 @@ def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None
 
 
 def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict[str, Any] | None, AgentRun]:
-    """Independent read-only review. The critic sees the contract and verifier
-    evidence, never the builder's narrative (Section 14.2)."""
+    """Independent read-only review. The critic sees the contract, never the
+    builder's narrative — it must gather its own evidence from the tree."""
     prompt_path = ROOT / runtime["critic_prompt_path"]
     base = prompt_path.read_text(encoding="utf-8") if prompt_path.is_file() else (
         "You are an independent adversarial reviewer. Attempt to disprove that the\n"
         "current working tree satisfies the mission contract. Do not edit files."
     )
-    verifier_tail = ""
-    if state.latest_verifier_log:
-        log = ROOT / state.latest_verifier_log
-        if log.is_file():
-            verifier_tail = log.read_text(encoding="utf-8", errors="replace")[-8000:]
     prompt = (
         f"{base}\n\n"
         f"Mission objective: {runtime['objective']}\n"
         f"Definition of done: {json.dumps(runtime['definition_of_done'], indent=2)}\n\n"
-        f"Latest verifier evidence:\n{verifier_tail}\n\n"
-        "Inspect the working tree yourself; do not trust any builder narrative.\n"
+        "The builder claims the mission is done. Inspect the working tree "
+        "yourself and run read-only checks (tests, builds, the program) to "
+        "confirm or refute that claim; do not trust any builder narrative.\n"
         "Return JSON with recommendation (PASS, HOLD, or REJECT), blocking_findings, and summary."
     )
 
@@ -592,27 +623,17 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
 
 
 def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
-                     verifier_timeout: int) -> tuple[str, str] | None:
-    """Layered acceptance: clean re-verification, integrity check, independent
-    critic, then the human gate. Returns (stop_reason, terminal_status) when the
-    mission should stop, or None when the repair loop should continue."""
+                     check_timeout: int) -> tuple[str, str] | None:
+    """Layered acceptance: optional integrity check, independent critic, then
+    the human gate. Returns (stop_reason, terminal_status) when the mission
+    should stop, or None when the repair loop should continue."""
     state.status = "FINAL_REVIEW"
-    say("verifier passed — entering final acceptance (clean re-run, integrity, critic)")
-
-    rerun_log = TMP / f"iteration-{state.iteration:04d}-verify-rerun.log"
-    rerun = run_command(runtime["verify_command"], rerun_log, verifier_timeout,
-                        label="verifier re-run")
-    append_ledger({"type": "verification_rerun", "iteration": state.iteration,
-                   "exit_code": rerun.returncode})
-    if rerun.returncode != 0:
-        # A pass followed by a fail on identical state means the verifier is
-        # flaky and cannot support acceptance until re-baselined (Section 27.2).
-        return "verifier_flaky", "BLOCKED"
+    say("builder reports done — entering final acceptance (integrity, critic)")
 
     integrity_command = runtime.get("integrity_command")
     if integrity_command:
         integrity_log = TMP / f"iteration-{state.iteration:04d}-integrity.log"
-        integrity = run_command(integrity_command, integrity_log, verifier_timeout)
+        integrity = run_command(integrity_command, integrity_log, check_timeout)
         append_ledger({"type": "integrity_check", "iteration": state.iteration,
                        "exit_code": integrity.returncode})
         if integrity.returncode != 0:
@@ -689,7 +710,6 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
         f"# ABSOLOOP report — {state.mission_id} ({runtime.get('loop_id', 'no loop id')})",
         "",
         f"- objective: {runtime.get('objective', '')}",
-        f"- verifier: `{runtime.get('verify_command', '')}`",
         f"- status: **{state.status}**"
         + (f" (stop reason: {state.stop_reason})" if state.stop_reason else ""),
         f"- iterations: {state.iteration} of {runtime.get('max_iterations', '?')}",
@@ -713,9 +733,9 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
             continue
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(event.get("ts", 0)))
         kind = event.get("type")
-        if kind == "verification":
-            outcome = "PASS" if event.get("exit_code") == 0 else f"FAIL (exit {event.get('exit_code')})"
-            lines.append(f"- {ts} — iteration {event.get('iteration')}: verifier {outcome}")
+        if kind == "iteration":
+            outcome = "builder reports DONE" if event.get("done") else "not done yet"
+            lines.append(f"- {ts} — iteration {event.get('iteration')}: {outcome}")
         elif kind == "agent_run":
             lines.append(f"- {ts} — {event.get('engine')} run: exit {event.get('exit_code')}, "
                          f"${float(event.get('cost_usd', 0)):.2f}, "
@@ -728,7 +748,6 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
             lines.append(f"- {ts} — stop: {event.get('status')} ({event.get('reason')})")
     lines += ["", "## Pointers", ""]
     for key, label in (("latest_agent_result", "latest agent result"),
-                       ("latest_verifier_log", "latest verifier log"),
                        ("latest_critic_findings", "latest critic findings")):
         value = getattr(state, key)
         if value:
@@ -824,7 +843,7 @@ def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int
         return 0
     if status == "AWAITING_APPROVAL":
         # Every automated gate passed; human approval still required.
-        say("next: review the diff and verifier log, then 'absoloop approve' to "
+        say("next: review the diff, then 'absoloop approve' to "
             "accept, or 'absoloop reject \"what to change\"' to answer the agent "
             "and 'absoloop resume' to continue the loop")
         return 3
@@ -871,10 +890,9 @@ def main() -> int:
         return 3
 
     max_wall = float(runtime["max_wall_seconds"])
-    verifier_timeout = min(900, int(max_wall))
+    check_timeout = min(900, int(max_wall))
 
     say(f"mission {state.mission_id}: {runtime['objective']}")
-    say(f"verifier: $ {runtime['verify_command']}")
     say(f"budgets: {runtime['max_iterations']} iterations, ${runtime['max_cost_usd']:.2f}, "
         f"{int(max_wall)}s wall clock")
     goal_path = ROOT / runtime.get("goal_path", ".absoloop/goal.md")
@@ -886,27 +904,7 @@ def main() -> int:
                        "local": "working tree, unstaged"}.get(delivery.get("mode", "local"), "?")
     say(f"delivery on acceptance: {delivery.get('mode', 'local')} ({delivery_detail})")
 
-    # Baseline before any model spend (Section 9.3). If the mission is already
-    # green, acceptance still requires the integrity check and the critic.
-    if not state.baseline_done:
-        baseline_log = TMP / "iteration-0000-baseline.log"
-        baseline = run_command(runtime["verify_command"], baseline_log, verifier_timeout,
-                               label="baseline verifier")
-        state.baseline_done = True
-        state.latest_verifier_log = str(baseline_log.relative_to(ROOT))
-        append_ledger({"type": "baseline", "exit_code": baseline.returncode,
-                       "log": state.latest_verifier_log})
-        checkpoint(state, "baseline")
-        if baseline.returncode == 127:
-            # The verifier itself cannot run (command not found). Iterating
-            # would burn the whole budget with no chance of ever passing.
-            say("the verifier command does not exist — fix verify_command in "
-                ".absoloop/runtime.json before restarting the loop")
-            return stop(state, "verifier_command_not_found", "BLOCKED", runtime)
-        if baseline.returncode == 0:
-            verdict = final_acceptance(runtime, state, args.engine, verifier_timeout)
-            if verdict is not None:
-                return stop(state, *verdict, runtime)
+    last_tree = tree_fingerprint()
 
     while state.iteration < int(runtime["max_iterations"]):
         if time.time() - state.started_at >= max_wall:
@@ -914,17 +912,13 @@ def main() -> int:
         if state.cost_usd >= float(runtime["max_cost_usd"]):
             return stop(state, "cost_budget", "BUDGET_EXHAUSTED", runtime)
 
-        # Re-read the mission config so an operator (or builder) fix to
-        # verify_command or budgets takes effect on the next iteration instead
-        # of being silently ignored for the rest of the run.
+        # Re-read the mission config so an operator fix to budgets takes
+        # effect on the next iteration instead of being silently ignored for
+        # the rest of the run.
         try:
-            fresh = json.loads(RUNTIME_PATH.read_text(encoding="utf-8"))
-            if fresh.get("verify_command") != runtime.get("verify_command"):
-                say(f"runtime.json changed on disk — verifier is now: "
-                    f"$ {fresh.get('verify_command')}")
-            runtime = fresh
+            runtime = json.loads(RUNTIME_PATH.read_text(encoding="utf-8"))
             max_wall = float(runtime["max_wall_seconds"])
-            verifier_timeout = min(900, int(max_wall))
+            check_timeout = min(900, int(max_wall))
         except (OSError, json.JSONDecodeError):
             say("warning: runtime.json unreadable right now — keeping previous config")
 
@@ -935,12 +929,7 @@ def main() -> int:
             f"spent ${state.cost_usd:.2f} of ${float(runtime['max_cost_usd']):.2f}, "
             f"{int(max_wall - (time.time() - state.started_at))}s wall clock left")
 
-        previous_log = (
-            ROOT / state.latest_verifier_log
-            if state.latest_verifier_log
-            else None
-        )
-        prompt = build_iteration_prompt(runtime, state, previous_log, args.engine)
+        prompt = build_iteration_prompt(runtime, state, args.engine)
         prompt_path = TMP / f"iteration-{state.iteration:04d}-prompt.md"
         prompt_path.write_text(prompt, encoding="utf-8")
         if state.human_feedback:
@@ -995,42 +984,41 @@ def main() -> int:
             append_ledger({"type": "bounded_agent_failure", "iteration": state.iteration,
                            "exit_code": run.exit_code, "limit_reached": run.limit_reached})
 
-        state.status = "VERIFYING"
-        verifier_log = TMP / f"iteration-{state.iteration:04d}-verify.log"
-        verification = run_command(runtime["verify_command"], verifier_log, verifier_timeout)
-        state.latest_verifier_log = str(verifier_log.relative_to(ROOT))
-
+        structured = agent_structured(result_path)
+        builder_done = (run.exit_code == 0 and not run.limit_reached
+                        and isinstance(structured, dict)
+                        and structured.get("done") is True)
         append_ledger({
-            "type": "verification",
+            "type": "iteration",
             "iteration": state.iteration,
-            "exit_code": verification.returncode,
-            "log": state.latest_verifier_log,
+            "done": builder_done,
         })
 
-        if verification.returncode == 0:
-            checkpoint(state, "verified")
-            verdict = final_acceptance(runtime, state, args.engine, verifier_timeout)
+        if builder_done:
+            checkpoint(state, "builder-done")
+            verdict = final_acceptance(runtime, state, args.engine, check_timeout)
             if verdict is not None:
                 return stop(state, *verdict, runtime)
             checkpoint(state, "critic-hold")
             continue  # critic HOLD: findings feed the next repair iteration
 
-        if verification.returncode == 127:
-            say("the verifier command does not exist — fix verify_command in "
-                ".absoloop/runtime.json before restarting the loop")
-            return stop(state, "verifier_command_not_found", "BLOCKED", runtime)
-
-        failure_text = verifier_log.read_text(encoding="utf-8", errors="replace")
-        fingerprint = normalized_fingerprint(failure_text)
-        if fingerprint == state.last_failure_fingerprint:
+        # No-progress detection: an iteration that neither finishes the
+        # mission nor changes the working tree is a stall. Repeated stalls
+        # climb the thinking ladder and eventually block the loop.
+        current_tree = tree_fingerprint()
+        if current_tree is None and isinstance(structured, dict):
+            current_tree = normalized_fingerprint(str(structured.get("summary", "")))
+        if current_tree is not None and current_tree == last_tree:
             state.repeated_failure_count += 1
-            say(f"same failure as last iteration ({state.repeated_failure_count} in a row; "
-                f"loop stops at {runtime['no_progress_window']})")
+            state.last_failure_fingerprint = current_tree
+            say(f"no changes made this iteration ({state.repeated_failure_count} "
+                f"stalled in a row; loop stops at {runtime['no_progress_window']})")
         else:
-            state.repeated_failure_count = 1
-            state.last_failure_fingerprint = fingerprint
+            state.repeated_failure_count = 0
+            state.last_failure_fingerprint = current_tree
+        last_tree = current_tree
 
-        checkpoint(state, "post-verifier")
+        checkpoint(state, "post-iteration")
 
         if state.repeated_failure_count >= int(runtime["no_progress_window"]):
             return stop(state, "no_progress_window", "BLOCKED", runtime)

@@ -22,8 +22,8 @@ TEMPLATES = ABSOLOOP_HOME / "templates"
 EPILOG = """\
 examples:
   absoloop                      # fully interactive
-  absoloop my-mission           # prompts only for objective + verifier
-  absoloop my-mission -o "Make all tests pass" -v "pytest -q" --start
+  absoloop my-mission           # prompts only for the objective
+  absoloop my-mission -o "Make all tests pass" --start
                                   # one shot: scaffold and start the loop
   absoloop existing-project     # adopts an existing directory in place
   absoloop .                    # adopt the directory you are already in
@@ -47,7 +47,7 @@ examples:
 
 New directories are scaffolded; existing ones are adopted — ABSOLOOP files
 are added only where missing, and an existing .absoloop/runtime.json is
-reused (pass -o/-v to update the mission in place).
+reused (pass -o to update the mission in place).
 
 Runner exit codes: 0 = completed, 3 = accepted & awaiting your approval,
 2 = stopped safely (see stop_reason in the printed state).
@@ -64,12 +64,15 @@ Do not edit files.
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
+        "done": {"type": "boolean",
+                 "description": "true only when every item in the definition "
+                                "of done is genuinely met"},
         "summary": {"type": "string"},
         "changed_artifacts": {"type": "array", "items": {"type": "string"}},
         "commands_run": {"type": "array", "items": {"type": "string"}},
         "risks": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["summary", "changed_artifacts", "risks"],
+    "required": ["done", "summary", "changed_artifacts", "risks"],
 }
 
 # ---------------------------------------------------------------------------
@@ -98,9 +101,9 @@ def new_loop_id() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Goal engine — turn (objective, verifier) into a /goal contract the loop
-# feeds to claude/codex every iteration, tuned per mission type so long
-# thinking loops spend their depth on the right things.
+# Goal engine — turn the objective into a /goal contract the loop feeds to
+# claude/codex every iteration, tuned per mission type so long thinking loops
+# spend their depth on the right things.
 # ---------------------------------------------------------------------------
 
 MISSION_PROFILES = {
@@ -108,7 +111,7 @@ MISSION_PROFILES = {
         "keywords": ("test", "pytest", "jest", "vitest", "spec", "coverage",
                      "unit test", "e2e", "regression"),
         "done": [
-            "Every test in the verifier's scope passes; no test is skipped, "
+            "Every test in the mission's scope passes; no test is skipped, "
             "deleted, or weakened to get there.",
         ],
         "strategies": [
@@ -144,20 +147,20 @@ MISSION_PROFILES = {
             "Study existing patterns in the codebase and extend them rather "
             "than inventing parallel structures.",
             "Build the thinnest end-to-end slice first, verify it, then deepen.",
-            "Wire the feature into the verifier's path early so progress is "
-            "measurable every iteration.",
+            "Exercise the feature with a real command or test early so progress "
+            "is demonstrable every iteration.",
         ],
     },
     "refactor": {
         "keywords": ("refactor", "clean", "simplif", "restructure", "migrat",
                      "rename", "extract", "consolidat", "moderniz"),
         "done": [
-            "Behavior is unchanged — the verifier passes before and after, and "
-            "no public contract was altered without the mission saying so.",
+            "Behavior is unchanged — the project's checks pass before and after, "
+            "and no public contract was altered without the mission saying so.",
         ],
         "strategies": [
-            "Confirm the verifier is green on the untouched baseline before "
-            "moving anything.",
+            "Confirm the project's checks are green on the untouched baseline "
+            "before moving anything.",
             "Refactor in small, individually-verifiable steps; never combine a "
             "behavior change with a structural move.",
         ],
@@ -166,8 +169,8 @@ MISSION_PROFILES = {
         "keywords": ("performance", "speed", "optimi", "faster", "latency",
                      "memory", "throughput"),
         "done": [
-            "The measured improvement is demonstrated by the verifier, not "
-            "asserted from reading the code.",
+            "The measured improvement is demonstrated by a recorded measurement, "
+            "not asserted from reading the code.",
         ],
         "strategies": [
             "Measure before optimizing; keep the measurement command in the "
@@ -191,12 +194,13 @@ MISSION_PROFILES = {
 
 GOAL_CONSTRAINTS = [
     "Never weaken, skip, or delete tests or acceptance criteria to make the "
-    "verifier pass — that is mission failure, not success.",
-    "Make the smallest authorized change that moves the verifier toward zero; "
+    "mission look done — that is mission failure, not success.",
+    "Make the smallest authorized change that moves the mission forward; "
     "avoid opportunistic edits outside the mission.",
     "Do not push, publish, deploy, or perform destructive or external actions "
     "— delivery is handled by the loop after acceptance.",
-    "Do not claim completion; only the verifier, critic, and human gate decide.",
+    "Report \"done\": true only with evidence; the critic and human gate make "
+    "the final call.",
 ]
 
 # Canonical thinking rungs, shallow → deep. claude_thinking_tokens becomes the
@@ -220,8 +224,8 @@ THINKING_RUNGS = [
     {"claude_keyword": "ultrathink", "claude_thinking_tokens": 31999,
      "codex_effort": "high", "budget_scale": 2.0,
      "posture": "Last chance before the loop blocks. Step back to first "
-                "principles, question the verifier's assumptions, and consider "
-                "whether the mission needs operator input."},
+                "principles, question your assumptions about the mission, and "
+                "consider whether it needs operator input."},
 ]
 
 REPEAT_LABELS = ["0 (fresh evidence)", "1 (first repeat)",
@@ -255,11 +259,10 @@ def classify_mission(objective: str) -> list[str]:
 def generate_goal_markdown(config: dict) -> str:
     """Render the mission's /goal contract from its runtime config.
 
-    Deterministic and self-contained: everything is derived from the objective,
-    verifier, and delivery mode, so the same mission always yields the same
-    contract and the runner can trust it as ground truth."""
+    Deterministic and self-contained: everything is derived from the objective
+    and delivery mode, so the same mission always yields the same contract and
+    the runner can trust it as ground truth."""
     objective = config.get("objective", "")
-    verify = config.get("verify_command", "")
     kinds = classify_mission(objective)
     delivery = config.get("delivery") or default_delivery("local", config.get("loop_id", "loop"))
 
@@ -273,8 +276,8 @@ def generate_goal_markdown(config: dict) -> str:
         strategies.extend(s for s in profile["strategies"] if s not in strategies)
     if not strategies:
         strategies = [
-            "Inspect the current state and the verifier's failure evidence "
-            "before editing anything.",
+            "Inspect the current state of the working tree before editing "
+            "anything.",
             "Pick one bounded strategy per iteration and see it through.",
         ]
 
@@ -313,10 +316,10 @@ def generate_goal_markdown(config: dict) -> str:
     lines += [
         "## Success condition (the only thing that ends this loop)",
         "",
-        f"`{verify}` exits 0 in two consecutive clean runs, an independent",
-        f"critic finds no blocking issue, and {gate}.",
-        "Nothing else counts — not effort, not plausible-looking diffs, not",
-        "your own assessment that the work is done.",
+        "You report the mission done (\"done\": true in your JSON result) with",
+        f"evidence, an independent critic finds no blocking issue, and {gate}.",
+        "A done claim without evidence counts for nothing — the critic inspects",
+        "the working tree itself and rejects unearned claims.",
         "",
         "## Definition of done",
         "",
@@ -414,21 +417,13 @@ def validate_goal_config(config: dict, target: pathlib.Path | None = None) -> li
     """Problems that would make the generated /goal contract weak or wrong.
 
     Run before every write so a contract with a hollow success condition
-    (empty objective, unrunnable verifier, broken ladder) never becomes the
-    loop's ground truth."""
+    (empty objective, broken ladder) never becomes the loop's ground truth."""
     problems: list[str] = []
     objective = str(config.get("objective", "")).strip()
     if not objective:
         problems.append("objective is empty — the contract has no mission")
     elif len(objective) < 8:
         problems.append(f"objective {objective!r} is too short to define done")
-    verify = str(config.get("verify_command", "")).strip()
-    if not verify:
-        problems.append("verify_command is empty — nothing can ever end the loop")
-    elif target is not None:
-        problem = verifier_problem(verify, target)
-        if problem:
-            problems.append(problem)
     done = config.get("definition_of_done")
     if not (isinstance(done, list) and any(str(item).strip() for item in done)):
         problems.append("definition_of_done is empty")
@@ -461,17 +456,15 @@ def write_goal(target: pathlib.Path, config: dict) -> pathlib.Path:
     return goal_path
 
 
-def runtime_config(objective: str, verify_command: str,
-                   loop_id: str, delivery_mode: str) -> dict:
+def runtime_config(objective: str, loop_id: str, delivery_mode: str) -> dict:
     return {
         "mission_id": "ABS-MINIMAL-001",
         "loop_id": loop_id,
         "objective": objective,
         "definition_of_done": [
-            "The verifier command exits zero in two consecutive clean runs.",
+            "The objective is achieved and demonstrated in the working tree.",
             "An independent critic finds no blocking issue.",
         ],
-        "verify_command": verify_command,
         "thinking_ladder": build_thinking_ladder(classify_mission(objective)),
         "goal_path": ".absoloop/goal.md",
         "critic_prompt_path": ".absoloop/prompts/critic-final-review.md",
@@ -504,23 +497,6 @@ def ask(prompt: str) -> str:
         sys.exit(1)
 
 
-def verifier_problem(command: str, target: pathlib.Path) -> str | None:
-    """Return a message when the verifier command clearly cannot run.
-
-    Catches answers like '0' or 'done' before the loop burns budget on a
-    verifier that exits 127 forever. Compound shell commands are left to the
-    shell to judge."""
-    if any(token in command for token in ("&&", "||", "|", ";", "$(", "`", ">", "<")):
-        return None
-    head = command.split()[0] if command.split() else ""
-    if head and (shutil.which(head) or (target / head).exists()
-                 or pathlib.Path(head).expanduser().exists()):
-        return None
-    return (f"'{command}' is not a runnable command. The verifier must be a real "
-            "shell command that exits 0 only when the mission is complete, "
-            "e.g. 'pytest -q' or 'node scripts/verify.mjs'.")
-
-
 def default_engine() -> str | None:
     for engine in ("claude", "codex"):
         if shutil.which(engine):
@@ -544,7 +520,7 @@ def read_state(target: pathlib.Path) -> dict | None:
 def next_step_hint(state: dict) -> str:
     status = state.get("status")
     if status == "AWAITING_APPROVAL":
-        return ("review the diff and verifier log, then 'absoloop approve' — or "
+        return ("review the diff, then 'absoloop approve' — or "
                 "'absoloop reject \"what to change\"' followed by 'absoloop resume'")
     if status == "COMPLETED":
         return ("results were delivered per the mission's delivery mode (see "
@@ -596,8 +572,8 @@ def goal_command(argv: list[str]) -> int:
         for problem in problems:
             print(f"goal check: {problem}", file=sys.stderr)
         if not problems:
-            print("goal config OK — objective, verifier, delivery, and thinking "
-                  "ladder all pass validation")
+            print("goal config OK — objective, delivery, and thinking ladder "
+                  "all pass validation")
         return 1 if problems else 0
     goal_path = target / runtime.get("goal_path", ".absoloop/goal.md")
     if args.regen or not goal_path.is_file():
@@ -672,8 +648,6 @@ def report_command(argv: list[str]) -> int:
     rule("═")
     if runtime.get("objective"):
         print(f" objective : {runtime['objective']}")
-    if runtime.get("verify_command"):
-        print(f" verifier  : $ {runtime['verify_command']}")
     delivery = runtime.get("delivery") or {}
     if delivery:
         detail = delivery.get("branch") if delivery.get("mode") == "git" else \
@@ -700,10 +674,7 @@ def report_command(argv: list[str]) -> int:
     for event in events:
         ts = time.strftime("%m-%d %H:%M", time.localtime(event.get("ts", 0)))
         kind = event.get("type")
-        if kind == "baseline":
-            mark = "✓" if event.get("exit_code") == 0 else "✗"
-            print(f"  {ts}  baseline verifier {mark} (exit {event.get('exit_code')})")
-        elif kind == "agent_run":
+        if kind == "agent_run":
             cost = f"${float(event.get('cost_usd', 0)):.2f}"
             exact = "" if event.get("cost_is_exact") else "~"
             limit = f" [hit {event['limit_reached']}]" if event.get("limit_reached") else ""
@@ -712,12 +683,9 @@ def report_command(argv: list[str]) -> int:
             summary = agent_summary(target, str(event.get("result", "")))
             if summary:
                 print(f"           └ {summary[:110]}")
-        elif kind == "verification":
-            mark = "✓ PASS" if event.get("exit_code") == 0 else f"✗ FAIL (exit {event.get('exit_code')})"
-            print(f"  {ts}  iteration {event.get('iteration')}: verifier {mark}")
-        elif kind == "verification_rerun":
-            mark = "✓" if event.get("exit_code") == 0 else "✗ flaky"
-            print(f"  {ts}  acceptance re-run {mark}")
+        elif kind == "iteration":
+            mark = "✓ builder reports DONE" if event.get("done") else "… not done yet"
+            print(f"  {ts}  iteration {event.get('iteration')}: {mark}")
         elif kind == "integrity_check":
             mark = "✓" if event.get("exit_code") == 0 else "✗ VIOLATION"
             print(f"  {ts}  integrity check {mark}")
@@ -757,8 +725,6 @@ def status_command(argv: list[str]) -> int:
         print(f"loop:       {runtime['loop_id']}")
     if runtime.get("objective"):
         print(f"objective:  {runtime['objective']}")
-    if runtime.get("verify_command"):
-        print(f"verifier:   $ {runtime['verify_command']}")
     delivery = runtime.get("delivery") or {}
     if delivery:
         print(f"delivery:   {delivery.get('mode', 'local')} — "
@@ -775,7 +741,6 @@ def status_command(argv: list[str]) -> int:
     if state.get("human_feedback"):
         print(f"feedback:   queued for next iteration: {state['human_feedback']!r}")
     for key, label in (("latest_agent_result", "agent result"),
-                       ("latest_verifier_log", "verifier log"),
                        ("latest_critic_findings", "critic findings")):
         if state.get(key):
             print(f"latest {label}: {state[key]}")
@@ -1022,13 +987,12 @@ def main(argv: list[str]) -> int:
 
     parser = argparse.ArgumentParser(
         prog="absoloop",
-        description="Scaffold and start an ABSOLOOP verifier-first loop project.",
+        description="Scaffold and start an ABSOLOOP mission loop project.",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("name", nargs="?", help="project name (prompted if omitted)")
     parser.add_argument("-o", "--objective", help="mission objective (one sentence)")
-    parser.add_argument("-v", "--verify", help="verifier command (exits 0 only when done)")
     parser.add_argument("-d", "--deliver", choices=sorted(DELIVERY_MODES),
                         help="where accepted work lands: git (commit to branch), "
                              "local (leave unstaged), out (~/absoloop/out/<loop_id>/)")
@@ -1113,26 +1077,13 @@ def main(argv: list[str]) -> int:
             print(f"warning: {runtime_path} is unreadable — rebuilding it.", file=sys.stderr)
 
     objective = (args.objective or "").strip()
-    verify_command = (args.verify or "").strip()
     if existing_config:
         objective = objective or str(existing_config.get("objective", "")).strip()
-        verify_command = verify_command or str(existing_config.get("verify_command", "")).strip()
-    if not (objective and verify_command):
+    if not objective:
         status = "adopted" if adopting else "created"
         print(f"\nProject '{target.name}' {status}. Now define the mission:")
     while not objective:
         objective = ask("Mission objective (one sentence): ")
-    if verify_command:
-        problem = verifier_problem(verify_command, target)
-        if problem:
-            print(f"warning: {problem}", file=sys.stderr)
-    while not verify_command:
-        verify_command = ask("Verifier command (exits 0 only when done): ")
-        if verify_command:
-            problem = verifier_problem(verify_command, target)
-            if problem:
-                print(problem, file=sys.stderr)
-                verify_command = ""
 
     # Delivery: flag wins, then an existing config's choice, then a prompt.
     delivery_mode = args.deliver or ""
@@ -1178,7 +1129,7 @@ def main(argv: list[str]) -> int:
                 or validate_thinking_ladder(existing_config.get("thinking_ladder"))):
             existing_config["thinking_ladder"] = build_thinking_ladder(
                 classify_mission(objective))
-        existing_config["verify_command"] = verify_command
+        existing_config.pop("verify_command", None)
         critic_path_cfg = str(existing_config.get("critic_prompt_path", ""))
         if critic_path_cfg.startswith(".absolution/"):
             existing_config["critic_prompt_path"] = ".absoloop/" + critic_path_cfg[len(".absolution/"):]
@@ -1189,7 +1140,7 @@ def main(argv: list[str]) -> int:
         config = existing_config
         print("reusing existing .absoloop/runtime.json (mission fields updated)")
     else:
-        config = runtime_config(objective, verify_command, new_loop_id(), delivery_mode)
+        config = runtime_config(objective, new_loop_id(), delivery_mode)
     runtime_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
 
     goal_path = write_goal(target, config)
