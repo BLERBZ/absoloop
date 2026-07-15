@@ -497,11 +497,36 @@ def ask(prompt: str) -> str:
         sys.exit(1)
 
 
+ENGINES = ("claude", "codex")
+
+
 def default_engine() -> str | None:
-    for engine in ("claude", "codex"):
+    for engine in ENGINES:
         if shutil.which(engine):
             return engine
     return None
+
+
+def choose_engine() -> str:
+    """Interactive engine picker, marking which CLIs are actually installed."""
+    default = default_engine() or ENGINES[0]
+    print("\nWhich engine should run the loop?")
+    for index, name in enumerate(ENGINES, 1):
+        mark = "✓ available" if shutil.which(name) else "✗ not found on PATH"
+        tag = "  (default)" if name == default else ""
+        print(f"  {index}. {name:<6} — {mark}{tag}")
+    while True:
+        answer = ask(f"Engine [1-{len(ENGINES)}, or "
+                     f"{'/'.join(ENGINES)}] (default: {default}): ") or default
+        if answer.isdigit() and 1 <= int(answer) <= len(ENGINES):
+            answer = ENGINES[int(answer) - 1]
+        if answer not in ENGINES:
+            print(f"Answer 1-{len(ENGINES)}, {', or '.join(ENGINES)}.", file=sys.stderr)
+            continue
+        if not shutil.which(answer):
+            print(f"note: '{answer}' is not on PATH yet — install it before "
+                  "starting the loop.", file=sys.stderr)
+        return answer
 
 
 def read_state(target: pathlib.Path) -> dict | None:
@@ -1157,14 +1182,18 @@ def main(argv: list[str]) -> int:
                              + ("" if existing_ignores.endswith("\n") or not existing_ignores else "\n")
                              + ignore_line + "\n", encoding="utf-8")
 
-    engine = args.engine or default_engine()
+    engine = args.engine or ""
+    if not engine and sys.stdin.isatty():
+        engine = choose_engine()
+    engine = engine or default_engine()
+
     if args.start or args.engine:
         if engine is None:
             print("error: no engine available — install 'claude' or 'codex'.", file=sys.stderr)
             return 1
         return start_loop(target, engine)
 
-    if engine and sys.stdin.isatty():
+    if engine and shutil.which(engine) and sys.stdin.isatty():
         if ask(f"\nMission ready. Start the loop now with '{engine}'? [Y/n] ").lower() in ("", "y", "yes"):
             return start_loop(target, engine)
 

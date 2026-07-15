@@ -69,8 +69,10 @@ absoloop .            # adopt the directory you are already in
 
 It scaffolds `./<name>/` (scripts + `.absoloop/` config, git init) and
 generates the mission's **/goal contract** at `.absoloop/goal.md`.
-`--engine claude|codex` picks the engine and implies `--start`; without it the
-first engine found on PATH is used.
+`--engine claude|codex` picks the engine and implies `--start`; without it,
+interactive setup asks which engine to use in a multiple-choice prompt that
+marks each one ✓ available or ✗ not found on PATH (non-interactive runs fall
+back to the first engine found).
 
 To start (or resume) the loop later from inside the project:
 
