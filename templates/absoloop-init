@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+# absoloop-init — minimal bootstrap for the Section 22 reference runner.
+set -euo pipefail
+
+OBJECTIVE="${1:-}"
+VERIFY_COMMAND="${2:-}"
+DELIVERY="${3:-}"
+[ -n "$OBJECTIVE" ] || read -r -p "Mission objective (one sentence): " OBJECTIVE
+[ -n "$VERIFY_COMMAND" ] || read -r -p "Verifier command (exits 0 only when done): " VERIFY_COMMAND
+if [ -z "$DELIVERY" ]; then
+  echo "Delivery of accepted results:"
+  echo "  git   — commit to a dedicated branch"
+  echo "  local — leave changes unstaged (default)"
+  echo "  out   — export to ~/absoloop/out/<loop_id>/"
+  read -r -p "Delivery [git/local/out] (default: local): " DELIVERY
+  DELIVERY="${DELIVERY:-local}"
+fi
+case "$DELIVERY" in git|local|out) ;; *)
+  echo "unknown delivery mode '$DELIVERY' — using 'local'" >&2; DELIVERY=local ;;
+esac
+
+# Reject answers like '0' that would make the verifier exit 127 forever.
+verifier_ok() {
+  case "$1" in *"&&"*|*"||"*|*"|"*|*";"*) return 0 ;; esac
+  local head=${1%% *}
+  [ -n "$head" ] && { command -v "$head" >/dev/null 2>&1 || [ -e "$head" ]; }
+}
+until verifier_ok "$VERIFY_COMMAND"; do
+  echo "'$VERIFY_COMMAND' is not a runnable command. Use a real shell command" \
+       "that exits 0 only when the mission is complete (e.g. 'pytest -q')." >&2
+  read -r -p "Verifier command (exits 0 only when done): " VERIFY_COMMAND
+done
+
+mkdir -p .absoloop/tmp .absoloop/checkpoints .absoloop/schemas .absoloop/prompts scripts
+
+cat > .absoloop/schemas/agent-result.schema.json <<'EOF'
+{
+  "type": "object",
+  "properties": {
+    "summary": {"type": "string"},
+    "changed_artifacts": {"type": "array", "items": {"type": "string"}},
+    "commands_run": {"type": "array", "items": {"type": "string"}},
+    "risks": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["summary", "changed_artifacts", "risks"]
+}
+EOF
+
+cat > .absoloop/prompts/critic-final-review.md <<'EOF'
+You are an independent adversarial reviewer. Attempt to disprove that the
+current working tree satisfies the mission contract. Inspect the relevant
+files yourself with read-only tools; do not trust any builder narrative.
+Look for weakened tests, unverifiable claims, regressions, and scope drift.
+Do not edit files.
+EOF
+
+python3 - "$OBJECTIVE" "$VERIFY_COMMAND" "$DELIVERY" <<'EOF'
+import json, os, secrets, sys, time
+
+objective, verify, delivery_mode = sys.argv[1], sys.argv[2], sys.argv[3]
+loop_id = f"loop-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+out_dir = os.path.join(os.path.expanduser("~"), "absoloop", "out", loop_id)
+runtime = {
+    "mission_id": "ABS-MINIMAL-001",
+    "loop_id": loop_id,
+    "objective": objective,
+    "definition_of_done": [
+        "The verifier command exits zero in two consecutive clean runs.",
+        "An independent critic finds no blocking issue.",
+    ],
+    "verify_command": verify,
+    "goal_path": ".absoloop/goal.md",
+    "critic_prompt_path": ".absoloop/prompts/critic-final-review.md",
+    "delivery": {"mode": delivery_mode, "branch": f"absoloop/{loop_id}",
+                 "out_dir": out_dir},
+    "require_human_approval": True,
+    "max_iterations": 15,
+    "no_progress_window": 3,
+    "max_wall_seconds": 7200,
+    "max_cost_usd": 25.0,
+    "claude": {
+        "builder": {"permission_mode": "acceptEdits", "max_turns": 30,
+                    "max_budget_usd": 5.0, "max_wall_seconds": 1200},
+        "critic": {"permission_mode": "plan", "max_turns": 12,
+                   "max_budget_usd": 2.0, "max_wall_seconds": 600},
+    },
+    "codex": {
+        "builder": {"sandbox": "workspace-write", "max_budget_usd": 5.0,
+                    "max_wall_seconds": 1200, "model_reasoning_effort": "medium"},
+        "critic": {"sandbox": "read-only", "max_budget_usd": 2.0,
+                   "max_wall_seconds": 600, "model_reasoning_effort": "high"},
+    },
+}
+with open(".absoloop/runtime.json", "w", encoding="utf-8") as handle:
+    json.dump(runtime, handle, indent=2)
+    handle.write("\n")
+
+goal = f"""# /goal — {objective}
+
+mission: {runtime['mission_id']} · loop: {loop_id}
+
+## Success condition (the only thing that ends this loop)
+
+`{verify}` exits 0 in two consecutive clean runs, an independent
+critic finds no blocking issue, and the human operator approves the result.
+Nothing else counts — not effort, not plausible-looking diffs, not
+your own assessment that the work is done.
+
+## Definition of done
+
+- The verifier command exits zero in two consecutive clean runs.
+- An independent critic finds no blocking issue.
+
+## Constraints
+
+- Never weaken, skip, or delete tests or acceptance criteria.
+- Make the smallest authorized change per iteration.
+- Do not push, publish, deploy, or perform destructive/external actions.
+
+## Delivery (applied by the loop after acceptance — never by you)
+
+- mode: {delivery_mode}
+"""
+with open(".absoloop/goal.md", "w", encoding="utf-8") as handle:
+    handle.write(goal)
+EOF
+
+grep -qxF '.absoloop/tmp/' .gitignore 2>/dev/null || echo '.absoloop/tmp/' >> .gitignore
+
+[ -x scripts/absoloop-run ] || echo "Reminder: save the Section 22 runner as scripts/absoloop-run and chmod +x it."
+echo "Mission ready. Baseline and run:  ./scripts/absoloop-run --engine claude"

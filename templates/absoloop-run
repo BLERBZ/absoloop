@@ -1,0 +1,1042 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, asdict
+from typing import Any
+
+ROOT = pathlib.Path.cwd()
+ABS = ROOT / ".absoloop"
+TMP = ABS / "tmp"
+CHECKPOINTS = ABS / "checkpoints"
+STATE_PATH = ABS / "state.json"
+LEDGER_PATH = ABS / "ledger.jsonl"
+RUNTIME_PATH = ABS / "runtime.json"
+RESULT_SCHEMA = ABS / "schemas" / "agent-result.schema.json"
+
+# Thinking escalation: as the same failure repeats, both engines are pushed to
+# spend more reasoning depth instead of re-trying the same shallow fix.
+# The authoritative ladder is generated per mission by 'absoloop' into
+# runtime.json ("thinking_ladder") and rendered in the /goal contract; this
+# built-in ladder is only the fallback for projects scaffolded before ladders
+# became per-mission. Each rung carries: the claude extended-thinking keyword,
+# a MAX_THINKING_TOKENS budget exported to `claude -p`, the codex
+# model_reasoning_effort, and a budget_scale that widens the builder's
+# per-run wall-clock/cost caps so deep thinking is not cut off early.
+DEFAULT_THINKING_LADDER: list[dict[str, Any]] = [
+    {"repeats": "0 (fresh evidence)", "claude_keyword": "think",
+     "claude_thinking_tokens": 4000, "codex_effort": "medium", "budget_scale": 1.0,
+     "posture": "Plan briefly, act on the strongest hypothesis."},
+    {"repeats": "1 (first repeat)", "claude_keyword": "think hard",
+     "claude_thinking_tokens": 10000, "codex_effort": "high", "budget_scale": 1.25,
+     "posture": "The obvious fix failed once — re-derive the failure from the "
+                "evidence before editing anything."},
+    {"repeats": "2 (second repeat)", "claude_keyword": "think harder",
+     "claude_thinking_tokens": 16000, "codex_effort": "high", "budget_scale": 1.5,
+     "posture": "Two identical failures mean your model of the problem is wrong. "
+                "Enumerate at least three distinct hypotheses and test the most "
+                "falsifiable one."},
+    {"repeats": "3+ (final window)", "claude_keyword": "ultrathink",
+     "claude_thinking_tokens": 31999, "codex_effort": "high", "budget_scale": 2.0,
+     "posture": "Final window before the loop blocks. Step back to first "
+                "principles, question the verifier's assumptions, and say so in "
+                "your summary if the mission needs operator input."},
+]
+
+CODEX_EFFORT_RANK = {"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4}
+
+
+def thinking_rung(runtime: dict[str, Any], state: "State") -> dict[str, Any]:
+    """The escalation rung for the current repeated-failure count, from the
+    mission's generated ladder when it is usable, else the built-in default."""
+    ladder = runtime.get("thinking_ladder")
+    if not (isinstance(ladder, list) and ladder
+            and all(isinstance(rung, dict)
+                    and str(rung.get("claude_keyword", "")).strip()
+                    and rung.get("codex_effort") in CODEX_EFFORT_RANK
+                    for rung in ladder)):
+        ladder = DEFAULT_THINKING_LADDER
+    return ladder[min(state.repeated_failure_count, len(ladder) - 1)]
+
+
+CRITIC_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "recommendation": {"type": "string", "enum": ["PASS", "HOLD", "REJECT"]},
+        "blocking_findings": {"type": "array", "items": {"type": "string"}},
+        "summary": {"type": "string"},
+    },
+    "required": ["recommendation", "blocking_findings", "summary"],
+}
+
+
+@dataclass
+class State:
+    mission_id: str
+    status: str = "READY"
+    iteration: int = 0
+    started_at: float = 0.0
+    cost_usd: float = 0.0
+    inexact_cost_events: int = 0
+    baseline_done: bool = False
+    last_failure_fingerprint: str | None = None
+    repeated_failure_count: int = 0
+    latest_agent_result: str | None = None
+    latest_verifier_log: str | None = None
+    latest_critic_findings: str | None = None
+    latest_checkpoint: str | None = None
+    stop_reason: str | None = None
+    human_feedback: str | None = None
+
+
+@dataclass
+class AgentRun:
+    exit_code: int
+    cost_usd: float           # exact when parsed; the configured cap otherwise
+    cost_is_exact: bool
+    limit_reached: str | None
+    output_path: pathlib.Path
+
+
+def say(message: str) -> None:
+    """Live progress line so the operator can watch the loop working."""
+    print(f"[absoloop {time.strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+@contextlib.contextmanager
+def heartbeat(label: str, interval: float = 30.0):
+    """Print a periodic heartbeat while a long blocking step runs, so a slow
+    agent or verifier never looks like a hang."""
+    started = time.time()
+    done = threading.Event()
+
+    def beat() -> None:
+        while not done.wait(interval):
+            say(f"{label}... still running ({time.time() - started:.0f}s elapsed)")
+
+    thread = threading.Thread(target=beat, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join(timeout=1)
+
+
+def report_spend(state: "State", runtime: dict[str, Any]) -> None:
+    """Running cost report after every paid step, with early warnings so the
+    cap never arrives as a surprise."""
+    cap = float(runtime["max_cost_usd"])
+    pct = 100 * state.cost_usd / cap if cap else 0.0
+    remaining = max(0.0, cap - state.cost_usd)
+    say(f"spend: ${state.cost_usd:.2f} of ${cap:.2f} mission budget "
+        f"({pct:.0f}% used, ${remaining:.2f} left)")
+    if state.inexact_cost_events:
+        say(f"spend: {state.inexact_cost_events} run(s) had no exact cost and were "
+            "counted at their full per-run cap")
+    if pct >= 90:
+        say("WARNING: over 90% of the mission cost budget used — the loop will "
+            "stop at the cap; raise max_cost_usd in .absoloop/runtime.json to continue")
+    elif pct >= 75:
+        say("notice: over 75% of the mission cost budget used")
+
+
+def load_json(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(f"Missing required file: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Invalid JSON in {path}: {exc}") from exc
+
+
+def atomic_write_json(path: pathlib.Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
+def append_ledger(event: dict[str, Any]) -> None:
+    LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    event = {"ts": time.time(), **event}
+    with LEDGER_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def checkpoint(state: State, label: str) -> None:
+    CHECKPOINTS.mkdir(parents=True, exist_ok=True)
+    path = CHECKPOINTS / f"{state.iteration:04d}-{label}.json"
+    state.latest_checkpoint = str(path.relative_to(ROOT))
+    atomic_write_json(path, asdict(state))
+    atomic_write_json(STATE_PATH, asdict(state))
+
+
+def normalized_fingerprint(text: str) -> str:
+    # Replace volatile-looking tokens before hashing. Extend for your verifier.
+    normalized_lines: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(("time=", "duration=", "timestamp=", "wall_seconds=")):
+            continue
+        normalized_lines.append(line)
+    normalized = "\n".join(sorted(set(normalized_lines)))
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def run_command(command: str, log_path: pathlib.Path, timeout: int,
+                label: str = "verifier") -> subprocess.CompletedProcess[str]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    say(f"{label}: $ {command}")
+    started = time.time()
+    # Verifier commands run under bash where available (macOS/Linux, Git Bash
+    # on Windows); otherwise fall back to the platform shell (cmd.exe).
+    bash = shutil.which("bash")
+    argv: list[str] | str = [bash, "-lc", command] if bash else command
+    try:
+        with heartbeat(label):
+            result = subprocess.run(
+                argv,
+                shell=bash is None,
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+                env=os.environ.copy(),
+            )
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + "\n" + (exc.stderr or "")
+        log_path.write_text(output + "\nVERIFIER_TIMEOUT\n", encoding="utf-8")
+        say(f"{label}: TIMED OUT after {timeout}s (log: {log_path.relative_to(ROOT)})")
+        return subprocess.CompletedProcess(command, 124, exc.stdout or "", exc.stderr or "timeout")
+
+    combined = (
+        f"$ {command}\n"
+        f"exit_code={result.returncode}\n"
+        f"wall_seconds={time.time() - started:.3f}\n\n"
+        f"--- stdout ---\n{result.stdout}\n"
+        f"--- stderr ---\n{result.stderr}\n"
+    )
+    log_path.write_text(combined, encoding="utf-8")
+    if result.returncode == 0:
+        say(f"{label}: PASSED in {time.time() - started:.1f}s")
+    else:
+        stderr_tail = " | ".join(result.stderr.strip().splitlines()[-3:]) or "(no stderr)"
+        say(f"{label}: FAILED exit {result.returncode} in {time.time() - started:.1f}s "
+            f"— {stderr_tail} (log: {log_path.relative_to(ROOT)})")
+    return result
+
+
+def say_agent_message(out_path: pathlib.Path, label: str) -> None:
+    """Pass the agent's own English report through to the console, so the
+    operator sees what it says it did — not just exit codes and cost.
+    Handles both shapes: claude's CLI payload (structured_output/result) and
+    codex's ``-o`` file, which is the structured result itself."""
+    try:
+        payload = json.loads(out_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if not isinstance(payload, dict):
+        return
+    structured = payload.get("structured_output")
+    structured = structured if isinstance(structured, dict) else payload
+    message = structured.get("summary")
+    if not (isinstance(message, str) and message.strip()):
+        message = payload.get("result")
+    if isinstance(message, str) and message.strip():
+        for line in message.strip().splitlines():
+            if line.strip():
+                say(f"{label} says: {line.strip()}")
+    risks = structured.get("risks")
+    if isinstance(risks, list):
+        for risk in risks:
+            if isinstance(risk, str) and risk.strip():
+                say(f"{label} flags risk: {risk.strip()}")
+
+
+def load_goal(runtime: dict[str, Any]) -> str:
+    """The mission's /goal contract (generated at scaffold time by
+    'absoloop'). Falls back to a minimal inline contract so old projects
+    without goal.md still get a firm stop condition."""
+    goal_path = ROOT / runtime.get("goal_path", ".absoloop/goal.md")
+    if goal_path.is_file():
+        return goal_path.read_text(encoding="utf-8", errors="replace")
+    return (
+        f"# /goal — {runtime['objective']}\n\n"
+        "## Success condition (the only thing that ends this loop)\n\n"
+        f"`{runtime['verify_command']}` exits 0 in two consecutive clean runs and "
+        "an independent critic finds no blocking issue. Nothing else counts.\n\n"
+        "## Definition of done\n\n"
+        + "\n".join(f"- {item}" for item in runtime.get("definition_of_done", []))
+        + "\n"
+    )
+
+
+def build_iteration_prompt(
+    runtime: dict[str, Any],
+    state: State,
+    verifier_log: pathlib.Path | None,
+    engine: str,
+) -> str:
+    previous_failure = "No previous verifier failure; establish the baseline."
+    if verifier_log is not None and verifier_log.is_file():
+        raw = verifier_log.read_text(encoding="utf-8", errors="replace")
+        previous_failure = raw[-12000:]
+
+    critic_block = ""
+    if state.latest_critic_findings:
+        findings_file = ROOT / state.latest_critic_findings
+        if findings_file.is_file():
+            findings = findings_file.read_text(encoding="utf-8", errors="replace")[-4000:]
+            critic_block = f"\n## Blocking critic findings to repair\n\n{findings}\n"
+
+    feedback_block = ""
+    if state.human_feedback:
+        feedback_block = (
+            "\n## Operator feedback (address this first)\n\n"
+            f"{state.human_feedback.strip()}\n"
+        )
+
+    rung = thinking_rung(runtime, state)
+    posture = str(rung.get("posture", "")).strip()
+    if engine == "claude":
+        # The keyword is claude's extended-thinking trigger; leading position
+        # makes it unmissable. The matching MAX_THINKING_TOKENS budget is
+        # exported to the CLI by the loop, so the depth is real, not rhetorical.
+        keyword = rung["claude_keyword"]
+        thinking_block = (
+            f"{keyword}: {posture}\n\n"
+            f"Thinking depth for this iteration: {keyword} "
+            f"({rung.get('claude_thinking_tokens', '?')} thinking tokens, escalated "
+            f"from {state.repeated_failure_count} repeated failure(s))."
+        )
+    else:
+        thinking_block = (
+            f"Reasoning posture for this iteration ({rung['codex_effort']} effort, "
+            f"escalated from {state.repeated_failure_count} repeated failure(s)): "
+            f"{posture}"
+        )
+
+    return f"""# ABSOLOOP bounded repair iteration
+
+{thinking_block}
+
+## Mission goal contract (ground truth — overrides any other narrative)
+
+{load_goal(runtime).strip()}
+
+## Loop position
+
+Iteration: {state.iteration} of {runtime['max_iterations']} \
+({runtime['max_iterations'] - state.iteration} remaining)
+Repeated failure count: {state.repeated_failure_count}
+
+## Current verifier evidence
+
+{previous_failure}
+{critic_block}{feedback_block}
+## Required procedure
+
+1. Read the project instructions and the goal contract above.
+2. Inspect the failure before editing.
+3. Choose one bounded strategy from the goal contract's strategy ladder that
+   differs from any failed repeated strategy.
+4. Make only the smallest authorized changes needed for this iteration.
+5. Run a focused check when available, but do not claim final completion.
+6. Never weaken tests or acceptance criteria.
+7. Return schema-valid JSON with changed artifacts, commands, evidence, risks, and a concise decision summary.
+
+Do not push, publish, deploy, or perform destructive/external actions —
+delivery is handled by the loop after acceptance, per the goal contract.
+"""
+
+
+def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
+               json_schema: dict[str, Any] | None = None,
+               label: str = "claude agent",
+               extra_env: dict[str, str] | None = None) -> AgentRun:
+    schema = json.dumps(json_schema) if json_schema else RESULT_SCHEMA.read_text(encoding="utf-8")
+    command = [
+        # shutil.which resolves claude.cmd/.exe on Windows (PATHEXT), where a
+        # bare name in argv-list form would not be found.
+        shutil.which("claude") or "claude",
+        "-p",
+        "--permission-mode", cfg["permission_mode"],
+        "--max-turns", str(cfg["max_turns"]),
+        "--max-budget-usd", str(cfg["max_budget_usd"]),
+        "--json-schema", schema,
+        "--output-format", "json",
+        prompt,
+    ]
+    say(f"{label}: starting (limits: {cfg['max_turns']} turns, "
+        f"${cfg['max_budget_usd']}, {cfg.get('max_wall_seconds', 600)}s wall)")
+    started = time.time()
+    # --max-turns bounds turns, not wall time; a single exploratory turn can run
+    # for minutes, so every agent run also gets a hard wall-clock bound.
+    try:
+        with heartbeat(label):
+            result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
+                                    check=False, timeout=float(cfg.get("max_wall_seconds", 600)),
+                                    env={**os.environ, **(extra_env or {})})
+    except subprocess.TimeoutExpired as exc:
+        out_path.write_text(exc.stdout or "", encoding="utf-8")
+        out_path.with_suffix(".stderr.log").write_text(
+            (exc.stderr or "") + "\nAGENT_WALL_TIMEOUT\n", encoding="utf-8")
+        run = AgentRun(124, float(cfg["max_budget_usd"]), False, "wall_timeout", out_path)
+        say(f"{label}: KILLED at {cfg.get('max_wall_seconds', 600)}s wall-clock limit")
+        append_ledger({"type": "agent_run", "engine": "claude", "exit_code": 124,
+                       "wall_seconds": time.time() - started, "cost_usd": run.cost_usd,
+                       "cost_is_exact": False, "limit_reached": "wall_timeout",
+                       "result": str(out_path.relative_to(ROOT))})
+        return run
+    out_path.write_text(result.stdout, encoding="utf-8")
+    out_path.with_suffix(".stderr.log").write_text(result.stderr, encoding="utf-8")
+
+    # The result JSON carries exact total_cost_usd, and an error subtype such as
+    # error_max_turns or error_max_budget_usd when a limit ended the run.
+    payload: dict[str, Any] | None = None
+    try:
+        parsed = json.loads(result.stdout)
+        payload = parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+    exact = payload.get("total_cost_usd") if payload else None
+    cost_is_exact = isinstance(exact, (int, float))
+    subtype = str(payload.get("subtype", "")) if payload else ""
+    limit = subtype if payload and payload.get("is_error") and subtype.startswith("error_") else None
+
+    run = AgentRun(
+        exit_code=result.returncode,
+        cost_usd=float(exact) if cost_is_exact else float(cfg["max_budget_usd"]),
+        cost_is_exact=cost_is_exact,
+        limit_reached=limit,
+        output_path=out_path,
+    )
+    outcome = "finished" if run.exit_code == 0 and not run.limit_reached else "FAILED"
+    detail = f" — cut off by limit '{run.limit_reached}'" if run.limit_reached else ""
+    say(f"{label}: {outcome} in {time.time() - started:.0f}s, "
+        f"cost ${run.cost_usd:.2f}{detail}")
+    if run.limit_reached in ("error_max_budget_usd", "error_max_turns"):
+        say(f"{label}: hint — the run was terminated by its own budget before it "
+            "could finish; consider raising claude.builder limits in .absoloop/runtime.json")
+    append_ledger({
+        "type": "agent_run",
+        "engine": "claude",
+        "exit_code": run.exit_code,
+        "wall_seconds": time.time() - started,
+        "cost_usd": run.cost_usd,
+        "cost_is_exact": run.cost_is_exact,
+        "limit_reached": run.limit_reached,
+        "result": str(out_path.relative_to(ROOT)),
+    })
+    return run
+
+
+def codex_usage_to_usd(events_path: pathlib.Path, pricing: dict[str, float] | None) -> float | None:
+    """Sum token usage from turn.completed events; convert with configured rates."""
+    if not pricing:
+        return None
+    totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
+    seen = False
+    try:
+        lines = events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        usage = event.get("usage") if event.get("type") == "turn.completed" else None
+        if isinstance(usage, dict):
+            seen = True
+            for key in totals:
+                value = usage.get(key)
+                if isinstance(value, (int, float)):
+                    totals[key] += value
+    if not seen:
+        return None
+    fresh_input = max(0, totals["input_tokens"] - totals["cached_input_tokens"])
+    return (
+        fresh_input * pricing["input_per_mtok_usd"]
+        + totals["cached_input_tokens"] * pricing["cached_input_per_mtok_usd"]
+        + totals["output_tokens"] * pricing["output_per_mtok_usd"]
+    ) / 1_000_000
+
+
+def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None,
+              out_path: pathlib.Path, schema_path: pathlib.Path,
+              label: str = "codex agent") -> AgentRun:
+    # codex exec is non-interactive and never prompts; the sandbox policy is
+    # the enforcement boundary for scripted runs. Codex has no per-run dollar
+    # cap flag, so max_budget_usd is the accounting reserve when parsing fails.
+    effort = str(cfg.get("model_reasoning_effort", "") or "")
+    command = [
+        shutil.which("codex") or "codex", "exec",
+        "--sandbox", cfg["sandbox"],
+        "--output-schema", str(schema_path),
+        "--json",
+        "-o", str(out_path),
+    ]
+    if effort:
+        command += ["-c", f"model_reasoning_effort={effort}"]
+    command.append(prompt)
+    say(f"{label}: starting (limits: sandbox={cfg['sandbox']}, "
+        f"{cfg.get('max_wall_seconds', 600)}s wall"
+        + (f", reasoning={effort}" if effort else "") + ")")
+    started = time.time()
+    try:
+        with heartbeat(label):
+            result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
+                                    check=False, timeout=float(cfg.get("max_wall_seconds", 600)))
+    except subprocess.TimeoutExpired as exc:
+        events_path = out_path.with_suffix(".events.jsonl")
+        events_path.write_text(exc.stdout or "", encoding="utf-8")
+        out_path.with_suffix(".stderr.log").write_text(
+            (exc.stderr or "") + "\nAGENT_WALL_TIMEOUT\n", encoding="utf-8")
+        run = AgentRun(124, float(cfg["max_budget_usd"]), False, "wall_timeout", out_path)
+        say(f"{label}: KILLED at {cfg.get('max_wall_seconds', 600)}s wall-clock limit")
+        append_ledger({"type": "agent_run", "engine": "codex", "exit_code": 124,
+                       "wall_seconds": time.time() - started, "cost_usd": run.cost_usd,
+                       "cost_is_exact": False, "limit_reached": "wall_timeout",
+                       "result": str(out_path.relative_to(ROOT))})
+        return run
+    events_path = out_path.with_suffix(".events.jsonl")
+    events_path.write_text(result.stdout, encoding="utf-8")
+    out_path.with_suffix(".stderr.log").write_text(result.stderr, encoding="utf-8")
+
+    exact = codex_usage_to_usd(events_path, pricing)
+    run = AgentRun(
+        exit_code=result.returncode,
+        cost_usd=exact if exact is not None else float(cfg["max_budget_usd"]),
+        cost_is_exact=exact is not None,
+        limit_reached=None,
+        output_path=out_path,
+    )
+    say(f"{label}: {'finished' if run.exit_code == 0 else 'FAILED'} in "
+        f"{time.time() - started:.0f}s, cost ${run.cost_usd:.2f}"
+        f"{'' if run.cost_is_exact else ' (estimated)'}")
+    append_ledger({
+        "type": "agent_run",
+        "engine": "codex",
+        "exit_code": run.exit_code,
+        "wall_seconds": time.time() - started,
+        "cost_usd": run.cost_usd,
+        "cost_is_exact": run.cost_is_exact,
+        "result": str(out_path.relative_to(ROOT)),
+        "events": str(events_path.relative_to(ROOT)),
+    })
+    return run
+
+
+def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict[str, Any] | None, AgentRun]:
+    """Independent read-only review. The critic sees the contract and verifier
+    evidence, never the builder's narrative (Section 14.2)."""
+    prompt_path = ROOT / runtime["critic_prompt_path"]
+    base = prompt_path.read_text(encoding="utf-8") if prompt_path.is_file() else (
+        "You are an independent adversarial reviewer. Attempt to disprove that the\n"
+        "current working tree satisfies the mission contract. Do not edit files."
+    )
+    verifier_tail = ""
+    if state.latest_verifier_log:
+        log = ROOT / state.latest_verifier_log
+        if log.is_file():
+            verifier_tail = log.read_text(encoding="utf-8", errors="replace")[-8000:]
+    prompt = (
+        f"{base}\n\n"
+        f"Mission objective: {runtime['objective']}\n"
+        f"Definition of done: {json.dumps(runtime['definition_of_done'], indent=2)}\n\n"
+        f"Latest verifier evidence:\n{verifier_tail}\n\n"
+        "Inspect the working tree yourself; do not trust any builder narrative.\n"
+        "Return JSON with recommendation (PASS, HOLD, or REJECT), blocking_findings, and summary."
+    )
+
+    out_path = TMP / f"iteration-{state.iteration:04d}-critic.json"
+    verdict: dict[str, Any] | None = None
+    if engine == "claude":
+        run = run_claude(prompt, runtime["claude"]["critic"], out_path,
+                         json_schema=CRITIC_SCHEMA, label="critic")
+        try:
+            payload = json.loads(out_path.read_text(encoding="utf-8"))
+            candidate = payload.get("structured_output") if isinstance(payload, dict) else None
+        except (OSError, json.JSONDecodeError):
+            candidate = None
+    else:
+        schema_path = TMP / "critic-schema.json"
+        atomic_write_json(schema_path, CRITIC_SCHEMA)
+        run = run_codex(prompt, runtime["codex"]["critic"], runtime["codex"].get("pricing"),
+                        out_path, schema_path, label="critic")
+        try:
+            candidate = json.loads(out_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            candidate = None
+
+    if isinstance(candidate, dict) and candidate.get("recommendation") in {"PASS", "HOLD", "REJECT"}:
+        verdict = candidate
+        say(f"critic verdict: {verdict['recommendation']} — {verdict.get('summary', '')[:200]}")
+    else:
+        say("critic verdict: UNREADABLE (treated as an error, not a pass)")
+    return verdict, run
+
+
+def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
+                     verifier_timeout: int) -> tuple[str, str] | None:
+    """Layered acceptance: clean re-verification, integrity check, independent
+    critic, then the human gate. Returns (stop_reason, terminal_status) when the
+    mission should stop, or None when the repair loop should continue."""
+    state.status = "FINAL_REVIEW"
+    say("verifier passed — entering final acceptance (clean re-run, integrity, critic)")
+
+    rerun_log = TMP / f"iteration-{state.iteration:04d}-verify-rerun.log"
+    rerun = run_command(runtime["verify_command"], rerun_log, verifier_timeout,
+                        label="verifier re-run")
+    append_ledger({"type": "verification_rerun", "iteration": state.iteration,
+                   "exit_code": rerun.returncode})
+    if rerun.returncode != 0:
+        # A pass followed by a fail on identical state means the verifier is
+        # flaky and cannot support acceptance until re-baselined (Section 27.2).
+        return "verifier_flaky", "BLOCKED"
+
+    integrity_command = runtime.get("integrity_command")
+    if integrity_command:
+        integrity_log = TMP / f"iteration-{state.iteration:04d}-integrity.log"
+        integrity = run_command(integrity_command, integrity_log, verifier_timeout)
+        append_ledger({"type": "integrity_check", "iteration": state.iteration,
+                       "exit_code": integrity.returncode})
+        if integrity.returncode != 0:
+            # Weakened tests or edited checks are an automatic failure (14.3).
+            return "integrity_violation", "REJECTED"
+
+    verdict, run = run_critic(engine, runtime, state)
+    state.cost_usd += run.cost_usd
+    if not run.cost_is_exact:
+        state.inexact_cost_events += 1
+    report_spend(state, runtime)
+    if verdict is None:
+        # An unreadable critic is ERROR, not PASS (Section 14.5).
+        return "critic_unavailable", "BLOCKED"
+
+    if verdict["recommendation"] == "REJECT":
+        return "critic_reject", "REJECTED"
+
+    if verdict["recommendation"] == "HOLD":
+        findings_path = TMP / f"iteration-{state.iteration:04d}-critic-findings.json"
+        atomic_write_json(findings_path, verdict)
+        state.latest_critic_findings = str(findings_path.relative_to(ROOT))
+        fingerprint = normalized_fingerprint(
+            "critic:" + "\n".join(str(f) for f in verdict["blocking_findings"])
+        )
+        if fingerprint == state.last_failure_fingerprint:
+            state.repeated_failure_count += 1
+        else:
+            state.repeated_failure_count = 1
+            state.last_failure_fingerprint = fingerprint
+        if state.repeated_failure_count >= int(runtime["no_progress_window"]):
+            return "critic_findings_not_converging", "BLOCKED"
+        return None  # findings feed the next repair iteration
+
+    state.latest_critic_findings = None
+    if runtime.get("require_human_approval", True):
+        # Externalization stays behind the human gate (Section 16).
+        return "accepted_pending_human_gate", "AWAITING_APPROVAL"
+    return "accepted_by_all_gates", "COMPLETED"
+
+
+# ---------------------------------------------------------------------------
+# Results: report.md after every stop, delivery after acceptance.
+# ---------------------------------------------------------------------------
+
+def git_changed_files() -> list[str]:
+    """Paths with uncommitted changes (staged, unstaged, or untracked)."""
+    if not shutil.which("git"):
+        return []
+    # -uall lists each untracked file individually instead of collapsing new
+    # directories to 'dir/', which the copy step could not resolve to files.
+    result = subprocess.run(["git", "status", "--porcelain", "-uall"], cwd=ROOT,
+                            text=True, capture_output=True, check=False)
+    if result.returncode != 0:
+        return []
+    paths: list[str] = []
+    for line in result.stdout.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip().strip('"')
+        if " -> " in path:  # renames: keep the destination
+            path = path.split(" -> ", 1)[1].strip('"')
+        paths.append(path)
+    return sorted(set(paths))
+
+
+def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
+    """Human-readable mission report, regenerated at every stop so it always
+    reflects the latest state. 'absoloop report' renders the same story live."""
+    report_path = ABS / "report.md"
+    changed = [p for p in git_changed_files() if not p.startswith(".absoloop/")]
+    delivery = runtime.get("delivery") or {"mode": "local"}
+    lines = [
+        f"# ABSOLOOP report — {state.mission_id} ({runtime.get('loop_id', 'no loop id')})",
+        "",
+        f"- objective: {runtime.get('objective', '')}",
+        f"- verifier: `{runtime.get('verify_command', '')}`",
+        f"- status: **{state.status}**"
+        + (f" (stop reason: {state.stop_reason})" if state.stop_reason else ""),
+        f"- iterations: {state.iteration} of {runtime.get('max_iterations', '?')}",
+        f"- total cost: ${state.cost_usd:.2f} of "
+        f"${float(runtime.get('max_cost_usd', 0)):.2f}",
+        f"- delivery mode: {delivery.get('mode', 'local')}",
+        "",
+        "## Changed files (uncommitted, excluding .absoloop/)",
+        "",
+    ]
+    lines += [f"- `{path}`" for path in changed] or ["- (none detected)"]
+    lines += ["", "## Iteration timeline", ""]
+    try:
+        ledger_lines = LEDGER_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        ledger_lines = []
+    for raw in ledger_lines:
+        try:
+            event = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(event.get("ts", 0)))
+        kind = event.get("type")
+        if kind == "verification":
+            outcome = "PASS" if event.get("exit_code") == 0 else f"FAIL (exit {event.get('exit_code')})"
+            lines.append(f"- {ts} — iteration {event.get('iteration')}: verifier {outcome}")
+        elif kind == "agent_run":
+            lines.append(f"- {ts} — {event.get('engine')} run: exit {event.get('exit_code')}, "
+                         f"${float(event.get('cost_usd', 0)):.2f}, "
+                         f"{float(event.get('wall_seconds', 0)):.0f}s")
+        elif kind == "human_gate":
+            lines.append(f"- {ts} — human gate: {event.get('decision')}")
+        elif kind == "delivery":
+            lines.append(f"- {ts} — delivered ({event.get('mode')}): {event.get('detail', '')}")
+        elif kind == "mission_stop":
+            lines.append(f"- {ts} — stop: {event.get('status')} ({event.get('reason')})")
+    lines += ["", "## Pointers", ""]
+    for key, label in (("latest_agent_result", "latest agent result"),
+                       ("latest_verifier_log", "latest verifier log"),
+                       ("latest_critic_findings", "latest critic findings")):
+        value = getattr(state, key)
+        if value:
+            lines.append(f"- {label}: `{value}`")
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
+def deliver_results(runtime: dict[str, Any], state: State) -> bool:
+    """Externalize accepted work per the mission's delivery mode.
+
+    git   → commit everything to a dedicated branch
+    local → leave the working tree as-is
+    out   → copy changed files + report into ~/absoloop/out/<loop_id>/"""
+    delivery = runtime.get("delivery") or {"mode": "local"}
+    mode = delivery.get("mode", "local")
+    loop_id = runtime.get("loop_id", state.mission_id)
+
+    if mode == "local":
+        say("delivery (local): changes stay unstaged in the working tree — "
+            "review with 'git diff', commit when satisfied")
+        append_ledger({"type": "delivery", "mode": "local",
+                       "detail": "changes left unstaged in the working tree"})
+        return True
+
+    if mode == "git":
+        if not shutil.which("git"):
+            say("delivery (git) FAILED: git not found on PATH — changes remain unstaged")
+            return False
+        branch = delivery.get("branch") or f"absoloop/{loop_id}"
+        for command in (["git", "checkout", "-B", branch],
+                        ["git", "add", "-A"],
+                        ["git", "commit", "-m",
+                         f"absoloop {state.mission_id} {loop_id}: "
+                         f"{runtime.get('objective', 'mission result')}"]):
+            result = subprocess.run(command, cwd=ROOT, text=True,
+                                    capture_output=True, check=False)
+            if result.returncode != 0:
+                tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["unknown error"]
+                say(f"delivery (git) FAILED at '{' '.join(command)}': {tail[0]}")
+                return False
+        say(f"delivery (git): committed to branch '{branch}' — push/PR when ready")
+        append_ledger({"type": "delivery", "mode": "git", "detail": f"branch {branch}"})
+        return True
+
+    if mode == "out":
+        out_dir = pathlib.Path(delivery.get("out_dir", "")
+                               or pathlib.Path.home() / "absoloop" / "out" / loop_id).expanduser()
+        files_dir = out_dir / "files"
+        changed = [p for p in git_changed_files() if not p.startswith(".absoloop/")]
+        copied = 0
+        for rel in changed:
+            src = ROOT / rel
+            if not src.is_file():
+                continue  # deletions and directories are recorded in the report
+            dest = files_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            copied += 1
+        out_dir.mkdir(parents=True, exist_ok=True)
+        report_path = write_report(runtime, state)
+        shutil.copy2(report_path, out_dir / "report.md")
+        for extra in (STATE_PATH, LEDGER_PATH):
+            if extra.is_file():
+                shutil.copy2(extra, out_dir / extra.name)
+        goal_path = ROOT / runtime.get("goal_path", ".absoloop/goal.md")
+        if goal_path.is_file():
+            shutil.copy2(goal_path, out_dir / "goal.md")
+        say(f"delivery (out): {copied} changed file(s) + report exported to {out_dir}")
+        if not changed:
+            say("delivery (out): note — no uncommitted changes were detected to copy")
+        append_ledger({"type": "delivery", "mode": "out",
+                       "detail": f"{copied} file(s) to {out_dir}"})
+        return True
+
+    say(f"delivery: unknown mode {mode!r} — changes remain unstaged")
+    return False
+
+
+def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int:
+    state.stop_reason = reason
+    state.status = status
+    checkpoint(state, "terminal")
+    append_ledger({"type": "mission_stop", "reason": reason, "status": status})
+    say(f"mission stopped: {status} (reason: {reason}) after {state.iteration} "
+        f"iteration(s), total cost ${state.cost_usd:.2f}")
+    if status == "COMPLETED":
+        deliver_results(runtime, state)
+    report_path = write_report(runtime, state)
+    say(f"report: {report_path.relative_to(ROOT)} (or run 'absoloop report')")
+    if status == "COMPLETED":
+        checkpoint(state, "terminal")  # persist any delivery bookkeeping
+        return 0
+    if status == "AWAITING_APPROVAL":
+        # Every automated gate passed; human approval still required.
+        say("next: review the diff and verifier log, then 'absoloop approve' to "
+            "accept, or 'absoloop reject \"what to change\"' to answer the agent "
+            "and 'absoloop resume' to continue the loop")
+        return 3
+    return 2
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--engine", choices=["claude", "codex"])
+    parser.add_argument("--deliver-only", action="store_true",
+                        help="skip the loop: apply the mission's delivery mode to the "
+                             "current results and regenerate the report (used by "
+                             "'absoloop approve')")
+    args = parser.parse_args()
+
+    runtime = load_json(RUNTIME_PATH)
+    TMP.mkdir(parents=True, exist_ok=True)
+
+    if STATE_PATH.exists():
+        state = State(**load_json(STATE_PATH))
+    else:
+        state = State(mission_id=runtime["mission_id"], started_at=time.time())
+        checkpoint(state, "initial")
+
+    if args.deliver_only:
+        delivered = deliver_results(runtime, state)
+        report_path = write_report(runtime, state)
+        say(f"report: {report_path.relative_to(ROOT)} (or run 'absoloop report')")
+        return 0 if delivered else 2
+
+    if args.engine is None:
+        parser.error("--engine is required unless --deliver-only is given")
+
+    # Terminal-state guards: never burn budget re-running a decided mission.
+    if state.status == "COMPLETED":
+        say(f"mission {state.mission_id} is already COMPLETED — archive or delete "
+            ".absoloop/state.json to start a new mission")
+        return 0
+    if state.status == "AWAITING_APPROVAL":
+        say("mission passed every automated gate and is awaiting your decision — "
+            "not re-running (that would spend budget on an accepted mission)")
+        say("  accept:  absoloop approve")
+        say('  respond: absoloop reject "what to change"   then: absoloop resume')
+        return 3
+
+    max_wall = float(runtime["max_wall_seconds"])
+    verifier_timeout = min(900, int(max_wall))
+
+    say(f"mission {state.mission_id}: {runtime['objective']}")
+    say(f"verifier: $ {runtime['verify_command']}")
+    say(f"budgets: {runtime['max_iterations']} iterations, ${runtime['max_cost_usd']:.2f}, "
+        f"{int(max_wall)}s wall clock")
+    goal_path = ROOT / runtime.get("goal_path", ".absoloop/goal.md")
+    say(f"goal contract: {goal_path.relative_to(ROOT)}"
+        + ("" if goal_path.is_file() else " (missing — using inline fallback)"))
+    delivery = runtime.get("delivery") or {"mode": "local"}
+    delivery_detail = {"git": f"branch {delivery.get('branch', '?')}",
+                       "out": delivery.get("out_dir", "?"),
+                       "local": "working tree, unstaged"}.get(delivery.get("mode", "local"), "?")
+    say(f"delivery on acceptance: {delivery.get('mode', 'local')} ({delivery_detail})")
+
+    # Baseline before any model spend (Section 9.3). If the mission is already
+    # green, acceptance still requires the integrity check and the critic.
+    if not state.baseline_done:
+        baseline_log = TMP / "iteration-0000-baseline.log"
+        baseline = run_command(runtime["verify_command"], baseline_log, verifier_timeout,
+                               label="baseline verifier")
+        state.baseline_done = True
+        state.latest_verifier_log = str(baseline_log.relative_to(ROOT))
+        append_ledger({"type": "baseline", "exit_code": baseline.returncode,
+                       "log": state.latest_verifier_log})
+        checkpoint(state, "baseline")
+        if baseline.returncode == 127:
+            # The verifier itself cannot run (command not found). Iterating
+            # would burn the whole budget with no chance of ever passing.
+            say("the verifier command does not exist — fix verify_command in "
+                ".absoloop/runtime.json before restarting the loop")
+            return stop(state, "verifier_command_not_found", "BLOCKED", runtime)
+        if baseline.returncode == 0:
+            verdict = final_acceptance(runtime, state, args.engine, verifier_timeout)
+            if verdict is not None:
+                return stop(state, *verdict, runtime)
+
+    while state.iteration < int(runtime["max_iterations"]):
+        if time.time() - state.started_at >= max_wall:
+            return stop(state, "wall_clock_budget", "BUDGET_EXHAUSTED", runtime)
+        if state.cost_usd >= float(runtime["max_cost_usd"]):
+            return stop(state, "cost_budget", "BUDGET_EXHAUSTED", runtime)
+
+        # Re-read the mission config so an operator (or builder) fix to
+        # verify_command or budgets takes effect on the next iteration instead
+        # of being silently ignored for the rest of the run.
+        try:
+            fresh = json.loads(RUNTIME_PATH.read_text(encoding="utf-8"))
+            if fresh.get("verify_command") != runtime.get("verify_command"):
+                say(f"runtime.json changed on disk — verifier is now: "
+                    f"$ {fresh.get('verify_command')}")
+            runtime = fresh
+            max_wall = float(runtime["max_wall_seconds"])
+            verifier_timeout = min(900, int(max_wall))
+        except (OSError, json.JSONDecodeError):
+            say("warning: runtime.json unreadable right now — keeping previous config")
+
+        state.iteration += 1
+        state.status = "EXECUTING"
+        checkpoint(state, "pre-agent")
+        say(f"iteration {state.iteration}/{runtime['max_iterations']} — "
+            f"spent ${state.cost_usd:.2f} of ${float(runtime['max_cost_usd']):.2f}, "
+            f"{int(max_wall - (time.time() - state.started_at))}s wall clock left")
+
+        previous_log = (
+            ROOT / state.latest_verifier_log
+            if state.latest_verifier_log
+            else None
+        )
+        prompt = build_iteration_prompt(runtime, state, previous_log, args.engine)
+        prompt_path = TMP / f"iteration-{state.iteration:04d}-prompt.md"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        if state.human_feedback:
+            say("operator feedback delivered to the builder in this iteration's prompt")
+            state.human_feedback = None  # consumed once; findings/logs carry forward
+        rung = thinking_rung(runtime, state)
+        scale = float(rung.get("budget_scale", 1.0))
+        scale = scale if scale >= 1.0 else 1.0
+        say(f"thinking level: "
+            f"{rung['claude_keyword'] if args.engine == 'claude' else rung['codex_effort']} "
+            f"(repeated failures: {state.repeated_failure_count}, "
+            f"per-run budgets ×{scale:g})")
+
+        def scaled(cfg: dict[str, Any]) -> dict[str, Any]:
+            # Deeper thinking needs room to run: widen this iteration's
+            # wall-clock and cost caps by the rung's budget_scale. The
+            # mission-level caps still bound total spend.
+            cfg = dict(cfg)
+            cfg["max_wall_seconds"] = int(float(cfg.get("max_wall_seconds", 1200)) * scale)
+            cfg["max_budget_usd"] = round(float(cfg.get("max_budget_usd", 5.0)) * scale, 2)
+            return cfg
+
+        result_path = TMP / f"iteration-{state.iteration:04d}-agent-result.json"
+        if args.engine == "claude":
+            extra_env: dict[str, str] = {}
+            tokens = rung.get("claude_thinking_tokens")
+            if isinstance(tokens, (int, float)) and tokens > 0:
+                # Real extended-thinking budget to match the prompt keyword.
+                extra_env["MAX_THINKING_TOKENS"] = str(int(tokens))
+            run = run_claude(prompt, scaled(runtime["claude"]["builder"]), result_path,
+                             label="builder", extra_env=extra_env)
+        else:
+            builder_cfg = scaled(runtime["codex"]["builder"])
+            configured = str(builder_cfg.get("model_reasoning_effort", "medium"))
+            codex_effort = str(rung.get("codex_effort", configured))
+            # Escalation only ever raises the configured effort, never lowers it.
+            if CODEX_EFFORT_RANK.get(codex_effort, 2) > CODEX_EFFORT_RANK.get(configured, 2):
+                builder_cfg["model_reasoning_effort"] = codex_effort
+            run = run_codex(prompt, builder_cfg,
+                            runtime["codex"].get("pricing"), result_path, RESULT_SCHEMA,
+                            label="builder")
+
+        state.cost_usd += run.cost_usd
+        if not run.cost_is_exact:
+            state.inexact_cost_events += 1
+        report_spend(state, runtime)
+        state.latest_agent_result = str(result_path.relative_to(ROOT))
+        say_agent_message(result_path, "builder")
+
+        if run.exit_code != 0 or run.limit_reached:
+            # A limit-terminated CLI run is a bounded failure, never completion.
+            append_ledger({"type": "bounded_agent_failure", "iteration": state.iteration,
+                           "exit_code": run.exit_code, "limit_reached": run.limit_reached})
+
+        state.status = "VERIFYING"
+        verifier_log = TMP / f"iteration-{state.iteration:04d}-verify.log"
+        verification = run_command(runtime["verify_command"], verifier_log, verifier_timeout)
+        state.latest_verifier_log = str(verifier_log.relative_to(ROOT))
+
+        append_ledger({
+            "type": "verification",
+            "iteration": state.iteration,
+            "exit_code": verification.returncode,
+            "log": state.latest_verifier_log,
+        })
+
+        if verification.returncode == 0:
+            checkpoint(state, "verified")
+            verdict = final_acceptance(runtime, state, args.engine, verifier_timeout)
+            if verdict is not None:
+                return stop(state, *verdict, runtime)
+            checkpoint(state, "critic-hold")
+            continue  # critic HOLD: findings feed the next repair iteration
+
+        if verification.returncode == 127:
+            say("the verifier command does not exist — fix verify_command in "
+                ".absoloop/runtime.json before restarting the loop")
+            return stop(state, "verifier_command_not_found", "BLOCKED", runtime)
+
+        failure_text = verifier_log.read_text(encoding="utf-8", errors="replace")
+        fingerprint = normalized_fingerprint(failure_text)
+        if fingerprint == state.last_failure_fingerprint:
+            state.repeated_failure_count += 1
+            say(f"same failure as last iteration ({state.repeated_failure_count} in a row; "
+                f"loop stops at {runtime['no_progress_window']})")
+        else:
+            state.repeated_failure_count = 1
+            state.last_failure_fingerprint = fingerprint
+
+        checkpoint(state, "post-verifier")
+
+        if state.repeated_failure_count >= int(runtime["no_progress_window"]):
+            return stop(state, "no_progress_window", "BLOCKED", runtime)
+
+    return stop(state, "iteration_budget", "BUDGET_EXHAUSTED", runtime)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

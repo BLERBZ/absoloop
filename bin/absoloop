@@ -1,0 +1,1228 @@
+#!/usr/bin/env python3
+"""absoloop — scaffold and start an ABSOLOOP mission project from anywhere.
+
+Cross-platform: macOS, Linux, Windows (via absoloop.cmd shim or `python absoloop`).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+
+ABSOLOOP_HOME = pathlib.Path(os.environ.get("ABSOLOOP_HOME", pathlib.Path.home() / "absoloop"))
+TEMPLATES = ABSOLOOP_HOME / "templates"
+
+EPILOG = """\
+examples:
+  absoloop                      # fully interactive
+  absoloop my-mission           # prompts only for objective + verifier
+  absoloop my-mission -o "Make all tests pass" -v "pytest -q" --start
+                                  # one shot: scaffold and start the loop
+  absoloop existing-project     # adopts an existing directory in place
+  absoloop .                    # adopt the directory you are already in
+  absoloop status               # where is the mission? what should I do next?
+  absoloop report               # iteration-by-iteration results timeline
+  absoloop goal                 # show the generated /goal contract
+                                  # (--regen rebuilds it; --check validates the
+                                  #  mission config it is generated from)
+  absoloop my-mission -d out    # deliver accepted work to ~/absoloop/out/<loop_id>/
+                                  # (-d git commits to a branch; -d local leaves
+                                  #  changes unstaged; prompted when omitted)
+  absoloop resume               # re-enter the active mission's loop in place
+  absoloop resume --extend      # follow-on run for a COMPLETED mission: fresh
+                                  budgets, previous work carried in as context
+  absoloop resume --extend -m "finish the CLI flags too" --hours 4 --iterations 30
+                                  # extended follow-on run with a focus note
+  absoloop approve              # accept a mission stopped at the human gate
+  absoloop reject "use the v2 API instead"
+                                  # answer the agent; feedback lands in the
+                                  # next iteration's prompt — then resume
+
+New directories are scaffolded; existing ones are adopted — ABSOLOOP files
+are added only where missing, and an existing .absoloop/runtime.json is
+reused (pass -o/-v to update the mission in place).
+
+Runner exit codes: 0 = completed, 3 = accepted & awaiting your approval,
+2 = stopped safely (see stop_reason in the printed state).
+"""
+
+CRITIC_PROMPT = """\
+You are an independent adversarial reviewer. Attempt to disprove that the
+current working tree satisfies the mission contract. Inspect the relevant
+files yourself with read-only tools; do not trust any builder narrative.
+Look for weakened tests, unverifiable claims, regressions, and scope drift.
+Do not edit files.
+"""
+
+RESULT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {"type": "string"},
+        "changed_artifacts": {"type": "array", "items": {"type": "string"}},
+        "commands_run": {"type": "array", "items": {"type": "string"}},
+        "risks": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["summary", "changed_artifacts", "risks"],
+}
+
+# ---------------------------------------------------------------------------
+# Delivery modes — where accepted loop work ends up.
+# ---------------------------------------------------------------------------
+
+OUT_ROOT = ABSOLOOP_HOME / "out"
+
+DELIVERY_MODES = {
+    "git": "commit accepted work to a dedicated branch (absoloop/<loop_id>)",
+    "local": "leave changes unstaged in the working tree (you commit yourself)",
+    "out": f"export changed files + report to {OUT_ROOT}/<loop_id>/",
+}
+
+
+def default_delivery(mode: str, loop_id: str) -> dict:
+    return {
+        "mode": mode,
+        "branch": f"absoloop/{loop_id}",
+        "out_dir": str(OUT_ROOT / loop_id),
+    }
+
+
+def new_loop_id() -> str:
+    return f"loop-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+
+
+# ---------------------------------------------------------------------------
+# Goal engine — turn (objective, verifier) into a /goal contract the loop
+# feeds to claude/codex every iteration, tuned per mission type so long
+# thinking loops spend their depth on the right things.
+# ---------------------------------------------------------------------------
+
+MISSION_PROFILES = {
+    "tests": {
+        "keywords": ("test", "pytest", "jest", "vitest", "spec", "coverage",
+                     "unit test", "e2e", "regression"),
+        "done": [
+            "Every test in the verifier's scope passes; no test is skipped, "
+            "deleted, or weakened to get there.",
+        ],
+        "strategies": [
+            "Reproduce the failing tests and read the complete failure output "
+            "before touching any file.",
+            "Fix root causes in the code under test; change a test only when "
+            "you can prove the test itself is wrong.",
+            "After each fix, re-run only the affected tests first, then widen.",
+        ],
+    },
+    "bugfix": {
+        "keywords": ("fix", "bug", "error", "crash", "broken", "fail",
+                     "regression", "issue", "defect"),
+        "done": [
+            "The reported failure can no longer be reproduced, and a check "
+            "exists that would catch it if it returned.",
+        ],
+        "strategies": [
+            "Reproduce the bug first and capture the exact failing behavior.",
+            "Trace to the root cause before editing — reject the first "
+            "plausible surface-level explanation.",
+            "Prefer the smallest fix at the true cause over broad rewrites.",
+        ],
+    },
+    "feature": {
+        "keywords": ("add", "implement", "create", "build", "support",
+                     "feature", "new", "introduce", "generate"),
+        "done": [
+            "The new capability works end-to-end for the primary use case and "
+            "fails loudly (not silently) outside it.",
+        ],
+        "strategies": [
+            "Study existing patterns in the codebase and extend them rather "
+            "than inventing parallel structures.",
+            "Build the thinnest end-to-end slice first, verify it, then deepen.",
+            "Wire the feature into the verifier's path early so progress is "
+            "measurable every iteration.",
+        ],
+    },
+    "refactor": {
+        "keywords": ("refactor", "clean", "simplif", "restructure", "migrat",
+                     "rename", "extract", "consolidat", "moderniz"),
+        "done": [
+            "Behavior is unchanged — the verifier passes before and after, and "
+            "no public contract was altered without the mission saying so.",
+        ],
+        "strategies": [
+            "Confirm the verifier is green on the untouched baseline before "
+            "moving anything.",
+            "Refactor in small, individually-verifiable steps; never combine a "
+            "behavior change with a structural move.",
+        ],
+    },
+    "perf": {
+        "keywords": ("performance", "speed", "optimi", "faster", "latency",
+                     "memory", "throughput"),
+        "done": [
+            "The measured improvement is demonstrated by the verifier, not "
+            "asserted from reading the code.",
+        ],
+        "strategies": [
+            "Measure before optimizing; keep the measurement command in the "
+            "iteration notes.",
+            "Optimize the single hottest path per iteration, re-measure, and "
+            "keep or revert based on evidence.",
+        ],
+    },
+    "docs": {
+        "keywords": ("doc", "readme", "comment", "guide", "tutorial",
+                     "changelog"),
+        "done": [
+            "Every documented command and example actually runs as written.",
+        ],
+        "strategies": [
+            "Verify claims against the code before writing them down.",
+            "Run every example command you document.",
+        ],
+    },
+}
+
+GOAL_CONSTRAINTS = [
+    "Never weaken, skip, or delete tests or acceptance criteria to make the "
+    "verifier pass — that is mission failure, not success.",
+    "Make the smallest authorized change that moves the verifier toward zero; "
+    "avoid opportunistic edits outside the mission.",
+    "Do not push, publish, deploy, or perform destructive or external actions "
+    "— delivery is handled by the loop after acceptance.",
+    "Do not claim completion; only the verifier, critic, and human gate decide.",
+]
+
+# Canonical thinking rungs, shallow → deep. claude_thinking_tokens becomes the
+# MAX_THINKING_TOKENS budget the runner exports for `claude -p` (so escalation
+# buys real extended-thinking capacity, not just a keyword); budget_scale
+# widens the builder's per-run wall-clock and cost caps so a deep-thinking
+# iteration is not killed by limits sized for shallow ones.
+THINKING_RUNGS = [
+    {"claude_keyword": "think", "claude_thinking_tokens": 4000,
+     "codex_effort": "medium", "budget_scale": 1.0,
+     "posture": "Plan briefly, act on the strongest hypothesis."},
+    {"claude_keyword": "think hard", "claude_thinking_tokens": 10000,
+     "codex_effort": "high", "budget_scale": 1.25,
+     "posture": "The obvious fix failed once — re-derive the failure from "
+                "evidence before editing."},
+    {"claude_keyword": "think harder", "claude_thinking_tokens": 16000,
+     "codex_effort": "high", "budget_scale": 1.5,
+     "posture": "Two identical failures — your model of the problem is wrong. "
+                "Enumerate at least three distinct hypotheses and test the most "
+                "falsifiable one."},
+    {"claude_keyword": "ultrathink", "claude_thinking_tokens": 31999,
+     "codex_effort": "high", "budget_scale": 2.0,
+     "posture": "Last chance before the loop blocks. Step back to first "
+                "principles, question the verifier's assumptions, and consider "
+                "whether the mission needs operator input."},
+]
+
+REPEAT_LABELS = ["0 (fresh evidence)", "1 (first repeat)",
+                 "2 (second repeat)", "3+ (final window)"]
+
+# Mission types whose failures are usually only understood after deep analysis
+# start one rung up the ladder instead of spending an iteration on a shallow try.
+MISSION_BASE_DEPTH = {"tests": 0, "bugfix": 1, "feature": 0,
+                      "refactor": 0, "perf": 1, "docs": 0}
+
+
+def build_thinking_ladder(kinds: list[str]) -> list[dict]:
+    """Generate the mission's thinking escalation ladder: repeated-failure
+    count → rung. The base depth comes from the mission type (bugfix/perf
+    start at 'think hard'); each repeated failure climbs one rung, capped at
+    ultrathink. Stored in runtime.json so the runner and the /goal contract
+    share exactly one ladder per loop."""
+    base = max((MISSION_BASE_DEPTH.get(kind, 0) for kind in kinds), default=0)
+    return [{"repeats": label,
+             **THINKING_RUNGS[min(base + repeats, len(THINKING_RUNGS) - 1)]}
+            for repeats, label in enumerate(REPEAT_LABELS)]
+
+
+def classify_mission(objective: str) -> list[str]:
+    lower = objective.lower()
+    kinds = [name for name, profile in MISSION_PROFILES.items()
+             if any(keyword in lower for keyword in profile["keywords"])]
+    return kinds or ["general"]
+
+
+def generate_goal_markdown(config: dict) -> str:
+    """Render the mission's /goal contract from its runtime config.
+
+    Deterministic and self-contained: everything is derived from the objective,
+    verifier, and delivery mode, so the same mission always yields the same
+    contract and the runner can trust it as ground truth."""
+    objective = config.get("objective", "")
+    verify = config.get("verify_command", "")
+    kinds = classify_mission(objective)
+    delivery = config.get("delivery") or default_delivery("local", config.get("loop_id", "loop"))
+
+    done: list[str] = list(config.get("definition_of_done", []))
+    strategies: list[str] = []
+    for kind in kinds:
+        profile = MISSION_PROFILES.get(kind)
+        if not profile:
+            continue
+        done.extend(item for item in profile["done"] if item not in done)
+        strategies.extend(s for s in profile["strategies"] if s not in strategies)
+    if not strategies:
+        strategies = [
+            "Inspect the current state and the verifier's failure evidence "
+            "before editing anything.",
+            "Pick one bounded strategy per iteration and see it through.",
+        ]
+
+    gate = ("the human operator approves the result"
+            if config.get("require_human_approval", True)
+            else "all automated gates pass")
+
+    lines = [
+        f"# /goal — {objective}",
+        "",
+        f"mission: {config.get('mission_id', '?')} · loop: {config.get('loop_id', '?')} · "
+        f"type: {', '.join(kinds)}",
+        "",
+    ]
+    continuation = config.get("continuation")
+    if isinstance(continuation, dict) and continuation.get("previous_loop_id"):
+        lines += [
+            "## Continuation of previous run (context — the mission above is still ground truth)",
+            "",
+            f"This run extends {continuation['previous_loop_id']} "
+            f"(ended {continuation.get('previous_status', '?')} after "
+            f"{continuation.get('iterations', '?')} iteration(s), "
+            f"${float(continuation.get('cost_usd', 0)):.2f}).",
+        ]
+        if continuation.get("summary"):
+            lines += ["", f"Where the previous run left off: {continuation['summary']}"]
+        lines += [
+            "",
+            "Operator's continuation intent: "
+            + (continuation.get("note") or "complete what the previous run started."),
+            "",
+            "The previous run's work is already in the working tree. Build on it — "
+            "inspect what exists before editing, and do not redo or revert it.",
+            "",
+        ]
+    lines += [
+        "## Success condition (the only thing that ends this loop)",
+        "",
+        f"`{verify}` exits 0 in two consecutive clean runs, an independent",
+        f"critic finds no blocking issue, and {gate}.",
+        "Nothing else counts — not effort, not plausible-looking diffs, not",
+        "your own assessment that the work is done.",
+        "",
+        "## Definition of done",
+        "",
+    ]
+    lines += [f"- {item}" for item in done]
+    lines += ["", "## Strategy ladder (one bounded strategy per iteration)", ""]
+    lines += [f"{i}. {s}" for i, s in enumerate(strategies, 1)]
+    lines += ["", "## Constraints", ""]
+    lines += [f"- {c}" for c in GOAL_CONSTRAINTS]
+    ladder = config.get("thinking_ladder")
+    if not (isinstance(ladder, list) and ladder):
+        ladder = build_thinking_ladder(kinds)
+    lines += [
+        "",
+        "## Thinking escalation (repeated-failure count → depth)",
+        "",
+        "| repeats | claude | thinking tokens | codex effort | budgets | posture |",
+        "|---|---|---|---|---|---|",
+    ]
+    lines += [f"| {rung.get('repeats', i)} | {rung.get('claude_keyword', 'think')} "
+              f"| {rung.get('claude_thinking_tokens', '?')} "
+              f"| {rung.get('codex_effort', 'medium')} "
+              f"| ×{rung.get('budget_scale', 1.0):g} "
+              f"| {rung.get('posture', '')} |"
+              for i, rung in enumerate(ladder)]
+    lines += [
+        "",
+        "## Delivery (applied by the loop after acceptance — never by you)",
+        "",
+        f"- mode: **{delivery.get('mode', 'local')}** — "
+        f"{DELIVERY_MODES.get(delivery.get('mode', 'local'), '')}",
+    ]
+    if delivery.get("mode") == "git":
+        lines.append(f"- branch: `{delivery.get('branch')}`")
+    if delivery.get("mode") == "out":
+        lines.append(f"- out dir: `{delivery.get('out_dir')}`")
+    return "\n".join(lines) + "\n"
+
+
+VALID_CODEX_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_CLAUDE_KEYWORDS = ("think", "think hard", "think harder", "ultrathink")
+
+
+def validate_thinking_ladder(ladder) -> list[str]:
+    """Problems with a thinking ladder, empty when it is sound.
+
+    A sound ladder is non-empty, every rung is complete and well-typed, and
+    depth never decreases as failures repeat — an escalation ladder that
+    de-escalates would silently waste the loop's hardest iterations."""
+    if not isinstance(ladder, list) or not ladder:
+        return ["thinking_ladder must be a non-empty list of rungs"]
+    problems: list[str] = []
+    previous_tokens = previous_scale = previous_effort = None
+    effort_rank = {name: rank for rank, name in enumerate(VALID_CODEX_EFFORTS)}
+    for index, rung in enumerate(ladder):
+        where = f"rung {index}"
+        if not isinstance(rung, dict):
+            problems.append(f"{where}: not an object")
+            continue
+        keyword = rung.get("claude_keyword")
+        if keyword not in VALID_CLAUDE_KEYWORDS:
+            problems.append(f"{where}: claude_keyword {keyword!r} is not one of "
+                            f"{', '.join(VALID_CLAUDE_KEYWORDS)}")
+        effort = rung.get("codex_effort")
+        if effort not in VALID_CODEX_EFFORTS:
+            problems.append(f"{where}: codex_effort {effort!r} is not one of "
+                            f"{', '.join(VALID_CODEX_EFFORTS)}")
+        tokens = rung.get("claude_thinking_tokens")
+        if not isinstance(tokens, (int, float)) or tokens <= 0:
+            problems.append(f"{where}: claude_thinking_tokens must be a positive number")
+            tokens = None
+        scale = rung.get("budget_scale")
+        if not isinstance(scale, (int, float)) or scale < 1.0:
+            problems.append(f"{where}: budget_scale must be a number >= 1.0")
+            scale = None
+        if not str(rung.get("posture", "")).strip():
+            problems.append(f"{where}: posture is empty")
+        if tokens is not None and previous_tokens is not None and tokens < previous_tokens:
+            problems.append(f"{where}: claude_thinking_tokens decreases "
+                            f"({previous_tokens} → {tokens}) — the ladder must escalate")
+        if scale is not None and previous_scale is not None and scale < previous_scale:
+            problems.append(f"{where}: budget_scale decreases "
+                            f"({previous_scale:g} → {scale:g}) — the ladder must escalate")
+        if (effort in effort_rank and previous_effort in effort_rank
+                and effort_rank[effort] < effort_rank[previous_effort]):
+            problems.append(f"{where}: codex_effort de-escalates "
+                            f"({previous_effort} → {effort})")
+        previous_tokens = tokens if tokens is not None else previous_tokens
+        previous_scale = scale if scale is not None else previous_scale
+        previous_effort = effort if effort in effort_rank else previous_effort
+    return problems
+
+
+def validate_goal_config(config: dict, target: pathlib.Path | None = None) -> list[str]:
+    """Problems that would make the generated /goal contract weak or wrong.
+
+    Run before every write so a contract with a hollow success condition
+    (empty objective, unrunnable verifier, broken ladder) never becomes the
+    loop's ground truth."""
+    problems: list[str] = []
+    objective = str(config.get("objective", "")).strip()
+    if not objective:
+        problems.append("objective is empty — the contract has no mission")
+    elif len(objective) < 8:
+        problems.append(f"objective {objective!r} is too short to define done")
+    verify = str(config.get("verify_command", "")).strip()
+    if not verify:
+        problems.append("verify_command is empty — nothing can ever end the loop")
+    elif target is not None:
+        problem = verifier_problem(verify, target)
+        if problem:
+            problems.append(problem)
+    done = config.get("definition_of_done")
+    if not (isinstance(done, list) and any(str(item).strip() for item in done)):
+        problems.append("definition_of_done is empty")
+    delivery_mode = (config.get("delivery") or {}).get("mode", "local")
+    if delivery_mode not in DELIVERY_MODES:
+        problems.append(f"delivery mode {delivery_mode!r} is not one of "
+                        f"{', '.join(sorted(DELIVERY_MODES))}")
+    if config.get("thinking_ladder") is not None:
+        problems.extend(validate_thinking_ladder(config["thinking_ladder"]))
+    return problems
+
+
+def write_goal(target: pathlib.Path, config: dict) -> pathlib.Path:
+    problems = validate_goal_config(config, target)
+    for problem in problems:
+        print(f"goal check: {problem}", file=sys.stderr)
+    ladder_broken = config.get("thinking_ladder") is not None and \
+        validate_thinking_ladder(config["thinking_ladder"])
+    if ladder_broken:
+        # Never render a de-escalating or malformed ladder into the contract;
+        # regenerate a sound one from the mission type instead.
+        config = {**config,
+                  "thinking_ladder": build_thinking_ladder(
+                      classify_mission(str(config.get("objective", ""))))}
+        print("goal check: replaced invalid thinking_ladder with a regenerated one "
+              "(runtime.json still holds your version — fix or delete it)", file=sys.stderr)
+    goal_path = target / ".absoloop" / "goal.md"
+    goal_path.parent.mkdir(parents=True, exist_ok=True)
+    goal_path.write_text(generate_goal_markdown(config), encoding="utf-8")
+    return goal_path
+
+
+def runtime_config(objective: str, verify_command: str,
+                   loop_id: str, delivery_mode: str) -> dict:
+    return {
+        "mission_id": "ABS-MINIMAL-001",
+        "loop_id": loop_id,
+        "objective": objective,
+        "definition_of_done": [
+            "The verifier command exits zero in two consecutive clean runs.",
+            "An independent critic finds no blocking issue.",
+        ],
+        "verify_command": verify_command,
+        "thinking_ladder": build_thinking_ladder(classify_mission(objective)),
+        "goal_path": ".absoloop/goal.md",
+        "critic_prompt_path": ".absoloop/prompts/critic-final-review.md",
+        "delivery": default_delivery(delivery_mode, loop_id),
+        "require_human_approval": True,
+        "max_iterations": 15,
+        "no_progress_window": 3,
+        "max_wall_seconds": 7200,
+        "max_cost_usd": 25.0,
+        "claude": {
+            "builder": {"permission_mode": "acceptEdits", "max_turns": 30,
+                        "max_budget_usd": 5.0, "max_wall_seconds": 1200},
+            "critic": {"permission_mode": "plan", "max_turns": 12,
+                       "max_budget_usd": 2.0, "max_wall_seconds": 600},
+        },
+        "codex": {
+            "builder": {"sandbox": "workspace-write", "max_budget_usd": 5.0,
+                        "max_wall_seconds": 1200, "model_reasoning_effort": "medium"},
+            "critic": {"sandbox": "read-only", "max_budget_usd": 2.0,
+                       "max_wall_seconds": 600, "model_reasoning_effort": "high"},
+        },
+    }
+
+
+def ask(prompt: str) -> str:
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        sys.exit(1)
+
+
+def verifier_problem(command: str, target: pathlib.Path) -> str | None:
+    """Return a message when the verifier command clearly cannot run.
+
+    Catches answers like '0' or 'done' before the loop burns budget on a
+    verifier that exits 127 forever. Compound shell commands are left to the
+    shell to judge."""
+    if any(token in command for token in ("&&", "||", "|", ";", "$(", "`", ">", "<")):
+        return None
+    head = command.split()[0] if command.split() else ""
+    if head and (shutil.which(head) or (target / head).exists()
+                 or pathlib.Path(head).expanduser().exists()):
+        return None
+    return (f"'{command}' is not a runnable command. The verifier must be a real "
+            "shell command that exits 0 only when the mission is complete, "
+            "e.g. 'pytest -q' or 'node scripts/verify.mjs'.")
+
+
+def default_engine() -> str | None:
+    for engine in ("claude", "codex"):
+        if shutil.which(engine):
+            return engine
+    return None
+
+
+def read_state(target: pathlib.Path) -> dict | None:
+    state_path = target / ".absoloop" / "state.json"
+    if not state_path.is_file():
+        print(f"error: {state_path} not found — run this inside an ABSOLOOP project "
+              "whose loop has run at least once.", file=sys.stderr)
+        return None
+    try:
+        return json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"error: invalid JSON in {state_path}: {exc}", file=sys.stderr)
+        return None
+
+
+def next_step_hint(state: dict) -> str:
+    status = state.get("status")
+    if status == "AWAITING_APPROVAL":
+        return ("review the diff and verifier log, then 'absoloop approve' — or "
+                "'absoloop reject \"what to change\"' followed by 'absoloop resume'")
+    if status == "COMPLETED":
+        return ("results were delivered per the mission's delivery mode (see "
+                "'absoloop report'); 'absoloop resume --extend' starts a "
+                "follow-on run that continues this work with fresh budgets")
+    if status == "BUDGET_EXHAUSTED":
+        return ("raise max_iterations / max_cost_usd / max_wall_seconds in "
+                ".absoloop/runtime.json, then 'absoloop resume'")
+    if status == "BLOCKED":
+        return ("inspect stop_reason and the latest logs, fix the cause (or "
+                "'absoloop reject \"guidance\"'), then 'absoloop resume'")
+    return "'absoloop resume' continues the loop from saved state"
+
+
+def budget_bar(used: float, cap: float, width: int = 22) -> str:
+    if not cap:
+        return ""
+    frac = min(1.0, max(0.0, used / cap))
+    filled = int(round(frac * width))
+    return f"[{'█' * filled}{'░' * (width - filled)}] {100 * frac:.0f}%"
+
+
+def load_runtime(target: pathlib.Path) -> dict:
+    try:
+        return json.loads((target / ".absoloop" / "runtime.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def goal_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="absoloop goal",
+        description="Show (or regenerate) the mission's /goal contract.")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    parser.add_argument("--regen", action="store_true",
+                        help="regenerate .absoloop/goal.md from runtime.json")
+    parser.add_argument("--check", action="store_true",
+                        help="validate the mission config the contract is generated "
+                             "from; exit 1 on problems, print nothing else on success")
+    args = parser.parse_args(argv)
+    target = pathlib.Path(args.project).expanduser().resolve()
+    runtime = load_runtime(target)
+    if not runtime:
+        print(f"error: no readable .absoloop/runtime.json under {target}", file=sys.stderr)
+        return 1
+    if args.check:
+        problems = validate_goal_config(runtime, target)
+        for problem in problems:
+            print(f"goal check: {problem}", file=sys.stderr)
+        if not problems:
+            print("goal config OK — objective, verifier, delivery, and thinking "
+                  "ladder all pass validation")
+        return 1 if problems else 0
+    goal_path = target / runtime.get("goal_path", ".absoloop/goal.md")
+    if args.regen or not goal_path.is_file():
+        changed = False
+        if not runtime.get("loop_id"):
+            runtime["loop_id"] = new_loop_id()
+            changed = True
+        if validate_thinking_ladder(runtime.get("thinking_ladder")):
+            # Missing or invalid: repair runtime.json itself so the runner's
+            # escalation and the rendered contract agree again.
+            runtime["thinking_ladder"] = build_thinking_ladder(
+                classify_mission(str(runtime.get("objective", ""))))
+            changed = True
+        if changed:
+            # Persist what the contract was generated from, so the runner's
+            # escalation and the rendered ladder can never disagree.
+            (target / ".absoloop" / "runtime.json").write_text(
+                json.dumps(runtime, indent=2) + "\n", encoding="utf-8")
+        goal_path = write_goal(target, runtime)
+        print(f"(goal regenerated at {goal_path.relative_to(target)})\n")
+    print(goal_path.read_text(encoding="utf-8"), end="")
+    return 0
+
+
+def iter_ledger(target: pathlib.Path):
+    ledger_path = target / ".absoloop" / "ledger.jsonl"
+    if not ledger_path.is_file():
+        return
+    for line in ledger_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            yield event
+
+
+def agent_summary(target: pathlib.Path, result_rel: str) -> str:
+    """One-line builder summary out of a saved agent result file."""
+    try:
+        payload = json.loads((target / result_rel).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    structured = payload.get("structured_output")
+    structured = structured if isinstance(structured, dict) else payload
+    summary = structured.get("summary") or payload.get("result") or ""
+    return " ".join(str(summary).split())
+
+
+def report_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="absoloop report",
+        description="Iteration-by-iteration results view for the mission.")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    args = parser.parse_args(argv)
+    target = pathlib.Path(args.project).expanduser().resolve()
+    state = read_state(target)
+    if state is None:
+        return 1
+    runtime = load_runtime(target)
+
+    width = 62
+    def rule(char="─"):
+        print(char * width)
+
+    rule("═")
+    print(f" ABSOLOOP REPORT — {state.get('mission_id')} "
+          f"({runtime.get('loop_id', 'no loop id')})")
+    rule("═")
+    if runtime.get("objective"):
+        print(f" objective : {runtime['objective']}")
+    if runtime.get("verify_command"):
+        print(f" verifier  : $ {runtime['verify_command']}")
+    delivery = runtime.get("delivery") or {}
+    if delivery:
+        detail = delivery.get("branch") if delivery.get("mode") == "git" else \
+                 delivery.get("out_dir") if delivery.get("mode") == "out" else \
+                 "working tree (unstaged)"
+        print(f" delivery  : {delivery.get('mode', 'local')} → {detail}")
+    print(f" status    : {state.get('status')}"
+          + (f"  ({state.get('stop_reason')})" if state.get("stop_reason") else ""))
+    cap = float(runtime.get("max_cost_usd") or 0)
+    spent = float(state.get("cost_usd", 0))
+    print(f" spend     : ${spent:.2f} of ${cap:.2f}  {budget_bar(spent, cap)}")
+    max_iter = int(runtime.get("max_iterations") or 0)
+    done_iter = int(state.get("iteration", 0))
+    print(f" iterations: {done_iter} of {max_iter}  {budget_bar(done_iter, max_iter)}")
+    rule()
+
+    # Stitch the ledger into one line per loop event, oldest first.
+    events = list(iter_ledger(target))
+    if not events:
+        print(" (no ledger yet — the loop has not run)")
+        rule()
+        return 0
+    print(" timeline")
+    for event in events:
+        ts = time.strftime("%m-%d %H:%M", time.localtime(event.get("ts", 0)))
+        kind = event.get("type")
+        if kind == "baseline":
+            mark = "✓" if event.get("exit_code") == 0 else "✗"
+            print(f"  {ts}  baseline verifier {mark} (exit {event.get('exit_code')})")
+        elif kind == "agent_run":
+            cost = f"${float(event.get('cost_usd', 0)):.2f}"
+            exact = "" if event.get("cost_is_exact") else "~"
+            limit = f" [hit {event['limit_reached']}]" if event.get("limit_reached") else ""
+            print(f"  {ts}  {event.get('engine')} run — exit {event.get('exit_code')}, "
+                  f"{exact}{cost}, {float(event.get('wall_seconds', 0)):.0f}s{limit}")
+            summary = agent_summary(target, str(event.get("result", "")))
+            if summary:
+                print(f"           └ {summary[:110]}")
+        elif kind == "verification":
+            mark = "✓ PASS" if event.get("exit_code") == 0 else f"✗ FAIL (exit {event.get('exit_code')})"
+            print(f"  {ts}  iteration {event.get('iteration')}: verifier {mark}")
+        elif kind == "verification_rerun":
+            mark = "✓" if event.get("exit_code") == 0 else "✗ flaky"
+            print(f"  {ts}  acceptance re-run {mark}")
+        elif kind == "integrity_check":
+            mark = "✓" if event.get("exit_code") == 0 else "✗ VIOLATION"
+            print(f"  {ts}  integrity check {mark}")
+        elif kind == "human_gate":
+            note = event.get("feedback") or event.get("note") or ""
+            print(f"  {ts}  human gate: {event.get('decision')}"
+                  + (f" — {note}" if note else ""))
+        elif kind == "delivery":
+            print(f"  {ts}  delivered ({event.get('mode')}): {event.get('detail', '')}")
+        elif kind == "mission_stop":
+            print(f"  {ts}  ■ stop: {event.get('status')} ({event.get('reason')})")
+        elif kind == "extension":
+            note = event.get("note") or ""
+            print(f"  {ts}  ▶ extended: {event.get('previous_loop_id')} → "
+                  f"{event.get('loop_id')}" + (f" — {note}" if note else ""))
+    rule()
+    print(f" next: {next_step_hint(state)}")
+    report_md = target / ".absoloop" / "report.md"
+    if report_md.is_file():
+        print(f" full report: {report_md.relative_to(target)}")
+    rule()
+    return 0
+
+
+def status_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="absoloop status")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    args = parser.parse_args(argv)
+    target = pathlib.Path(args.project).expanduser().resolve()
+    state = read_state(target)
+    if state is None:
+        return 1
+    runtime = load_runtime(target)
+    print(f"mission:    {state.get('mission_id')}  ({target})")
+    if runtime.get("loop_id"):
+        print(f"loop:       {runtime['loop_id']}")
+    if runtime.get("objective"):
+        print(f"objective:  {runtime['objective']}")
+    if runtime.get("verify_command"):
+        print(f"verifier:   $ {runtime['verify_command']}")
+    delivery = runtime.get("delivery") or {}
+    if delivery:
+        print(f"delivery:   {delivery.get('mode', 'local')} — "
+              f"{DELIVERY_MODES.get(delivery.get('mode', 'local'), '')}")
+    print(f"status:     {state.get('status')}"
+          + (f"  (stop_reason: {state.get('stop_reason')})" if state.get("stop_reason") else ""))
+    max_iter = int(runtime.get("max_iterations") or 0)
+    print(f"iteration:  {state.get('iteration')} of {max_iter or '?'}  "
+          f"{budget_bar(int(state.get('iteration', 0)), max_iter)}")
+    cap = runtime.get("max_cost_usd")
+    print(f"spent:      ${float(state.get('cost_usd', 0)):.2f}"
+          + (f" of ${float(cap):.2f}  {budget_bar(float(state.get('cost_usd', 0)), float(cap))}"
+             if cap else ""))
+    if state.get("human_feedback"):
+        print(f"feedback:   queued for next iteration: {state['human_feedback']!r}")
+    for key, label in (("latest_agent_result", "agent result"),
+                       ("latest_verifier_log", "verifier log"),
+                       ("latest_critic_findings", "critic findings")):
+        if state.get(key):
+            print(f"latest {label}: {state[key]}")
+    print(f"next:       {next_step_hint(state)}")
+    print("more:       'absoloop report' shows the full iteration timeline; "
+          "'absoloop goal' shows the mission contract")
+    return 0
+
+
+def extend_mission(target: pathlib.Path, state: dict, engine: str,
+                   note: str, iterations: int | None, budget: float | None,
+                   hours: float | None) -> int:
+    """Start a follow-on loop run that continues a finished mission's work.
+
+    Archives the previous run's records under .absoloop/runs/<loop_id>/, resets
+    state so the runner starts fresh (baseline, counters, budgets), assigns a
+    new loop_id, and bakes the previous run's outcome into the regenerated
+    goal contract so every iteration knows it is completing earlier work."""
+    abs_dir = target / ".absoloop"
+    runtime = load_runtime(target)
+    if not runtime:
+        print(f"error: no readable .absoloop/runtime.json under {target}", file=sys.stderr)
+        return 1
+
+    prev_loop_id = runtime.get("loop_id", "previous-loop")
+    prev_status = state.get("status", "?")
+
+    # What the last run left behind, for the continuation context.
+    summary = ""
+    if state.get("latest_agent_result"):
+        summary = agent_summary(target, str(state["latest_agent_result"]))
+
+    # Archive the finished run's records; the ledger stays in place so the
+    # timeline remains continuous across runs.
+    archive = abs_dir / "runs" / prev_loop_id
+    archive.mkdir(parents=True, exist_ok=True)
+    for name in ("state.json", "report.md", "goal.md"):
+        source = abs_dir / name
+        if source.is_file():
+            shutil.copy2(source, archive / name)
+    (abs_dir / "state.json").unlink()
+
+    new_id = new_loop_id()
+    runtime["loop_id"] = new_id
+    runtime["continuation"] = {
+        "previous_loop_id": prev_loop_id,
+        "previous_status": prev_status,
+        "iterations": state.get("iteration", 0),
+        "cost_usd": float(state.get("cost_usd", 0)),
+        "summary": summary,
+        "note": note,
+    }
+    if iterations:
+        runtime["max_iterations"] = iterations
+    if budget:
+        runtime["max_cost_usd"] = budget
+    if hours:
+        runtime["max_wall_seconds"] = int(hours * 3600)
+    delivery_mode = (runtime.get("delivery") or {}).get("mode", "local")
+    runtime["delivery"] = default_delivery(delivery_mode, new_id)
+
+    (abs_dir / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n",
+                                          encoding="utf-8")
+    write_goal(target, runtime)
+
+    with (abs_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"ts": time.time(), "type": "extension",
+                                 "previous_loop_id": prev_loop_id,
+                                 "previous_status": prev_status,
+                                 "loop_id": new_id, "note": note},
+                                sort_keys=True) + "\n")
+
+    print(f"extending mission {state.get('mission_id')}: previous run "
+          f"{prev_loop_id} ({prev_status}, {state.get('iteration', 0)} iteration(s), "
+          f"${float(state.get('cost_usd', 0)):.2f}) archived to "
+          f"{archive.relative_to(target)}/")
+    print(f"new run {new_id}: {runtime.get('max_iterations')} iterations, "
+          f"${float(runtime.get('max_cost_usd', 0)):.2f}, "
+          f"{int(runtime.get('max_wall_seconds', 0))}s wall clock")
+    if note:
+        print(f"continuation focus: {note}")
+    return start_loop(target, engine)
+
+
+def resume_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="absoloop resume",
+        description="Continue a stopped loop — or, with --extend, start a "
+                    "follow-on run that completes a finished mission's work.")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    parser.add_argument("--engine", choices=["claude", "codex"],
+                        help="engine for the loop (default: first one found on PATH)")
+    parser.add_argument("--extend", action="store_true",
+                        help="start a follow-on run of a finished mission: fresh "
+                             "budgets, new loop id, previous work carried in as context")
+    parser.add_argument("-m", "--note", default="",
+                        help="with --extend: what the follow-on run should focus on")
+    parser.add_argument("--iterations", type=int,
+                        help="with --extend: raise max_iterations for the new run")
+    parser.add_argument("--budget", type=float,
+                        help="with --extend: raise max_cost_usd for the new run")
+    parser.add_argument("--hours", type=float,
+                        help="with --extend: wall-clock budget for the new run, in hours")
+    args = parser.parse_args(argv)
+    target = pathlib.Path(args.project).expanduser().resolve()
+    state = read_state(target)
+    if state is None:
+        return 1
+    runner = target / "scripts" / "absoloop-run"
+    if not runner.is_file():
+        print(f"error: {runner} not found — re-adopt the project with "
+              f"'absoloop {target}' first.", file=sys.stderr)
+        return 1
+    engine = args.engine or default_engine()
+    if engine is None:
+        print("error: no engine available — install 'claude' or 'codex'.", file=sys.stderr)
+        return 1
+    status = state.get("status")
+    if args.extend:
+        if status == "AWAITING_APPROVAL":
+            print("mission is AWAITING_APPROVAL — decide the gate first "
+                  "('absoloop approve' or 'absoloop reject \"...\"'), then extend.",
+                  file=sys.stderr)
+            return 3
+        return extend_mission(target, state, engine, args.note,
+                              args.iterations, args.budget, args.hours)
+    if status in ("AWAITING_APPROVAL", "COMPLETED"):
+        # The runner's terminal-state guard would refuse anyway; explain here
+        # without spawning it.
+        print(f"mission {state.get('mission_id')} is {status} — nothing to resume.")
+        print(f"next: {next_step_hint(state)}")
+        return 0 if status == "COMPLETED" else 3
+    print(f"resuming mission {state.get('mission_id')} at iteration "
+          f"{state.get('iteration')} (${float(state.get('cost_usd', 0)):.2f} spent, "
+          f"status {status})")
+    return start_loop(target, engine)
+
+
+def gate_command(action: str, argv: list[str]) -> int:
+    """Human-gate decisions: `absoloop approve` / `absoloop reject "feedback"`.
+
+    approve marks an AWAITING_APPROVAL mission COMPLETED. reject records your
+    English response for the agent — the runner injects it into the next
+    iteration's prompt — and re-arms the loop."""
+    parser = argparse.ArgumentParser(prog=f"absoloop {action}")
+    if action == "reject":
+        parser.add_argument("message",
+                            help="feedback for the agent (delivered in the next iteration prompt)")
+    else:
+        parser.add_argument("message", nargs="?", default="",
+                            help="optional approval note (recorded in the ledger)")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    args = parser.parse_args(argv)
+
+    target = pathlib.Path(args.project).expanduser().resolve()
+    abs_dir = target / ".absoloop"
+    state_path = abs_dir / "state.json"
+    if not state_path.is_file():
+        print(f"error: {state_path} not found — run this inside an ABSOLOOP project "
+              "whose loop has run at least once.", file=sys.stderr)
+        return 1
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"error: invalid JSON in {state_path}: {exc}", file=sys.stderr)
+        return 1
+
+    def record(event: dict) -> None:
+        with (abs_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"ts": time.time(), **event}, sort_keys=True) + "\n")
+
+    def save() -> None:
+        checkpoints = abs_dir / "checkpoints"
+        checkpoints.mkdir(parents=True, exist_ok=True)
+        cp = checkpoints / f"{int(state.get('iteration', 0)):04d}-human-{action}.json"
+        state["latest_checkpoint"] = str(cp.relative_to(target))
+        body = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        cp.write_text(body, encoding="utf-8")
+        state_path.write_text(body, encoding="utf-8")
+
+    status = state.get("status")
+    if action == "approve":
+        if status != "AWAITING_APPROVAL":
+            print(f"error: mission status is {status!r}, not AWAITING_APPROVAL — "
+                  "nothing to approve.", file=sys.stderr)
+            return 1
+        state["status"] = "COMPLETED"
+        state["stop_reason"] = "human_approved"
+        state["human_feedback"] = None
+        save()
+        record({"type": "human_gate", "decision": "approved", "note": args.message,
+                "iteration": state.get("iteration")})
+        print(f"mission {state.get('mission_id')} APPROVED and marked COMPLETED "
+              f"(iteration {state.get('iteration')}, cost ${float(state.get('cost_usd', 0)):.2f}).")
+        runner = target / "scripts" / "absoloop-run"
+        if runner.is_file():
+            print("Delivering results per the mission's delivery mode...")
+            delivered = subprocess.run(
+                [sys.executable, str(runner), "--deliver-only"], cwd=target).returncode
+            if delivered != 0:
+                print("warning: delivery step reported a problem — run "
+                      f"'{sys.executable} scripts/absoloop-run --deliver-only' to retry.",
+                      file=sys.stderr)
+        else:
+            print("note: scripts/absoloop-run not found — externalize the result "
+                  "yourself (commit / push / PR).")
+        print("Full results: absoloop report")
+        return 0
+
+    if status not in ("AWAITING_APPROVAL", "BLOCKED", "BUDGET_EXHAUSTED", "REJECTED"):
+        print(f"note: mission status is {status!r}; recording feedback anyway.")
+    state["status"] = "READY"
+    state["stop_reason"] = None
+    state["human_feedback"] = args.message
+    save()
+    record({"type": "human_gate", "decision": "rejected", "feedback": args.message,
+            "iteration": state.get("iteration")})
+    print("Feedback recorded — the next builder iteration will see it under "
+          "'Operator feedback (address this first)'.")
+    print("Resume the loop with: absoloop resume")
+    return 0
+
+
+def start_loop(target: pathlib.Path, engine: str) -> int:
+    runner = target / "scripts" / "absoloop-run"
+    print(f"\nStarting loop with engine '{engine}'...\n")
+    return subprocess.run([sys.executable, str(runner), "--engine", engine],
+                          cwd=target).returncode
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] in ("approve", "reject"):
+        return gate_command(argv[0], argv[1:])
+    if argv and argv[0] == "status":
+        return status_command(argv[1:])
+    if argv and argv[0] == "report":
+        return report_command(argv[1:])
+    if argv and argv[0] == "goal":
+        return goal_command(argv[1:])
+    if argv and argv[0] == "resume":
+        return resume_command(argv[1:])
+
+    parser = argparse.ArgumentParser(
+        prog="absoloop",
+        description="Scaffold and start an ABSOLOOP verifier-first loop project.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("name", nargs="?", help="project name (prompted if omitted)")
+    parser.add_argument("-o", "--objective", help="mission objective (one sentence)")
+    parser.add_argument("-v", "--verify", help="verifier command (exits 0 only when done)")
+    parser.add_argument("-d", "--deliver", choices=sorted(DELIVERY_MODES),
+                        help="where accepted work lands: git (commit to branch), "
+                             "local (leave unstaged), out (~/absoloop/out/<loop_id>/)")
+    parser.add_argument("--engine", choices=["claude", "codex"],
+                        help="engine for the loop (implies --start)")
+    parser.add_argument("--start", action="store_true",
+                        help="start the loop immediately after scaffolding")
+    args = parser.parse_args(argv)
+
+    runner_template = TEMPLATES / "absoloop-run"
+    if not runner_template.is_file():
+        print(f"error: missing template {runner_template}", file=sys.stderr)
+        return 1
+
+    if shutil.which("jq") is None:
+        print("warning: 'jq' not found on PATH — some blueprint recipes use it.", file=sys.stderr)
+    if default_engine() is None:
+        print("warning: neither 'claude' nor 'codex' CLI found on PATH — "
+              "install one before running the loop.", file=sys.stderr)
+
+    name = args.name or ""
+    name_from_arg = bool(name)
+    while True:
+        if not name:
+            name = ask("Project name (or path to an existing project): ")
+        if re.fullmatch(r"[A-Za-z0-9._-]+", name) or pathlib.Path(name).expanduser().is_dir():
+            break
+        print("Use only letters, numbers, dots, dashes, underscores — "
+              "or the path of an existing directory.", file=sys.stderr)
+        name = ""
+
+    target = (pathlib.Path.cwd() / pathlib.Path(name).expanduser()).resolve()
+    if target.exists() and not target.is_dir():
+        print(f"error: {target} exists and is not a directory.", file=sys.stderr)
+        return 1
+    adopting = target.is_dir()
+
+    # Only confirm when the name came from an interactive prompt; passing it
+    # on the command line is confirmation enough.
+    if not name_from_arg:
+        question = (f"Set up ABSOLOOP in existing directory {target}? [y/N] " if adopting
+                    else f"Create ABSOLOOP project at {target}? [y/N] ")
+        if ask(question).lower() not in ("y", "yes"):
+            print("Aborted.")
+            return 1
+
+    scripts = target / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    for tmpl in ("absoloop-run", "absoloop-init"):
+        src = TEMPLATES / tmpl
+        dest = scripts / tmpl
+        if not src.is_file():
+            continue
+        if dest.exists():
+            print(f"kept existing scripts/{tmpl}")
+            continue
+        shutil.copy(src, dest)
+        if os.name != "nt":
+            os.chmod(dest, 0o755)
+
+    if shutil.which("git"):
+        inside = subprocess.run(["git", "-C", str(target), "rev-parse", "--is-inside-work-tree"],
+                                capture_output=True, text=True)
+        if inside.returncode != 0:
+            subprocess.run(["git", "init", "-q", str(target)], check=False)
+
+    abs_dir = target / ".absoloop"
+    legacy_dir = target / ".absolution"
+    if legacy_dir.is_dir() and not abs_dir.exists():
+        legacy_dir.rename(abs_dir)
+        print("migrated legacy .absolution/ config to .absoloop/")
+    for legacy in ("absolution-run", "absolution-init"):
+        if (scripts / legacy).exists():
+            print(f"note: scripts/{legacy} is from the old ABSOLUTION name and can be "
+                  f"deleted; {legacy.replace('absolution', 'absoloop')} replaces it.")
+    runtime_path = abs_dir / "runtime.json"
+    existing_config = None
+    if runtime_path.is_file():
+        try:
+            existing_config = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            print(f"warning: {runtime_path} is unreadable — rebuilding it.", file=sys.stderr)
+
+    objective = (args.objective or "").strip()
+    verify_command = (args.verify or "").strip()
+    if existing_config:
+        objective = objective or str(existing_config.get("objective", "")).strip()
+        verify_command = verify_command or str(existing_config.get("verify_command", "")).strip()
+    if not (objective and verify_command):
+        status = "adopted" if adopting else "created"
+        print(f"\nProject '{target.name}' {status}. Now define the mission:")
+    while not objective:
+        objective = ask("Mission objective (one sentence): ")
+    if verify_command:
+        problem = verifier_problem(verify_command, target)
+        if problem:
+            print(f"warning: {problem}", file=sys.stderr)
+    while not verify_command:
+        verify_command = ask("Verifier command (exits 0 only when done): ")
+        if verify_command:
+            problem = verifier_problem(verify_command, target)
+            if problem:
+                print(problem, file=sys.stderr)
+                verify_command = ""
+
+    # Delivery: flag wins, then an existing config's choice, then a prompt.
+    delivery_mode = args.deliver or ""
+    if not delivery_mode and existing_config:
+        delivery_mode = str((existing_config.get("delivery") or {}).get("mode", ""))
+    if delivery_mode and delivery_mode not in DELIVERY_MODES:
+        print(f"warning: unknown delivery mode {delivery_mode!r} in existing config — "
+              "asking again.", file=sys.stderr)
+        delivery_mode = ""
+    if not delivery_mode:
+        if sys.stdin.isatty():
+            print("\nWhere should accepted loop results land?")
+            ordered = ("git", "local", "out")
+            for index, mode in enumerate(ordered, 1):
+                print(f"  {index}. {mode:<5} — {DELIVERY_MODES[mode]}")
+            while not delivery_mode:
+                answer = ask("Delivery [1-3, or git/local/out] (default: local): ") or "local"
+                if answer in DELIVERY_MODES:
+                    delivery_mode = answer
+                elif answer in ("1", "2", "3"):
+                    delivery_mode = ordered[int(answer) - 1]
+                else:
+                    print("Answer 1, 2, 3, git, local, or out.", file=sys.stderr)
+        else:
+            delivery_mode = "local"
+
+    for sub in ("tmp", "checkpoints", "schemas", "prompts"):
+        (abs_dir / sub).mkdir(parents=True, exist_ok=True)
+    schema_path = abs_dir / "schemas" / "agent-result.schema.json"
+    if not schema_path.exists():
+        schema_path.write_text(json.dumps(RESULT_SCHEMA, indent=2) + "\n", encoding="utf-8")
+    critic_path = abs_dir / "prompts" / "critic-final-review.md"
+    if not critic_path.exists():
+        critic_path.write_text(CRITIC_PROMPT, encoding="utf-8")
+
+    if existing_config:
+        # Preserve any hand-tuned settings; only refresh the mission fields.
+        previous_objective = str(existing_config.get("objective", "")).strip()
+        existing_config["objective"] = objective
+        # The ladder derives from the objective's mission type: rebuild it when
+        # the mission changed or it is missing/invalid; keep a valid hand-tuned one.
+        if (objective != previous_objective
+                or validate_thinking_ladder(existing_config.get("thinking_ladder"))):
+            existing_config["thinking_ladder"] = build_thinking_ladder(
+                classify_mission(objective))
+        existing_config["verify_command"] = verify_command
+        critic_path_cfg = str(existing_config.get("critic_prompt_path", ""))
+        if critic_path_cfg.startswith(".absolution/"):
+            existing_config["critic_prompt_path"] = ".absoloop/" + critic_path_cfg[len(".absolution/"):]
+        existing_config.setdefault("loop_id", new_loop_id())
+        existing_config.setdefault("goal_path", ".absoloop/goal.md")
+        existing_config["delivery"] = default_delivery(delivery_mode,
+                                                       existing_config["loop_id"])
+        config = existing_config
+        print("reusing existing .absoloop/runtime.json (mission fields updated)")
+    else:
+        config = runtime_config(objective, verify_command, new_loop_id(), delivery_mode)
+    runtime_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+    goal_path = write_goal(target, config)
+    print(f"goal contract written to {goal_path.relative_to(target)} "
+          "(view or tweak with 'absoloop goal')")
+    print(f"delivery: {delivery_mode} — {DELIVERY_MODES[delivery_mode]}")
+
+    # Keep per-iteration loop scratch out of git; delivered commits stay clean.
+    gitignore = target / ".gitignore"
+    ignore_line = ".absoloop/tmp/"
+    existing_ignores = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+    if ignore_line not in existing_ignores.splitlines():
+        gitignore.write_text(existing_ignores
+                             + ("" if existing_ignores.endswith("\n") or not existing_ignores else "\n")
+                             + ignore_line + "\n", encoding="utf-8")
+
+    engine = args.engine or default_engine()
+    if args.start or args.engine:
+        if engine is None:
+            print("error: no engine available — install 'claude' or 'codex'.", file=sys.stderr)
+            return 1
+        return start_loop(target, engine)
+
+    if engine and sys.stdin.isatty():
+        if ask(f"\nMission ready. Start the loop now with '{engine}'? [Y/n] ").lower() in ("", "y", "yes"):
+            return start_loop(target, engine)
+
+    run_cmd = "python scripts/absoloop-run" if os.name == "nt" else "./scripts/absoloop-run"
+    steps = [] if target == pathlib.Path.cwd().resolve() else [f"cd {os.path.relpath(target)}"]
+    steps.append(f"{run_cmd} --engine {engine or 'claude'}")
+    print("\nMission ready. Next:\n  " + "\n  ".join(steps))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

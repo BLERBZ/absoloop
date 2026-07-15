@@ -1,0 +1,12 @@
+# Mission deliveries exported by `-d out` land here — per-loop artifacts, not source.
+out/
+
+# Local assistant/session state
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
