@@ -626,6 +626,16 @@ def build_iteration_prompt(
             f"{state.human_feedback.strip()}\n"
         )
 
+    min_iter = int(runtime.get("min_iterations", 1) or 1)
+    min_iter_block = ""
+    if state.iteration < min_iter:
+        min_iter_block = (
+            f"\nMinimum iterations: a \"done\": true report will NOT be accepted "
+            f"before iteration {min_iter}. Use this iteration to find the weakest "
+            "part of the current result and demonstrably improve it — do not "
+            "spend it re-confirming that existing work is fine.\n"
+        )
+
     rung = thinking_rung(runtime, state)
     posture = str(rung.get("posture", "")).strip()
     if engine == "claude":
@@ -659,7 +669,7 @@ def build_iteration_prompt(
 Iteration: {state.iteration} of {runtime['max_iterations']} \
 ({runtime['max_iterations'] - state.iteration} remaining)
 Repeated failure count: {state.repeated_failure_count}
-
+{min_iter_block}
 ## Where the mission stands
 
 {previous_work}
@@ -919,7 +929,9 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
     )
     prompt = (
         f"{base}\n\n"
-        f"Mission objective: {runtime['objective']}\n"
+        "Mission goal contract (ground truth — includes any extension "
+        "requirements and continuation intent, all of which are binding):\n\n"
+        f"{load_goal(runtime).strip()}\n\n"
         f"Definition of done: {json.dumps(runtime['definition_of_done'], indent=2)}\n\n"
         "The builder claims the mission is done. Inspect the working tree "
         "yourself and run read-only checks (tests, builds, the program) to "
@@ -1083,6 +1095,9 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
         if kind == "iteration":
             outcome = "builder reports DONE" if event.get("done") else "not done yet"
             lines.append(f"- {ts} — iteration {event.get('iteration')}: {outcome}")
+        elif kind == "early_done_claim":
+            lines.append(f"- {ts} — done claim at iteration {event.get('iteration')} "
+                         f"not accepted (floor: {event.get('min_iterations')})")
         elif kind == "agent_run":
             tokens_note = fmt_tokens(event.get("tokens"))
             lines.append(f"- {ts} — {event.get('engine')} run: exit {event.get('exit_code')}, "
@@ -1380,6 +1395,18 @@ def main() -> int:
             "iteration": state.iteration,
             "done": builder_done,
         })
+
+        # A done claim before the mission's iteration floor is noted but not
+        # accepted: cheap first-iteration "everything already works" claims are
+        # exactly how loops end after one run instead of doing the work.
+        min_iter = int(runtime.get("min_iterations", 1) or 1)
+        if builder_done and state.iteration < min_iter:
+            say(f"builder reports done at iteration {state.iteration}, but "
+                f"min_iterations is {min_iter} — not accepting yet; the next "
+                "iteration must demonstrably improve the result", "warn")
+            append_ledger({"type": "early_done_claim", "iteration": state.iteration,
+                           "min_iterations": min_iter})
+            builder_done = False
 
         if builder_done:
             checkpoint(state, "builder-done")

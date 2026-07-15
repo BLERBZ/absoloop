@@ -19,6 +19,32 @@ import time
 ABSOLOOP_HOME = pathlib.Path(os.environ.get("ABSOLOOP_HOME", pathlib.Path.home() / "absoloop"))
 TEMPLATES = ABSOLOOP_HOME / "templates"
 
+
+def render_logo(*, compact: bool = False) -> str:
+    """Render the Absoloop logo from the sibling bin/absoloop_logo.py, in full
+    color ('color always'). Best-effort: a logo problem must never block the
+    CLI, so any failure yields an empty string and the command runs as before."""
+    try:
+        sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+        from absoloop_logo import build_logo
+        return build_logo(compact=compact, color_mode="always")
+    except Exception:
+        return ""
+
+
+def print_banner(*, compact: bool = False) -> None:
+    logo = render_logo(compact=compact)
+    if logo:
+        print(logo + "\n")
+
+
+class BannerParser(argparse.ArgumentParser):
+    """Argument parser that prints the colored Absoloop logo above --help."""
+
+    def format_help(self) -> str:
+        logo = render_logo()
+        return (logo + "\n\n" if logo else "") + super().format_help()
+
 EPILOG = """\
 examples:
   absoloop                      # fully interactive
@@ -42,7 +68,10 @@ examples:
   absoloop resume --extend      # follow-on run for a COMPLETED mission: fresh
                                   budgets, previous work carried in as context
   absoloop resume --extend -m "finish the CLI flags too" --hours 4 --iterations 30
-                                  # extended follow-on run with a focus note
+                                  # extended follow-on run with a focus note —
+                                  # the note becomes a binding definition-of-done
+                                  # item (--min-iterations N sets the floor before
+                                  # a done claim is accepted; default 3 with a note)
   absoloop approve              # accept a mission stopped at the human gate
   absoloop reject "use the v2 API instead"
                                   # answer the agent; feedback lands in the
@@ -101,6 +130,26 @@ def default_delivery(mode: str, loop_id: str) -> dict:
 
 def new_loop_id() -> str:
     return f"loop-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
+
+
+def sync_runner(target: pathlib.Path) -> None:
+    """Keep the project's scripts/absoloop-run in step with the installed
+    template. Stale scaffolds otherwise keep running old loop logic forever
+    (e.g. a runner without --deliver-only breaks 'absoloop approve')."""
+    src = TEMPLATES / "absoloop-run"
+    dest = target / "scripts" / "absoloop-run"
+    try:
+        if not src.is_file():
+            return
+        if dest.is_file() and dest.read_bytes() == src.read_bytes():
+            return
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dest)
+        if os.name != "nt":
+            os.chmod(dest, 0o755)
+        print("updated scripts/absoloop-run to the installed ABSOLOOP version")
+    except OSError as exc:
+        print(f"warning: could not update scripts/absoloop-run: {exc}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +363,16 @@ def generate_goal_markdown(config: dict) -> str:
             "",
             "The previous run's work is already in the working tree. Build on it — "
             "inspect what exists before editing, and do not redo or revert it.",
-            "",
         ]
+        if continuation.get("note"):
+            lines += [
+                "",
+                "The original definition of done was already met by the previous "
+                "run. This run is NOT done until the operator's continuation "
+                "intent above is satisfied by new, inspectable work — confirming "
+                "that the previous result still exists counts for nothing.",
+            ]
+        lines.append("")
     lines += [
         "## Success condition (the only thing that ends this loop)",
         "",
@@ -323,6 +380,15 @@ def generate_goal_markdown(config: dict) -> str:
         f"evidence, an independent critic finds no blocking issue, and {gate}.",
         "A done claim without evidence counts for nothing — the critic inspects",
         "the working tree itself and rejects unearned claims.",
+    ]
+    min_iter = int(config.get("min_iterations", 1) or 1)
+    if min_iter > 1:
+        lines += [
+            "",
+            f"No \"done\": true report is accepted before iteration {min_iter} — "
+            "every earlier iteration must add a demonstrable improvement.",
+        ]
+    lines += [
         "",
         "## Definition of done",
         "",
@@ -474,6 +540,7 @@ def runtime_config(objective: str, loop_id: str, delivery_mode: str) -> dict:
         "delivery": default_delivery(delivery_mode, loop_id),
         "require_human_approval": True,
         "max_iterations": 15,
+        "min_iterations": 3,
         "no_progress_window": 3,
         "max_wall_seconds": 7200,
         "max_cost_usd": 25.0,
@@ -958,6 +1025,9 @@ def report_command(argv: list[str]) -> int:
         elif kind == "iteration":
             mark = "✓ builder reports DONE" if event.get("done") else "… not done yet"
             print(f"  {ts}  iteration {event.get('iteration')}: {mark}")
+        elif kind == "early_done_claim":
+            print(f"  {ts}  done claim at iteration {event.get('iteration')} not "
+                  f"accepted (floor: {event.get('min_iterations')} iterations)")
         elif kind == "integrity_check":
             mark = "✓" if event.get("exit_code") == 0 else "✗ VIOLATION"
             print(f"  {ts}  integrity check {mark}")
@@ -1053,7 +1123,7 @@ def status_command(argv: list[str]) -> int:
 
 def extend_mission(target: pathlib.Path, state: dict, engine: str,
                    note: str, iterations: int | None, budget: float | None,
-                   hours: float | None) -> int:
+                   hours: float | None, min_iterations: int | None = None) -> int:
     """Start a follow-on loop run that continues a finished mission's work.
 
     Archives the previous run's records under .absoloop/runs/<loop_id>/, resets
@@ -1094,12 +1164,31 @@ def extend_mission(target: pathlib.Path, state: dict, engine: str,
         "summary": summary,
         "note": note,
     }
+    if note.strip():
+        # The continuation intent becomes a binding definition-of-done item.
+        # Without this, the old (already satisfied) definition of done lets the
+        # builder truthfully report done on iteration 1 and the critic pass
+        # it — the follow-on run ends after a single iteration of nothing.
+        done_items = [str(item) for item in runtime.get("definition_of_done", [])
+                      if str(item).strip()]
+        done_items.append(
+            f"Extension requirement ({new_id}): {note.strip()} — the previous "
+            "run's existing result does not satisfy this by itself; this run "
+            "must demonstrably advance it with new, inspectable work.")
+        runtime["definition_of_done"] = done_items
     if iterations:
         runtime["max_iterations"] = iterations
     if budget:
         runtime["max_cost_usd"] = budget
     if hours:
         runtime["max_wall_seconds"] = int(hours * 3600)
+    if min_iterations:
+        runtime["min_iterations"] = min_iterations
+    elif note.strip():
+        # An extension with a focus note is a request for real further work:
+        # give it an iteration floor so a first-iteration done claim can't
+        # end the run, unless the operator tuned one already.
+        runtime.setdefault("min_iterations", 3)
     delivery_mode = (runtime.get("delivery") or {}).get("mode", "local")
     runtime["delivery"] = default_delivery(delivery_mode, new_id)
 
@@ -1147,6 +1236,9 @@ def resume_command(argv: list[str]) -> int:
                         help="with --extend: raise max_cost_usd for the new run")
     parser.add_argument("--hours", type=float,
                         help="with --extend: wall-clock budget for the new run, in hours")
+    parser.add_argument("--min-iterations", type=int, dest="min_iterations",
+                        help="with --extend: iteration floor — a \"done\" report "
+                             "is not accepted before this many iterations")
     args = parser.parse_args(argv)
     target = pathlib.Path(args.project).expanduser().resolve()
     state = read_state(target)
@@ -1169,7 +1261,8 @@ def resume_command(argv: list[str]) -> int:
                   file=sys.stderr)
             return 3
         return extend_mission(target, state, engine, args.note,
-                              args.iterations, args.budget, args.hours)
+                              args.iterations, args.budget, args.hours,
+                              args.min_iterations)
     if status in ("AWAITING_APPROVAL", "COMPLETED"):
         # The runner's terminal-state guard would refuse anyway; explain here
         # without spawning it.
@@ -1242,6 +1335,7 @@ def gate_command(action: str, argv: list[str]) -> int:
                                 state.get("tokens_total"))
         print(f"mission {state.get('mission_id')} APPROVED and marked COMPLETED "
               f"(iteration {state.get('iteration')}, cost {cost_text}).")
+        sync_runner(target)
         runner = target / "scripts" / "absoloop-run"
         if runner.is_file():
             print("Delivering results per the mission's delivery mode...")
@@ -1272,6 +1366,7 @@ def gate_command(action: str, argv: list[str]) -> int:
 
 
 def start_loop(target: pathlib.Path, engine: str) -> int:
+    sync_runner(target)
     runner = target / "scripts" / "absoloop-run"
     print(f"\nStarting loop with engine '{engine}'...\n")
     return subprocess.run([sys.executable, str(runner), "--engine", engine],
@@ -1292,7 +1387,7 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "resume":
         return resume_command(argv[1:])
 
-    parser = argparse.ArgumentParser(
+    parser = BannerParser(
         prog="absoloop",
         description="Scaffold and start an ABSOLOOP mission loop project.",
         epilog=EPILOG,
@@ -1308,6 +1403,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--start", action="store_true",
                         help="start the loop immediately after scaffolding")
     args = parser.parse_args(argv)
+
+    print_banner()
 
     runner_template = TEMPLATES / "absoloop-run"
     if not runner_template.is_file():
@@ -1348,7 +1445,10 @@ def main(argv: list[str]) -> int:
 
     scripts = target / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    for tmpl in ("absoloop-run", "absoloop-init"):
+    # The runner is a managed file: always kept in step with the installed
+    # template so scaffolded projects pick up loop fixes on re-adoption.
+    sync_runner(target)
+    for tmpl in ("absoloop-init",):
         src = TEMPLATES / tmpl
         dest = scripts / tmpl
         if not src.is_file():
