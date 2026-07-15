@@ -27,6 +27,10 @@ objective ──► /goal contract ──► iterate: builder works, reports don
   checkpointed state you can resume or extend at any time.
 - **Engine-agnostic** — the same mission runs under the `claude` or `codex`
   CLI; the loop handles each engine's flags, budgets, and output shapes.
+- **Observable** — the loop streams every agent action (tool calls, commands,
+  messages) to the console as it happens, and maintains live telemetry
+  (`.absoloop/tmp/monitor.json` + `live.jsonl`) that `absoloop watch` renders
+  as a refreshing dashboard: phase, budget bars, current activity, risk flags.
 
 ## Repo layout
 
@@ -88,6 +92,7 @@ Mission lifecycle commands:
 
 ```
 absoloop status                 # mission at a glance + exact next command
+absoloop watch                  # live dashboard while the loop runs
 absoloop report                 # iteration-by-iteration results timeline
 absoloop approve                # accept a mission stopped at the human gate
 absoloop reject "use v2 API"    # answer the agent; lands in the next prompt
@@ -143,16 +148,34 @@ is disabled):
 
 Re-run delivery any time with `python scripts/absoloop-run --deliver-only`.
 
-## Results views
+## Monitoring & results views
+
+While the loop runs, the runner **streams every agent action live** — each
+tool call, shell command, file edit, and agent message is narrated to the
+console with color (respects `NO_COLOR` / non-tty), and mirrored into
+telemetry files under `.absoloop/tmp/` (gitignored):
+
+- `monitor.json` — atomically-replaced snapshot: phase, iteration, spend,
+  thinking level, current agent, last activity, pid + heartbeat;
+- `live.jsonl` — append-only feed of individual agent actions.
 
 ```
-absoloop status   # budgets (with progress bars), delivery, latest artifacts
-absoloop report   # agent runs with cost + summaries, done claims,
-                  # critic verdicts, gates, delivery
+absoloop watch    # refreshing live dashboard: LIVE/stopped badge, phase,
+                  # iteration/spend/wall-clock bars, thinking level, what the
+                  # agent is doing right now, activity feed, risks, next step
+                  #   --once (single frame) · -n 5 (interval) · --plain (logs)
+absoloop status   # budgets (with progress bars), live phase when running,
+                  # builder's latest report + risks, delivery, next command
+absoloop report   # agent runs with cost + token counts + summaries,
+                  # done claims, critic verdicts, gates, delivery
 ```
 
-The runner also writes `.absoloop/report.md` (markdown mission report) at every
-stop, and includes it in `out` deliveries.
+`watch` distinguishes a live loop from a crashed one (pid + heartbeat
+freshness) and exits on its own once the mission reaches a terminal state.
+Every agent run also persists its full event stream
+(`iteration-NNNN-agent-result.stream.jsonl` / `.events.jsonl`) for
+after-the-fact auditing, and the runner writes `.absoloop/report.md`
+(markdown mission report) at every stop, included in `out` deliveries.
 
 ## Development notes
 

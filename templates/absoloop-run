@@ -9,10 +9,12 @@ import os
 import pathlib
 import shutil
 import subprocess
+import sys
+import textwrap
 import threading
 import time
 from dataclasses import dataclass, asdict
-from typing import Any
+from typing import Any, Callable
 
 ROOT = pathlib.Path.cwd()
 ABS = ROOT / ".absoloop"
@@ -22,6 +24,10 @@ STATE_PATH = ABS / "state.json"
 LEDGER_PATH = ABS / "ledger.jsonl"
 RUNTIME_PATH = ABS / "runtime.json"
 RESULT_SCHEMA = ABS / "schemas" / "agent-result.schema.json"
+# Live telemetry for 'absoloop watch' / 'absoloop status' — kept under tmp/
+# (gitignored) so monitoring artifacts never leak into delivered commits.
+MONITOR_PATH = TMP / "monitor.json"
+LIVE_PATH = TMP / "live.jsonl"
 
 # Thinking escalation: as the same failure repeats, both engines are pushed to
 # spend more reasoning depth instead of re-trying the same shallow fix.
@@ -86,6 +92,7 @@ class State:
     iteration: int = 0
     started_at: float = 0.0
     cost_usd: float = 0.0
+    tokens_total: int = 0
     inexact_cost_events: int = 0
     last_failure_fingerprint: str | None = None
     repeated_failure_count: int = 0
@@ -103,23 +110,107 @@ class AgentRun:
     cost_is_exact: bool
     limit_reached: str | None
     output_path: pathlib.Path
+    tokens: int | None = None  # total tokens processed, when the engine reported usage
 
 
-def say(message: str) -> None:
+def fmt_tokens(tokens: Any) -> str:
+    """Human token count for cost lines: 12.3k tokens."""
+    return (f"{float(tokens) / 1000:.1f}k tokens"
+            if isinstance(tokens, (int, float)) and tokens > 0 else "")
+
+
+# ---------------------------------------------------------------------------
+# Console output: colored, timestamped progress lines. Colors follow the
+# terminal (disabled when stdout is not a tty or NO_COLOR is set).
+# ---------------------------------------------------------------------------
+
+_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+_STYLES = {"ok": "32", "warn": "33", "err": "31", "act": "36", "dim": "2",
+           "bold": "1"}
+
+
+def tint(style: str, text: str) -> str:
+    code = _STYLES.get(style)
+    return f"\033[{code}m{text}\033[0m" if (_COLOR and code) else text
+
+
+def say(message: str, style: str | None = None) -> None:
     """Live progress line so the operator can watch the loop working."""
-    print(f"[absoloop {time.strftime('%H:%M:%S')}] {message}", flush=True)
+    stamp = tint("dim", f"[absoloop {time.strftime('%H:%M:%S')}]")
+    print(f"{stamp} {tint(style, message) if style else message}", flush=True)
+
+
+class MonitorFile:
+    """The loop's live telemetry surface.
+
+    Two artifacts, both safe to read at any moment from another process:
+      .absoloop/monitor.json — atomically-replaced snapshot of the loop's
+        current phase, budgets, spend, and last observed agent activity
+        (read by 'absoloop watch' and 'absoloop status');
+      .absoloop/live.jsonl — append-only feed of individual agent actions
+        (tool calls, commands, messages) streamed out of the engine.
+    Every write is best-effort: telemetry must never kill the loop."""
+
+    HEARTBEAT_EVERY = 5.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._data: dict[str, Any] = {"schema": 1, "pid": os.getpid()}
+        self._last_flush = 0.0
+
+    def update(self, **fields: Any) -> None:
+        with self._lock:
+            self._data.update(fields)
+            self._flush()
+
+    def touch(self) -> None:
+        """Refresh the heartbeat so watchers can tell a live loop from a
+        crashed one, without rewriting the file on every activity line."""
+        with self._lock:
+            if time.time() - self._last_flush >= self.HEARTBEAT_EVERY:
+                self._flush()
+
+    def _flush(self) -> None:
+        self._data["heartbeat_ts"] = time.time()
+        try:
+            atomic_write_json(MONITOR_PATH, self._data)
+        except OSError:
+            pass
+        self._last_flush = time.time()
+
+    def activity(self, agent: str, kind: str, detail: str) -> None:
+        detail = " ".join(str(detail).split())[:300]
+        event = {"ts": time.time(), "agent": agent, "kind": kind, "detail": detail}
+        try:
+            with LIVE_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+        except OSError:
+            pass
+        with self._lock:
+            self._data["last_activity"] = event
+            self._data["activity_count"] = int(self._data.get("activity_count", 0)) + 1
+            if time.time() - self._last_flush >= 1.0:
+                self._flush()
+
+
+MONITOR = MonitorFile()
 
 
 @contextlib.contextmanager
 def heartbeat(label: str, interval: float = 30.0):
     """Print a periodic heartbeat while a long blocking step runs, so a slow
-    agent or check never looks like a hang."""
+    agent or check never looks like a hang. Also keeps monitor.json fresh so
+    'absoloop watch' can prove the loop is alive."""
     started = time.time()
     done = threading.Event()
 
     def beat() -> None:
-        while not done.wait(interval):
-            say(f"{label}... still running ({time.time() - started:.0f}s elapsed)")
+        last_line = started
+        while not done.wait(min(interval, MonitorFile.HEARTBEAT_EVERY)):
+            MONITOR.touch()
+            if time.time() - last_line >= interval:
+                say(f"{label}... still running ({time.time() - started:.0f}s elapsed)", "dim")
+                last_line = time.time()
 
     thread = threading.Thread(target=beat, daemon=True)
     thread.start()
@@ -136,7 +227,11 @@ def report_spend(state: "State", runtime: dict[str, Any]) -> None:
     cap = float(runtime["max_cost_usd"])
     pct = 100 * state.cost_usd / cap if cap else 0.0
     remaining = max(0.0, cap - state.cost_usd)
-    say(f"spend: ${state.cost_usd:.2f} of ${cap:.2f} mission budget "
+    MONITOR.update(cost_usd=round(state.cost_usd, 4), max_cost_usd=cap,
+                   tokens_total=state.tokens_total,
+                   inexact_cost_events=state.inexact_cost_events)
+    tokens = f" ({fmt_tokens(state.tokens_total)})" if fmt_tokens(state.tokens_total) else ""
+    say(f"spend: ${state.cost_usd:.2f}{tokens} of ${cap:.2f} mission budget "
         f"({pct:.0f}% used, ${remaining:.2f} left)")
     if state.inexact_cost_events:
         say(f"spend: {state.inexact_cost_events} run(s) had no exact cost and were "
@@ -266,11 +361,23 @@ def agent_structured(out_path: pathlib.Path) -> dict[str, Any] | None:
     return structured if isinstance(structured, dict) else payload
 
 
-def say_agent_message(out_path: pathlib.Path, label: str) -> None:
-    """Pass the agent's own English report through to the console, so the
-    operator sees what it says it did — not just exit codes and cost."""
+def _clean_list(value: Any, limit: int) -> tuple[list[str], int]:
+    """First `limit` non-empty string items plus how many were left out."""
+    items = [str(item).strip() for item in value
+             if isinstance(item, (str, int, float)) and str(item).strip()] \
+        if isinstance(value, list) else []
+    return items[:limit], max(0, len(items) - limit)
+
+
+def render_agent_report(out_path: pathlib.Path, label: str) -> None:
+    """Render the agent's own structured report to the console — done claim,
+    summary, artifacts, commands, risks — so the operator sees exactly what
+    the agent says it did, not just exit codes and cost. Tolerates any
+    payload shape; a missing or garbled report is itself reported."""
     structured = agent_structured(out_path)
     if structured is None:
+        say(f"{label} report: none — the run produced no readable JSON result "
+            f"(raw output: {out_path.relative_to(ROOT)})", "warn")
         return
     try:
         payload = json.loads(out_path.read_text(encoding="utf-8"))
@@ -278,18 +385,198 @@ def say_agent_message(out_path: pathlib.Path, label: str) -> None:
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
+
+    done = structured.get("done")
+    if isinstance(done, bool):
+        claim = tint("ok", "reports DONE") if done else "reports not done yet"
+        say(f"{label} {claim}", "bold" if done else None)
+
     message = structured.get("summary")
     if not (isinstance(message, str) and message.strip()):
         message = payload.get("result")
     if isinstance(message, str) and message.strip():
-        for line in message.strip().splitlines():
-            if line.strip():
-                say(f"{label} says: {line.strip()}")
-    risks = structured.get("risks")
-    if isinstance(risks, list):
-        for risk in risks:
-            if isinstance(risk, str) and risk.strip():
-                say(f"{label} flags risk: {risk.strip()}")
+        condensed = " ".join(message.split())
+        for line in textwrap.wrap(condensed, width=88)[:6]:
+            say(f"{label} says: {line}")
+        if len(textwrap.wrap(condensed, width=88)) > 6:
+            say(f"{label} says: … (full report: {out_path.relative_to(ROOT)})", "dim")
+
+    artifacts, more = _clean_list(structured.get("changed_artifacts"), 8)
+    if artifacts:
+        say(f"{label} changed: " + ", ".join(artifacts)
+            + (f" (+{more} more)" if more else ""))
+    commands, more = _clean_list(structured.get("commands_run"), 5)
+    if commands:
+        say(f"{label} ran: " + " ; ".join(commands)
+            + (f" (+{more} more)" if more else ""))
+    risks, more = _clean_list(structured.get("risks"), 6)
+    for risk in risks:
+        say(f"{label} flags risk: {risk}", "warn")
+    if more:
+        say(f"{label} flags {more} more risk(s) — see {out_path.relative_to(ROOT)}", "warn")
+
+
+# ---------------------------------------------------------------------------
+# Engine event streaming: both engines emit machine-readable event lines while
+# they work. The loop parses them live, narrates each meaningful action to the
+# console, and mirrors it into the monitor feed so 'absoloop watch' shows what
+# the agent is doing *right now* — not just that something is running.
+# ---------------------------------------------------------------------------
+
+def stream_process(command: list[str], wall_seconds: float,
+                   on_line: Callable[[str], None],
+                   env: dict[str, str] | None = None,
+                   ) -> tuple[int, bool, str, str]:
+    """Run a command, feeding each stdout line to on_line as it arrives.
+
+    Returns (exit_code, timed_out, stdout, stderr). Enforces the wall-clock
+    bound by killing the process; reader threads make this safe on every
+    platform (no select() on pipes, which Windows lacks). on_line failures
+    are swallowed — narration must never break the run itself."""
+    proc = subprocess.Popen(command, cwd=ROOT, text=True, encoding="utf-8",
+                            errors="replace", stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                            env=env)
+    out_lines: list[str] = []
+    err_chunks: list[str] = []
+
+    def read_stdout() -> None:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            out_lines.append(line)
+            try:
+                on_line(line.rstrip("\n"))
+            except Exception:
+                pass
+
+    def read_stderr() -> None:
+        assert proc.stderr is not None
+        err_chunks.append(proc.stderr.read() or "")
+
+    readers = [threading.Thread(target=read_stdout, daemon=True),
+               threading.Thread(target=read_stderr, daemon=True)]
+    for thread in readers:
+        thread.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=wall_seconds)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        proc.wait()
+    for thread in readers:
+        thread.join(timeout=5)
+    return proc.returncode, timed_out, "".join(out_lines), "".join(err_chunks)
+
+
+def _first_of(mapping: dict[str, Any], *keys: str) -> str:
+    for key in keys:
+        value = mapping.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def describe_tool_use(name: str, tool_input: Any) -> str:
+    """One human line for a tool call: the tool plus its most telling input."""
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    detail = _first_of(tool_input, "command", "file_path", "path", "pattern",
+                       "query", "url", "description", "prompt")
+    if name == "TodoWrite":
+        detail = detail or "updating its task plan"
+    if not detail and tool_input:
+        detail = json.dumps(tool_input, sort_keys=True)
+    return f"{name}: {detail}" if detail else name
+
+
+def claude_stream_events(line: str) -> list[tuple[str, str]]:
+    """(kind, detail) narration for one claude stream-json line."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(event, dict):
+        return []
+    etype = event.get("type")
+    if etype == "system" and event.get("subtype") == "init":
+        model = event.get("model") or "?"
+        return [("start", f"session started (model {model})")]
+    if etype == "assistant":
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        described: list[tuple[str, str]] = []
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                described.append(("tool", describe_tool_use(
+                    str(block.get("name", "tool")), block.get("input"))))
+            elif block.get("type") == "text":
+                text = " ".join(str(block.get("text", "")).split())
+                if text:
+                    described.append(("say", text))
+        return described
+    return []
+
+
+def codex_stream_events(line: str) -> list[tuple[str, str]]:
+    """(kind, detail) narration for one codex --json event line."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(event, dict):
+        return []
+    etype = str(event.get("type", ""))
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    itype = str(item.get("item_type") or item.get("type") or "")
+    if etype == "thread.started":
+        return [("start", "session started")]
+    if etype == "item.completed":
+        if itype == "command_execution":
+            exit_code = item.get("exit_code")
+            suffix = "" if exit_code in (0, None) else f" (exit {exit_code})"
+            return [("tool", f"ran: {_first_of(item, 'command')}{suffix}")]
+        if itype == "file_change":
+            changes = item.get("changes")
+            paths = [str(c.get("path", "?")) for c in changes
+                     if isinstance(c, dict)] if isinstance(changes, list) else []
+            return [("tool", "edited: " + (", ".join(paths[:6]) or "files"))]
+        if itype in ("agent_message", "reasoning"):
+            text = " ".join(_first_of(item, "text", "summary").split())
+            if text:
+                kind = "say" if itype == "agent_message" else "think"
+                return [(kind, text)]
+        if itype in ("mcp_tool_call", "web_search"):
+            return [("tool", f"{itype}: "
+                     + (_first_of(item, "tool", "query", "server") or "…"))]
+    if etype == "turn.completed" and isinstance(event.get("usage"), dict):
+        usage = event["usage"]
+        return [("usage", f"turn complete — {usage.get('input_tokens', '?')} in / "
+                          f"{usage.get('output_tokens', '?')} out tokens")]
+    if etype == "error":
+        return [("error", _first_of(event, "message") or "engine error")]
+    return []
+
+
+def narrate(label: str, events: list[tuple[str, str]]) -> None:
+    """Print streamed agent actions and mirror them into the monitor feed."""
+    for kind, detail in events:
+        MONITOR.activity(label, kind, detail)
+        if kind == "say":
+            shown = detail if len(detail) <= 160 else detail[:157] + "…"
+            say(f"{label} · {shown}", "act")
+        elif kind == "think":
+            shown = detail if len(detail) <= 120 else detail[:117] + "…"
+            say(f"{label} · thinking: {shown}", "dim")
+        elif kind == "error":
+            say(f"{label} · engine error: {detail}", "err")
+        elif kind == "usage":
+            say(f"{label} · {detail}", "dim")
+        else:
+            shown = detail if len(detail) <= 140 else detail[:137] + "…"
+            say(f"{label} → {shown}")
 
 
 def load_goal(runtime: dict[str, Any]) -> str:
@@ -412,57 +699,91 @@ def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
         "--max-turns", str(cfg["max_turns"]),
         "--max-budget-usd", str(cfg["max_budget_usd"]),
         "--json-schema", schema,
-        "--output-format", "json",
+        # stream-json narrates the run live (tool calls, agent messages) while
+        # still delivering the same final result payload as a terminal event.
+        "--output-format", "stream-json",
+        "--verbose",
         prompt,
     ]
     say(f"{label}: starting (limits: {cfg['max_turns']} turns, "
         f"${cfg['max_budget_usd']}, {cfg.get('max_wall_seconds', 600)}s wall)")
     started = time.time()
+    result_event: dict[str, Any] = {}
+
+    def on_line(line: str) -> None:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if isinstance(event, dict) and event.get("type") == "result":
+            result_event.update(event)
+            return
+        narrate(label, claude_stream_events(line))
+
     # --max-turns bounds turns, not wall time; a single exploratory turn can run
     # for minutes, so every agent run also gets a hard wall-clock bound.
-    try:
-        with heartbeat(label):
-            result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
-                                    check=False, timeout=float(cfg.get("max_wall_seconds", 600)),
-                                    env={**os.environ, **(extra_env or {})})
-    except subprocess.TimeoutExpired as exc:
-        out_path.write_text(exc.stdout or "", encoding="utf-8")
+    with heartbeat(label):
+        exit_code, timed_out, stdout, stderr = stream_process(
+            command, float(cfg.get("max_wall_seconds", 600)), on_line,
+            env={**os.environ, **(extra_env or {})})
+    out_path.with_suffix(".stream.jsonl").write_text(stdout, encoding="utf-8")
+    if timed_out:
+        out_path.write_text(json.dumps(result_event) if result_event else "",
+                            encoding="utf-8")
         out_path.with_suffix(".stderr.log").write_text(
-            (exc.stderr or "") + "\nAGENT_WALL_TIMEOUT\n", encoding="utf-8")
+            stderr + "\nAGENT_WALL_TIMEOUT\n", encoding="utf-8")
         run = AgentRun(124, float(cfg["max_budget_usd"]), False, "wall_timeout", out_path)
-        say(f"{label}: KILLED at {cfg.get('max_wall_seconds', 600)}s wall-clock limit")
+        say(f"{label}: KILLED at {cfg.get('max_wall_seconds', 600)}s wall-clock limit", "err")
         append_ledger({"type": "agent_run", "engine": "claude", "exit_code": 124,
                        "wall_seconds": time.time() - started, "cost_usd": run.cost_usd,
                        "cost_is_exact": False, "limit_reached": "wall_timeout",
                        "result": str(out_path.relative_to(ROOT))})
         return run
-    out_path.write_text(result.stdout, encoding="utf-8")
-    out_path.with_suffix(".stderr.log").write_text(result.stderr, encoding="utf-8")
+    # The final result event carries exact total_cost_usd, and an error subtype
+    # such as error_max_turns or error_max_budget_usd when a limit ended the run.
+    # Persist it as the run's result payload; if the stream ended without one
+    # (crash, unexpected CLI output), fall back to raw stdout so nothing that
+    # was said is lost, and downstream parsing treats the run as not-done.
+    payload: dict[str, Any] | None = result_event or None
+    if payload is not None:
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    else:
+        out_path.write_text(stdout, encoding="utf-8")
+        say(f"{label}: stream ended without a result event — treating the run "
+            f"as unfinished (raw stream: {out_path.with_suffix('.stream.jsonl').relative_to(ROOT)})",
+            "warn")
+    out_path.with_suffix(".stderr.log").write_text(stderr, encoding="utf-8")
 
-    # The result JSON carries exact total_cost_usd, and an error subtype such as
-    # error_max_turns or error_max_budget_usd when a limit ended the run.
-    payload: dict[str, Any] | None = None
-    try:
-        parsed = json.loads(result.stdout)
-        payload = parsed if isinstance(parsed, dict) else None
-    except json.JSONDecodeError:
-        pass
     exact = payload.get("total_cost_usd") if payload else None
     cost_is_exact = isinstance(exact, (int, float))
     subtype = str(payload.get("subtype", "")) if payload else ""
     limit = subtype if payload and payload.get("is_error") and subtype.startswith("error_") else None
+    usage = payload.get("usage") if payload else None
+    tokens = None
+    if isinstance(usage, dict):
+        counted = [int(usage[key]) for key in
+                   ("input_tokens", "cache_creation_input_tokens",
+                    "cache_read_input_tokens", "output_tokens")
+                   if isinstance(usage.get(key), (int, float))]
+        tokens = sum(counted) if counted else None
 
     run = AgentRun(
-        exit_code=result.returncode,
+        exit_code=exit_code,
         cost_usd=float(exact) if cost_is_exact else float(cfg["max_budget_usd"]),
         cost_is_exact=cost_is_exact,
         limit_reached=limit,
         output_path=out_path,
+        tokens=tokens,
     )
     outcome = "finished" if run.exit_code == 0 and not run.limit_reached else "FAILED"
     detail = f" — cut off by limit '{run.limit_reached}'" if run.limit_reached else ""
+    turns = payload.get("num_turns") if payload else None
     say(f"{label}: {outcome} in {time.time() - started:.0f}s, "
-        f"cost ${run.cost_usd:.2f}{detail}")
+        f"cost ${run.cost_usd:.2f}"
+        + (f" ({fmt_tokens(run.tokens)})" if fmt_tokens(run.tokens) else "")
+        + (f", {turns} turn(s)" if isinstance(turns, int) else "")
+        + detail,
+        "ok" if outcome == "finished" else "err")
     if run.limit_reached in ("error_max_budget_usd", "error_max_turns"):
         say(f"{label}: hint — the run was terminated by its own budget before it "
             "could finish; consider raising claude.builder limits in .absoloop/runtime.json")
@@ -473,16 +794,15 @@ def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
         "wall_seconds": time.time() - started,
         "cost_usd": run.cost_usd,
         "cost_is_exact": run.cost_is_exact,
+        "tokens": run.tokens,
         "limit_reached": run.limit_reached,
         "result": str(out_path.relative_to(ROOT)),
     })
     return run
 
 
-def codex_usage_to_usd(events_path: pathlib.Path, pricing: dict[str, float] | None) -> float | None:
-    """Sum token usage from turn.completed events; convert with configured rates."""
-    if not pricing:
-        return None
+def codex_usage_totals(events_path: pathlib.Path) -> dict[str, int] | None:
+    """Summed token usage from turn.completed events, None when none appeared."""
     totals = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
     seen = False
     try:
@@ -500,8 +820,14 @@ def codex_usage_to_usd(events_path: pathlib.Path, pricing: dict[str, float] | No
             for key in totals:
                 value = usage.get(key)
                 if isinstance(value, (int, float)):
-                    totals[key] += value
-    if not seen:
+                    totals[key] += int(value)
+    return totals if seen else None
+
+
+def codex_usage_to_usd(totals: dict[str, int] | None,
+                       pricing: dict[str, float] | None) -> float | None:
+    """Convert summed token usage to dollars with the configured rates."""
+    if not totals or not pricing:
         return None
     fresh_input = max(0, totals["input_tokens"] - totals["cached_input_tokens"])
     return (
@@ -532,37 +858,43 @@ def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None
         f"{cfg.get('max_wall_seconds', 600)}s wall"
         + (f", reasoning={effort}" if effort else "") + ")")
     started = time.time()
-    try:
-        with heartbeat(label):
-            result = subprocess.run(command, cwd=ROOT, text=True, capture_output=True,
-                                    check=False, timeout=float(cfg.get("max_wall_seconds", 600)))
-    except subprocess.TimeoutExpired as exc:
-        events_path = out_path.with_suffix(".events.jsonl")
-        events_path.write_text(exc.stdout or "", encoding="utf-8")
+    events_path = out_path.with_suffix(".events.jsonl")
+
+    def on_line(line: str) -> None:
+        narrate(label, codex_stream_events(line))
+
+    with heartbeat(label):
+        exit_code, timed_out, stdout, stderr = stream_process(
+            command, float(cfg.get("max_wall_seconds", 600)), on_line)
+    events_path.write_text(stdout, encoding="utf-8")
+    if timed_out:
         out_path.with_suffix(".stderr.log").write_text(
-            (exc.stderr or "") + "\nAGENT_WALL_TIMEOUT\n", encoding="utf-8")
+            stderr + "\nAGENT_WALL_TIMEOUT\n", encoding="utf-8")
         run = AgentRun(124, float(cfg["max_budget_usd"]), False, "wall_timeout", out_path)
-        say(f"{label}: KILLED at {cfg.get('max_wall_seconds', 600)}s wall-clock limit")
+        say(f"{label}: KILLED at {cfg.get('max_wall_seconds', 600)}s wall-clock limit", "err")
         append_ledger({"type": "agent_run", "engine": "codex", "exit_code": 124,
                        "wall_seconds": time.time() - started, "cost_usd": run.cost_usd,
                        "cost_is_exact": False, "limit_reached": "wall_timeout",
                        "result": str(out_path.relative_to(ROOT))})
         return run
-    events_path = out_path.with_suffix(".events.jsonl")
-    events_path.write_text(result.stdout, encoding="utf-8")
-    out_path.with_suffix(".stderr.log").write_text(result.stderr, encoding="utf-8")
+    out_path.with_suffix(".stderr.log").write_text(stderr, encoding="utf-8")
 
-    exact = codex_usage_to_usd(events_path, pricing)
+    totals = codex_usage_totals(events_path)
+    exact = codex_usage_to_usd(totals, pricing)
+    tokens = (totals["input_tokens"] + totals["output_tokens"]) if totals else None
     run = AgentRun(
-        exit_code=result.returncode,
+        exit_code=exit_code,
         cost_usd=exact if exact is not None else float(cfg["max_budget_usd"]),
         cost_is_exact=exact is not None,
         limit_reached=None,
         output_path=out_path,
+        tokens=tokens,
     )
     say(f"{label}: {'finished' if run.exit_code == 0 else 'FAILED'} in "
         f"{time.time() - started:.0f}s, cost ${run.cost_usd:.2f}"
-        f"{'' if run.cost_is_exact else ' (estimated)'}")
+        + (f" ({fmt_tokens(run.tokens)})" if fmt_tokens(run.tokens) else "")
+        + f"{'' if run.cost_is_exact else ' (estimated)'}",
+        "ok" if run.exit_code == 0 else "err")
     append_ledger({
         "type": "agent_run",
         "engine": "codex",
@@ -570,6 +902,7 @@ def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None
         "wall_seconds": time.time() - started,
         "cost_usd": run.cost_usd,
         "cost_is_exact": run.cost_is_exact,
+        "tokens": run.tokens,
         "result": str(out_path.relative_to(ROOT)),
         "events": str(events_path.relative_to(ROOT)),
     })
@@ -595,6 +928,7 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
     )
 
     out_path = TMP / f"iteration-{state.iteration:04d}-critic.json"
+    MONITOR.update(phase="critic review", agent="critic", agent_started=time.time())
     verdict: dict[str, Any] | None = None
     if engine == "claude":
         run = run_claude(prompt, runtime["claude"]["critic"], out_path,
@@ -616,9 +950,18 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
 
     if isinstance(candidate, dict) and candidate.get("recommendation") in {"PASS", "HOLD", "REJECT"}:
         verdict = candidate
-        say(f"critic verdict: {verdict['recommendation']} — {verdict.get('summary', '')[:200]}")
+        style = {"PASS": "ok", "HOLD": "warn", "REJECT": "err"}[verdict["recommendation"]]
+        say(f"critic verdict: {verdict['recommendation']} — {verdict.get('summary', '')[:200]}", style)
+        findings, more = _clean_list(verdict.get("blocking_findings"), 6)
+        for finding in findings:
+            say(f"critic blocking finding: {finding}", "warn")
+        if more:
+            say(f"critic recorded {more} more blocking finding(s)", "warn")
+        MONITOR.activity("critic", "verdict",
+                         f"{verdict['recommendation']}: {verdict.get('summary', '')}")
     else:
-        say("critic verdict: UNREADABLE (treated as an error, not a pass)")
+        say("critic verdict: UNREADABLE (treated as an error, not a pass)", "err")
+        MONITOR.activity("critic", "verdict", "UNREADABLE (treated as an error)")
     return verdict, run
 
 
@@ -628,10 +971,12 @@ def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
     the human gate. Returns (stop_reason, terminal_status) when the mission
     should stop, or None when the repair loop should continue."""
     state.status = "FINAL_REVIEW"
-    say("builder reports done — entering final acceptance (integrity, critic)")
+    say("builder reports done — entering final acceptance (integrity, critic)", "bold")
+    MONITOR.update(phase="final acceptance", status="FINAL_REVIEW")
 
     integrity_command = runtime.get("integrity_command")
     if integrity_command:
+        MONITOR.update(phase="integrity check")
         integrity_log = TMP / f"iteration-{state.iteration:04d}-integrity.log"
         integrity = run_command(integrity_command, integrity_log, check_timeout)
         append_ledger({"type": "integrity_check", "iteration": state.iteration,
@@ -642,6 +987,7 @@ def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
 
     verdict, run = run_critic(engine, runtime, state)
     state.cost_usd += run.cost_usd
+    state.tokens_total += run.tokens or 0
     if not run.cost_is_exact:
         state.inexact_cost_events += 1
     report_spend(state, runtime)
@@ -714,7 +1060,8 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
         + (f" (stop reason: {state.stop_reason})" if state.stop_reason else ""),
         f"- iterations: {state.iteration} of {runtime.get('max_iterations', '?')}",
         f"- total cost: ${state.cost_usd:.2f} of "
-        f"${float(runtime.get('max_cost_usd', 0)):.2f}",
+        f"${float(runtime.get('max_cost_usd', 0)):.2f}"
+        + (f" ({fmt_tokens(state.tokens_total)})" if fmt_tokens(state.tokens_total) else ""),
         f"- delivery mode: {delivery.get('mode', 'local')}",
         "",
         "## Changed files (uncommitted, excluding .absoloop/)",
@@ -737,9 +1084,11 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
             outcome = "builder reports DONE" if event.get("done") else "not done yet"
             lines.append(f"- {ts} — iteration {event.get('iteration')}: {outcome}")
         elif kind == "agent_run":
+            tokens_note = fmt_tokens(event.get("tokens"))
             lines.append(f"- {ts} — {event.get('engine')} run: exit {event.get('exit_code')}, "
-                         f"${float(event.get('cost_usd', 0)):.2f}, "
-                         f"{float(event.get('wall_seconds', 0)):.0f}s")
+                         f"${float(event.get('cost_usd', 0)):.2f}"
+                         + (f" ({tokens_note})" if tokens_note else "")
+                         + f", {float(event.get('wall_seconds', 0)):.0f}s")
         elif kind == "human_gate":
             lines.append(f"- {ts} — human gate: {event.get('decision')}")
         elif kind == "delivery":
@@ -832,8 +1181,13 @@ def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int
     state.status = status
     checkpoint(state, "terminal")
     append_ledger({"type": "mission_stop", "reason": reason, "status": status})
+    MONITOR.update(phase="stopped", status=status, stop_reason=reason,
+                   iteration=state.iteration, cost_usd=round(state.cost_usd, 4),
+                   tokens_total=state.tokens_total, agent=None, ended_at=time.time())
+    style = {"COMPLETED": "ok", "AWAITING_APPROVAL": "ok"}.get(status, "warn")
+    tokens = f" ({fmt_tokens(state.tokens_total)})" if fmt_tokens(state.tokens_total) else ""
     say(f"mission stopped: {status} (reason: {reason}) after {state.iteration} "
-        f"iteration(s), total cost ${state.cost_usd:.2f}")
+        f"iteration(s), total cost ${state.cost_usd:.2f}{tokens}", style)
     if status == "COMPLETED":
         deliver_results(runtime, state)
     report_path = write_report(runtime, state)
@@ -861,6 +1215,15 @@ def main() -> int:
 
     runtime = load_json(RUNTIME_PATH)
     TMP.mkdir(parents=True, exist_ok=True)
+
+    # Keep the live activity feed bounded: trim to its most recent tail when a
+    # new run starts, so 'absoloop watch' stays fast on long-lived projects.
+    try:
+        if LIVE_PATH.is_file() and LIVE_PATH.stat().st_size > 1_000_000:
+            tail = LIVE_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-1000:]
+            LIVE_PATH.write_text("\n".join(tail) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
     if STATE_PATH.exists():
         state = State(**load_json(STATE_PATH))
@@ -892,9 +1255,20 @@ def main() -> int:
     max_wall = float(runtime["max_wall_seconds"])
     check_timeout = min(900, int(max_wall))
 
-    say(f"mission {state.mission_id}: {runtime['objective']}")
+    say(f"mission {state.mission_id}: {runtime['objective']}", "bold")
     say(f"budgets: {runtime['max_iterations']} iterations, ${runtime['max_cost_usd']:.2f}, "
         f"{int(max_wall)}s wall clock")
+    MONITOR.update(mission_id=state.mission_id, loop_id=runtime.get("loop_id"),
+                   objective=runtime.get("objective"), engine=args.engine,
+                   status="RUNNING", phase="starting",
+                   iteration=state.iteration,
+                   max_iterations=int(runtime["max_iterations"]),
+                   cost_usd=round(state.cost_usd, 4),
+                   max_cost_usd=float(runtime["max_cost_usd"]),
+                   tokens_total=state.tokens_total,
+                   started_at=state.started_at, max_wall_seconds=max_wall,
+                   repeated_failure_count=state.repeated_failure_count)
+    say("monitor: run 'absoloop watch' in another terminal for a live dashboard", "dim")
     goal_path = ROOT / runtime.get("goal_path", ".absoloop/goal.md")
     say(f"goal contract: {goal_path.relative_to(ROOT)}"
         + ("" if goal_path.is_file() else " (missing — using inline fallback)"))
@@ -925,9 +1299,13 @@ def main() -> int:
         state.iteration += 1
         state.status = "EXECUTING"
         checkpoint(state, "pre-agent")
+        iter_tokens = (f" ({fmt_tokens(state.tokens_total)})"
+                       if fmt_tokens(state.tokens_total) else "")
         say(f"iteration {state.iteration}/{runtime['max_iterations']} — "
-            f"spent ${state.cost_usd:.2f} of ${float(runtime['max_cost_usd']):.2f}, "
-            f"{int(max_wall - (time.time() - state.started_at))}s wall clock left")
+            f"spent ${state.cost_usd:.2f}{iter_tokens} of "
+            f"${float(runtime['max_cost_usd']):.2f}, "
+            f"{int(max_wall - (time.time() - state.started_at))}s wall clock left",
+            "bold")
 
         prompt = build_iteration_prompt(runtime, state, args.engine)
         prompt_path = TMP / f"iteration-{state.iteration:04d}-prompt.md"
@@ -938,10 +1316,17 @@ def main() -> int:
         rung = thinking_rung(runtime, state)
         scale = float(rung.get("budget_scale", 1.0))
         scale = scale if scale >= 1.0 else 1.0
-        say(f"thinking level: "
-            f"{rung['claude_keyword'] if args.engine == 'claude' else rung['codex_effort']} "
+        thinking_level = (rung["claude_keyword"] if args.engine == "claude"
+                          else rung["codex_effort"])
+        say(f"thinking level: {thinking_level} "
             f"(repeated failures: {state.repeated_failure_count}, "
             f"per-run budgets ×{scale:g})")
+        MONITOR.update(phase="building", iteration=state.iteration,
+                       max_iterations=int(runtime["max_iterations"]),
+                       agent="builder", agent_started=time.time(),
+                       thinking_level=thinking_level,
+                       repeated_failure_count=state.repeated_failure_count,
+                       status="EXECUTING", stop_reason=None)
 
         def scaled(cfg: dict[str, Any]) -> dict[str, Any]:
             # Deeper thinking needs room to run: widen this iteration's
@@ -973,11 +1358,13 @@ def main() -> int:
                             label="builder")
 
         state.cost_usd += run.cost_usd
+        state.tokens_total += run.tokens or 0
         if not run.cost_is_exact:
             state.inexact_cost_events += 1
         report_spend(state, runtime)
         state.latest_agent_result = str(result_path.relative_to(ROOT))
-        say_agent_message(result_path, "builder")
+        MONITOR.update(phase="assessing iteration", agent=None)
+        render_agent_report(result_path, "builder")
 
         if run.exit_code != 0 or run.limit_reached:
             # A limit-terminated CLI run is a bounded failure, never completion.
@@ -1012,7 +1399,8 @@ def main() -> int:
             state.repeated_failure_count += 1
             state.last_failure_fingerprint = current_tree
             say(f"no changes made this iteration ({state.repeated_failure_count} "
-                f"stalled in a row; loop stops at {runtime['no_progress_window']})")
+                f"stalled in a row; loop stops at {runtime['no_progress_window']})",
+                "warn")
         else:
             state.repeated_failure_count = 0
             state.last_failure_fingerprint = current_tree

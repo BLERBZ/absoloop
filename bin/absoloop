@@ -28,6 +28,9 @@ examples:
   absoloop existing-project     # adopts an existing directory in place
   absoloop .                    # adopt the directory you are already in
   absoloop status               # where is the mission? what should I do next?
+  absoloop watch                # live dashboard: phase, budgets, and a
+                                  # streaming feed of agent actions (--once
+                                  # for a single frame, -n 5 to refresh slower)
   absoloop report               # iteration-by-iteration results timeline
   absoloop goal                 # show the generated /goal contract
                                   # (--regen rebuilds it; --check validates the
@@ -575,6 +578,248 @@ def load_runtime(target: pathlib.Path) -> dict:
         return {}
 
 
+# ---------------------------------------------------------------------------
+# Live monitoring — reads the telemetry the runner maintains while it works:
+#   .absoloop/tmp/monitor.json  atomically-replaced loop snapshot (phase,
+#                               budgets, current agent, last activity)
+#   .absoloop/tmp/live.jsonl    append-only feed of streamed agent actions
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_STALE_SECONDS = 90
+
+
+def load_monitor(target: pathlib.Path) -> dict:
+    try:
+        data = json.loads((target / ".absoloop" / "tmp" / "monitor.json")
+                          .read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def monitor_is_live(monitor: dict) -> bool:
+    """True when the loop process that wrote this snapshot is still at work."""
+    heartbeat = monitor.get("heartbeat_ts")
+    fresh = (isinstance(heartbeat, (int, float))
+             and time.time() - heartbeat < HEARTBEAT_STALE_SECONDS)
+    return fresh and pid_alive(monitor.get("pid"))
+
+
+def fmt_tokens(tokens) -> str:
+    """Human token count shown next to costs: 12.3k tokens."""
+    return (f"{float(tokens) / 1000:.1f}k tokens"
+            if isinstance(tokens, (int, float)) and tokens > 0 else "")
+
+
+def with_tokens(cost_text: str, tokens) -> str:
+    note = fmt_tokens(tokens)
+    return f"{cost_text} ({note})" if note else cost_text
+
+
+def fmt_age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+
+
+def live_tail(target: pathlib.Path, count: int) -> list[dict]:
+    """The last `count` events from the runner's live activity feed."""
+    path = target / ".absoloop" / "tmp" / "live.jsonl"
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    events = []
+    for line in lines[-count:]:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def latest_builder_report(target: pathlib.Path, state: dict) -> dict:
+    """Structured fields from the most recent saved agent result, if any."""
+    rel = state.get("latest_agent_result")
+    if not rel:
+        return {}
+    try:
+        payload = json.loads((target / str(rel)).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    structured = payload.get("structured_output")
+    structured = structured if isinstance(structured, dict) else payload
+    return structured if isinstance(structured, dict) else {}
+
+
+TERMINAL_STATUSES = {"COMPLETED", "AWAITING_APPROVAL", "BLOCKED",
+                     "BUDGET_EXHAUSTED", "REJECTED"}
+
+
+def render_watch(target: pathlib.Path, state: dict, runtime: dict,
+                 monitor: dict, feed_lines: int, interval: float | None) -> tuple[str, bool]:
+    """One frame of the live dashboard. Returns (text, loop_is_live)."""
+    live = monitor_is_live(monitor)
+    width = 72
+    out: list[str] = []
+    def rule(char="─"):
+        out.append(char * width)
+
+    status = str(monitor.get("status") if live else state.get("status") or "?")
+    phase = str(monitor.get("phase") or "").strip()
+    badge = "● LIVE" if live else ("■ " + status if status in TERMINAL_STATUSES
+                                   else "○ loop not running")
+    rule("═")
+    out.append(f" ABSOLOOP WATCH — {state.get('mission_id') or monitor.get('mission_id') or '?'} "
+               f"({runtime.get('loop_id', 'no loop id')})   [{badge}]")
+    rule("═")
+    if runtime.get("objective"):
+        out.append(f" objective : {runtime['objective']}")
+    engine = monitor.get("engine")
+    line = f" status    : {status}"
+    if live and phase:
+        line += f" · {phase}"
+    if state.get("stop_reason") and not live:
+        line += f" ({state['stop_reason']})"
+    if engine:
+        line += f" · engine {engine}"
+    out.append(line)
+
+    max_iter = int(runtime.get("max_iterations") or 0)
+    iteration = int((monitor if live else state).get("iteration") or 0)
+    out.append(f" iteration : {iteration} of {max_iter or '?'}   "
+               f"{budget_bar(iteration, max_iter)}")
+    cap = float(runtime.get("max_cost_usd") or 0)
+    source = monitor if live else state
+    spent = float(source.get("cost_usd") or 0)
+    out.append(f" spend     : {with_tokens(f'${spent:.2f}', source.get('tokens_total'))} "
+               f"of ${cap:.2f}   {budget_bar(spent, cap)}")
+    started = (monitor.get("started_at") if live else state.get("started_at")) or 0
+    max_wall = float(runtime.get("max_wall_seconds") or 0)
+    if started and max_wall and (live or status == "EXECUTING"):
+        elapsed = time.time() - float(started)
+        out.append(f" wall clock: {fmt_age(elapsed)} of {fmt_age(max_wall)}   "
+                   f"{budget_bar(elapsed, max_wall)}")
+    if live:
+        if monitor.get("thinking_level"):
+            out.append(f" thinking  : {monitor['thinking_level']} "
+                       f"(repeated failures: {monitor.get('repeated_failure_count', 0)})")
+        agent = monitor.get("agent")
+        if agent:
+            agent_started = monitor.get("agent_started")
+            running = (f" — working for {fmt_age(time.time() - agent_started)}"
+                       if isinstance(agent_started, (int, float)) else "")
+            out.append(f" agent     : {agent}{running}")
+        activity = monitor.get("last_activity")
+        if isinstance(activity, dict) and activity.get("detail"):
+            age = fmt_age(time.time() - float(activity.get("ts") or time.time()))
+            out.append(f" doing     : {activity['detail'][:width - 22]} ({age} ago)")
+
+    feed = live_tail(target, feed_lines)
+    if feed:
+        rule()
+        out.append(f" agent activity (last {len(feed)})")
+        for event in feed:
+            stamp = time.strftime("%H:%M:%S", time.localtime(event.get("ts", 0)))
+            marker = {"say": "💬", "think": "…", "tool": "→", "verdict": "⚖",
+                      "error": "✗", "usage": "·", "start": "▶"}.get(event.get("kind"), "→")
+            detail = str(event.get("detail", ""))[:width - 26]
+            out.append(f"  {stamp} {event.get('agent', '?'):<8}{marker} {detail}")
+
+    report = latest_builder_report(target, state)
+    summary = str(report.get("summary") or "").strip()
+    risks = [str(r).strip() for r in report.get("risks", [])
+             if isinstance(r, str) and str(r).strip()] if isinstance(report.get("risks"), list) else []
+    if summary or risks:
+        rule()
+        if summary:
+            out.append(" builder's last report: " + " ".join(summary.split())[:width - 25])
+        for risk in risks[:3]:
+            out.append(f" ⚠ risk: {risk[:width - 10]}")
+    rule()
+    out.append(f" next: {next_step_hint(state or monitor)}")
+    footer = f" refreshed {time.strftime('%H:%M:%S')}"
+    if interval:
+        footer += f" · every {interval:g}s · Ctrl-C to exit"
+    out.append(footer)
+    rule("═")
+    return "\n".join(out), live
+
+
+def watch_command(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="absoloop watch",
+        description="Live dashboard for a running mission: phase, budgets, and "
+                    "a streaming feed of what the agent is doing right now.")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    parser.add_argument("-n", "--interval", type=float, default=2.0,
+                        help="refresh interval in seconds (default: 2)")
+    parser.add_argument("--once", action="store_true",
+                        help="render a single frame and exit")
+    parser.add_argument("--plain", action="store_true",
+                        help="append frames instead of clearing the screen "
+                             "(for logs or dumb terminals)")
+    parser.add_argument("--lines", type=int, default=12,
+                        help="activity-feed lines to show (default: 12)")
+    args = parser.parse_args(argv)
+    target = pathlib.Path(args.project).expanduser().resolve()
+    if not (target / ".absoloop").is_dir():
+        print(f"error: no .absoloop/ under {target} — not an ABSOLOOP project.",
+              file=sys.stderr)
+        return 1
+    clear = sys.stdout.isatty() and not args.plain
+    interval = max(0.5, args.interval)
+    try:
+        while True:
+            state = {}
+            state_path = target / ".absoloop" / "state.json"
+            if state_path.is_file():
+                try:
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    state = {}
+            frame, live = render_watch(target, state, load_runtime(target),
+                                       load_monitor(target), args.lines,
+                                       None if args.once else interval)
+            if clear:
+                print("\033[2J\033[3J\033[H", end="")
+            print(frame, flush=True)
+            if args.once:
+                return 0
+            if not live and str(state.get("status")) in TERMINAL_STATUSES:
+                print("\nmission is in a terminal state and the loop is not "
+                      "running — exiting watch.")
+                return 0
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
 def goal_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="absoloop goal",
@@ -683,7 +928,8 @@ def report_command(argv: list[str]) -> int:
           + (f"  ({state.get('stop_reason')})" if state.get("stop_reason") else ""))
     cap = float(runtime.get("max_cost_usd") or 0)
     spent = float(state.get("cost_usd", 0))
-    print(f" spend     : ${spent:.2f} of ${cap:.2f}  {budget_bar(spent, cap)}")
+    print(f" spend     : {with_tokens(f'${spent:.2f}', state.get('tokens_total'))} "
+          f"of ${cap:.2f}  {budget_bar(spent, cap)}")
     max_iter = int(runtime.get("max_iterations") or 0)
     done_iter = int(state.get("iteration", 0))
     print(f" iterations: {done_iter} of {max_iter}  {budget_bar(done_iter, max_iter)}")
@@ -704,7 +950,8 @@ def report_command(argv: list[str]) -> int:
             exact = "" if event.get("cost_is_exact") else "~"
             limit = f" [hit {event['limit_reached']}]" if event.get("limit_reached") else ""
             print(f"  {ts}  {event.get('engine')} run — exit {event.get('exit_code')}, "
-                  f"{exact}{cost}, {float(event.get('wall_seconds', 0)):.0f}s{limit}")
+                  f"{with_tokens(exact + cost, event.get('tokens'))}, "
+                  f"{float(event.get('wall_seconds', 0)):.0f}s{limit}")
             summary = agent_summary(target, str(event.get("result", "")))
             if summary:
                 print(f"           └ {summary[:110]}")
@@ -754,15 +1001,44 @@ def status_command(argv: list[str]) -> int:
     if delivery:
         print(f"delivery:   {delivery.get('mode', 'local')} — "
               f"{DELIVERY_MODES.get(delivery.get('mode', 'local'), '')}")
+    monitor = load_monitor(target)
+    live = monitor_is_live(monitor)
     print(f"status:     {state.get('status')}"
-          + (f"  (stop_reason: {state.get('stop_reason')})" if state.get("stop_reason") else ""))
+          + (f"  (stop_reason: {state.get('stop_reason')})" if state.get("stop_reason") else "")
+          + ("  [loop RUNNING now]" if live else ""))
+    if live:
+        line = f"live:       phase '{monitor.get('phase', '?')}'"
+        if monitor.get("agent"):
+            agent_started = monitor.get("agent_started")
+            line += f" · {monitor['agent']} at work"
+            if isinstance(agent_started, (int, float)):
+                line += f" for {fmt_age(time.time() - agent_started)}"
+        print(line)
+        activity = monitor.get("last_activity")
+        if isinstance(activity, dict) and activity.get("detail"):
+            age = fmt_age(time.time() - float(activity.get("ts") or time.time()))
+            print(f"doing:      {str(activity['detail'])[:100]} ({age} ago)")
     max_iter = int(runtime.get("max_iterations") or 0)
     print(f"iteration:  {state.get('iteration')} of {max_iter or '?'}  "
           f"{budget_bar(int(state.get('iteration', 0)), max_iter)}")
     cap = runtime.get("max_cost_usd")
-    print(f"spent:      ${float(state.get('cost_usd', 0)):.2f}"
-          + (f" of ${float(cap):.2f}  {budget_bar(float(state.get('cost_usd', 0)), float(cap))}"
-             if cap else ""))
+    source = monitor if live else state
+    spent = float(source.get("cost_usd") or 0)
+    print(f"spent:      {with_tokens(f'${spent:.2f}', source.get('tokens_total'))}"
+          + (f" of ${float(cap):.2f}  {budget_bar(spent, float(cap))}" if cap else ""))
+    started = state.get("started_at")
+    max_wall = float(runtime.get("max_wall_seconds") or 0)
+    if live and started and max_wall:
+        elapsed = time.time() - float(started)
+        print(f"wall clock: {fmt_age(elapsed)} of {fmt_age(max_wall)}  "
+              f"{budget_bar(elapsed, max_wall)}")
+    report = latest_builder_report(target, state)
+    summary = str(report.get("summary") or "").strip()
+    if summary:
+        print(f"builder:    {' '.join(summary.split())[:120]}")
+    if isinstance(report.get("risks"), list):
+        for risk in [str(r).strip() for r in report["risks"] if str(r).strip()][:3]:
+            print(f"risk:       {risk[:120]}")
     if state.get("human_feedback"):
         print(f"feedback:   queued for next iteration: {state['human_feedback']!r}")
     for key, label in (("latest_agent_result", "agent result"),
@@ -770,8 +1046,8 @@ def status_command(argv: list[str]) -> int:
         if state.get(key):
             print(f"latest {label}: {state[key]}")
     print(f"next:       {next_step_hint(state)}")
-    print("more:       'absoloop report' shows the full iteration timeline; "
-          "'absoloop goal' shows the mission contract")
+    print("more:       'absoloop watch' is a live dashboard; 'absoloop report' "
+          "shows the full timeline; 'absoloop goal' shows the contract")
     return 0
 
 
@@ -838,10 +1114,11 @@ def extend_mission(target: pathlib.Path, state: dict, engine: str,
                                  "loop_id": new_id, "note": note},
                                 sort_keys=True) + "\n")
 
+    prev_cost = with_tokens(f"${float(state.get('cost_usd', 0)):.2f}",
+                            state.get("tokens_total"))
     print(f"extending mission {state.get('mission_id')}: previous run "
           f"{prev_loop_id} ({prev_status}, {state.get('iteration', 0)} iteration(s), "
-          f"${float(state.get('cost_usd', 0)):.2f}) archived to "
-          f"{archive.relative_to(target)}/")
+          f"{prev_cost}) archived to {archive.relative_to(target)}/")
     print(f"new run {new_id}: {runtime.get('max_iterations')} iterations, "
           f"${float(runtime.get('max_cost_usd', 0)):.2f}, "
           f"{int(runtime.get('max_wall_seconds', 0))}s wall clock")
@@ -899,9 +1176,10 @@ def resume_command(argv: list[str]) -> int:
         print(f"mission {state.get('mission_id')} is {status} — nothing to resume.")
         print(f"next: {next_step_hint(state)}")
         return 0 if status == "COMPLETED" else 3
+    resume_cost = with_tokens(f"${float(state.get('cost_usd', 0)):.2f}",
+                              state.get("tokens_total"))
     print(f"resuming mission {state.get('mission_id')} at iteration "
-          f"{state.get('iteration')} (${float(state.get('cost_usd', 0)):.2f} spent, "
-          f"status {status})")
+          f"{state.get('iteration')} ({resume_cost} spent, status {status})")
     return start_loop(target, engine)
 
 
@@ -960,8 +1238,10 @@ def gate_command(action: str, argv: list[str]) -> int:
         save()
         record({"type": "human_gate", "decision": "approved", "note": args.message,
                 "iteration": state.get("iteration")})
+        cost_text = with_tokens(f"${float(state.get('cost_usd', 0)):.2f}",
+                                state.get("tokens_total"))
         print(f"mission {state.get('mission_id')} APPROVED and marked COMPLETED "
-              f"(iteration {state.get('iteration')}, cost ${float(state.get('cost_usd', 0)):.2f}).")
+              f"(iteration {state.get('iteration')}, cost {cost_text}).")
         runner = target / "scripts" / "absoloop-run"
         if runner.is_file():
             print("Delivering results per the mission's delivery mode...")
@@ -1003,6 +1283,8 @@ def main(argv: list[str]) -> int:
         return gate_command(argv[0], argv[1:])
     if argv and argv[0] == "status":
         return status_command(argv[1:])
+    if argv and argv[0] == "watch":
+        return watch_command(argv[1:])
     if argv and argv[0] == "report":
         return report_command(argv[1:])
     if argv and argv[0] == "goal":
