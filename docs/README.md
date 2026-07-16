@@ -2,6 +2,7 @@
 
 | Doc | Audience |
 |---|---|
+| [getting-started.md](getting-started.md) | Setup wizard, first mission, PATH + providers |
 | [mission-loop.md](mission-loop.md) | Mission Briefing, `/goal`, skills, delivery, watch/report |
 | [multi-provider.md](multi-provider.md) | Harness user guide (Grok / Claude / Codex) |
 | [architecture/multi-provider-harness.md](architecture/multi-provider-harness.md) | Design of the provider-neutral harness |

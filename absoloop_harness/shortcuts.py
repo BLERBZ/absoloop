@@ -104,6 +104,9 @@ ACTIONS: Dict[str, Action] = {
         ("cancel",), group="harness", micro_slot="error",
         needs_prompt=True, prompt_label="run-id (blank = newest live)",
         dangerous=True),
+    "setup": Action(
+        "setup", "First-run setup wizard (PATH · providers · defaults)",
+        ("setup",), group="system", micro_slot=""),
     "doctor": Action(
         "doctor", "Provider health, auth, actionable fixes",
         ("doctor",), group="system", micro_slot="doctor"),

@@ -11,6 +11,7 @@
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
+  <a href="docs/getting-started.md">Setup wizard</a> ·
   <a href="#how-the-loop-closes">How it works</a> ·
   <a href="#multi-provider-harness">Harness</a> ·
   <a href="CONTRIBUTING.md">Contribute</a> ·
@@ -68,11 +69,17 @@ and/or `grok`).
 ```bash
 git clone https://github.com/BLERBZ/absoloop.git
 cd absoloop
-# ABSOLOOP_HOME auto-detects from bin/ — export only if you relocate the tree
-mkdir -p ~/.local/bin && ln -sf "$PWD/bin/absoloop" ~/.local/bin/absoloop
-# Windows: add absoloop\bin to PATH (absoloop.cmd sets ABSOLOOP_HOME)
+export PATH="$PWD/bin:$PATH"       # Windows: add absoloop\bin to User PATH
 
-absoloop doctor                    # env + Grok/Claude/Codex + Micro hints
+absoloop setup                     # guided wizard — PATH, providers, defaults
+# or just:  absoloop               # first run offers the wizard automatically
+```
+
+The wizard walks you through five short steps, then can open Mission Briefing
+in the same session. Re-run anytime with `absoloop setup --force`.
+
+```bash
+absoloop doctor                    # health check anytime
 absoloop "Make all tests pass"     # Mission Briefing → review card → Enter
 ```
 

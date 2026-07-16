@@ -16,6 +16,7 @@ python -m unittest discover -s tests -v
 # or
 python -m pytest tests -q
 
+absoloop setup -y # non-interactive PATH link + defaults (optional)
 absoloop doctor   # env + Grok/Claude/Codex auth hints + Codex Micro tips
 ```
 

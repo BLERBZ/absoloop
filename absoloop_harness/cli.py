@@ -32,7 +32,7 @@ from . import runtime as run_ctrl
 from .workspace import RunStore, list_runs
 
 HARNESS_COMMANDS = ("doctor", "providers", "run", "build", "review",
-                    "cancel", "inspect", "apply", "config")
+                    "cancel", "inspect", "apply", "config", "setup")
 
 _USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
@@ -83,6 +83,7 @@ def _event_printer(verbose: bool):
 
 def doctor_command(argv: List[str]) -> int:
     from .platform_util import prerequisite_checks, rewrite_python_gate
+    from . import setup_wizard
 
     cfg = load_config(_root())
     print("Absoloop doctor — environment + provider health\n")
@@ -95,6 +96,10 @@ def doctor_command(argv: List[str]) -> int:
             print(f"           {_tint('33', note)}")
         else:
             print(f"           {note}")
+    if setup_wizard.is_setup_complete():
+        print(f"           setup:   complete ({setup_wizard.setup_state_path()})")
+    else:
+        print(f"           {_tint('33', 'setup:   not run yet — absoloop setup')}")
     gate = str(cfg.get("gates", "commands", default={}).get("tests") or "")
     if gate:
         rewritten = rewrite_python_gate(gate)

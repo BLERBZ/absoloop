@@ -125,9 +125,10 @@ prints every resolved value with its source.
 - `absoloop resume` now checks harness run ids first
   (`.absoloop/runs/<id>`); anything else falls through to the legacy
   mission resume, so existing missions behave exactly as before.
-- New harness subcommands (`doctor`, `providers`, `run`, `build`, `review`,
-  `inspect`, `apply`, `config`) are reserved words — a legacy mission
-  project can no longer be named exactly one of these.
+- New harness / management subcommands (`setup`, `doctor`, `providers`,
+  `run`, `build`, `review`, `inspect`, `apply`, `config`) are reserved
+  words — a legacy mission project can no longer be named exactly one of
+  these.
 - Legacy `.absoloop/runtime.json`, `state.json`, etc. are untouched; the
   harness only adds `.absoloop/runs/` and `.absoloop/worktrees/`
   (the latter is transient and cleaned after each run).
