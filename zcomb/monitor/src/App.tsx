@@ -66,16 +66,16 @@ export default function App() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <img
             src="/absoloop-logo-mark.png"
-            alt=""
-            width={34}
+            alt="AbsoLoop"
+            // Mark is ~2.3:1 landscape; size by height so 1.23× is visible
+            // (a square box with object-fit:contain kept the glyph ~12px tall).
             height={34}
             style={{
-              width: 34,
-              height: 34,
+              height: 34,          // 28 × 1.23
+              width: 'auto',
               objectFit: 'contain',
               display: 'block',
               flexShrink: 0,
-              borderRadius: 6,
             }}
           />
           <div style={{
