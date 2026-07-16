@@ -729,6 +729,44 @@ def budget_bar(used: float, cap: float, width: int = 22) -> str:
     return f"[{'█' * filled}{'░' * (width - filled)}] {100 * frac:.0f}%"
 
 
+def terminal_columns(fallback: int = 80) -> int:
+    """Current terminal width; falls back for pipes / dumb terminals."""
+    try:
+        return max(1, shutil.get_terminal_size((fallback, 24)).columns)
+    except OSError:
+        return fallback
+
+
+def clip_text(text: str, max_len: int) -> str:
+    """Truncate to max_len characters, appending an ellipsis when clipped."""
+    text = str(text).replace("\n", " ")
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return "…"
+    return text[: max_len - 1] + "…"
+
+
+def wrap_prefix(prefix: str, value: str, width: int) -> list[str]:
+    """Wrap `value` after `prefix` to `width`, hanging-indent on continuations."""
+    avail = max(12, width - len(prefix))
+    text = " ".join(str(value).split())
+    if not text:
+        return [prefix.rstrip()]
+    lines: list[str] = []
+    while text:
+        chunk, text = text[:avail], text[avail:]
+        lines.append((prefix if not lines else " " * len(prefix)) + chunk)
+    return lines
+
+
+def wrap_field(label: str, value: str, width: int) -> list[str]:
+    """Labeled field wrapped to `width` (` label     : value`)."""
+    return wrap_prefix(f" {label:<10}: ", value, width)
+
+
 def load_runtime(target: pathlib.Path) -> dict:
     try:
         return json.loads((target / ".absoloop" / "runtime.json").read_text(encoding="utf-8"))
@@ -841,7 +879,10 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
                  monitor: dict, feed_lines: int, interval: float | None) -> tuple[str, bool]:
     """One frame of the live dashboard. Returns (text, loop_is_live)."""
     live = monitor_is_live(monitor)
-    width = 72
+    # Re-read each frame so resizing the terminal expands the dashboard live.
+    # Floor keeps labels readable; ceiling avoids absurdly long single lines.
+    width = max(56, min(terminal_columns(80), 240))
+    bar_w = max(18, min(48, width // 3))
     out: list[str] = []
     def rule(char="─"):
         out.append(char * width)
@@ -850,12 +891,14 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
     phase = str(monitor.get("phase") or "").strip()
     badge = "● LIVE" if live else ("■ " + status if status in TERMINAL_STATUSES
                                    else "○ loop not running")
+    mission = state.get("mission_id") or monitor.get("mission_id") or "?"
+    loop_id = runtime.get("loop_id", "no loop id")
     rule("═")
-    out.append(f" ABSOLOOP WATCH — {state.get('mission_id') or monitor.get('mission_id') or '?'} "
-               f"({runtime.get('loop_id', 'no loop id')})   [{badge}]")
+    out.append(clip_text(
+        f" ABSOLOOP WATCH — {mission} ({loop_id})   [{badge}]", width))
     rule("═")
     if runtime.get("objective"):
-        out.append(f" objective : {runtime['objective']}")
+        out.extend(wrap_field("objective", runtime["objective"], width))
     engine = monitor.get("engine")
     line = f" status    : {status}"
     if live and phase:
@@ -864,37 +907,44 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
         line += f" ({state['stop_reason']})"
     if engine:
         line += f" · engine {engine}"
-    out.append(line)
+    out.append(clip_text(line, width))
 
     max_iter = int(runtime.get("max_iterations") or 0)
     iteration = int((monitor if live else state).get("iteration") or 0)
-    out.append(f" iteration : {iteration} of {max_iter or '?'}   "
-               f"{budget_bar(iteration, max_iter)}")
+    out.append(clip_text(
+        f" iteration : {iteration} of {max_iter or '?'}   "
+        f"{budget_bar(iteration, max_iter, bar_w)}", width))
     cap = float(runtime.get("max_cost_usd") or 0)
     source = monitor if live else state
     spent = float(source.get("cost_usd") or 0)
-    out.append(f" spend     : {with_tokens(f'${spent:.2f}', source.get('tokens_total'))} "
-               f"of ${cap:.2f}   {budget_bar(spent, cap)}")
+    out.append(clip_text(
+        f" spend     : {with_tokens(f'${spent:.2f}', source.get('tokens_total'))} "
+        f"of ${cap:.2f}   {budget_bar(spent, cap, bar_w)}", width))
     started = (monitor.get("started_at") if live else state.get("started_at")) or 0
     max_wall = float(runtime.get("max_wall_seconds") or 0)
     if started and max_wall and (live or status == "EXECUTING"):
         elapsed = time.time() - float(started)
-        out.append(f" wall clock: {fmt_age(elapsed)} of {fmt_age(max_wall)}   "
-                   f"{budget_bar(elapsed, max_wall)}")
+        out.append(clip_text(
+            f" wall clock: {fmt_age(elapsed)} of {fmt_age(max_wall)}   "
+            f"{budget_bar(elapsed, max_wall, bar_w)}", width))
     if live:
         if monitor.get("thinking_level"):
-            out.append(f" thinking  : {monitor['thinking_level']} "
-                       f"(repeated failures: {monitor.get('repeated_failure_count', 0)})")
+            out.append(clip_text(
+                f" thinking  : {monitor['thinking_level']} "
+                f"(repeated failures: {monitor.get('repeated_failure_count', 0)})",
+                width))
         agent = monitor.get("agent")
         if agent:
             agent_started = monitor.get("agent_started")
             running = (f" — working for {fmt_age(time.time() - agent_started)}"
                        if isinstance(agent_started, (int, float)) else "")
-            out.append(f" agent     : {agent}{running}")
+            out.append(clip_text(f" agent     : {agent}{running}", width))
         activity = monitor.get("last_activity")
         if isinstance(activity, dict) and activity.get("detail"):
             age = fmt_age(time.time() - float(activity.get("ts") or time.time()))
-            out.append(f" doing     : {activity['detail'][:width - 22]} ({age} ago)")
+            suffix = f" ({age} ago)"
+            detail = clip_text(activity["detail"], max(12, width - 13 - len(suffix)))
+            out.append(f" doing     : {detail}{suffix}")
 
     feed = live_tail(target, feed_lines)
     if feed:
@@ -904,8 +954,10 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
             stamp = time.strftime("%H:%M:%S", time.localtime(event.get("ts", 0)))
             marker = {"say": "💬", "think": "…", "tool": "→", "verdict": "⚖",
                       "error": "✗", "usage": "·", "start": "▶"}.get(event.get("kind"), "→")
-            detail = str(event.get("detail", ""))[:width - 26]
-            out.append(f"  {stamp} {event.get('agent', '?'):<8}{marker} {detail}")
+            agent_name = str(event.get("agent", "?") or "?")[:8]
+            prefix = f"  {stamp} {agent_name:<8}{marker} "
+            detail = clip_text(event.get("detail", ""), max(8, width - len(prefix)))
+            out.append(prefix + detail)
 
     report = latest_builder_report(target, state)
     summary = str(report.get("summary") or "").strip()
@@ -914,15 +966,17 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
     if summary or risks:
         rule()
         if summary:
-            out.append(" builder's last report: " + " ".join(summary.split())[:width - 25])
+            out.extend(wrap_prefix(
+                " builder's last report: ", " ".join(summary.split()), width))
         for risk in risks[:3]:
-            out.append(f" ⚠ risk: {risk[:width - 10]}")
+            risk_prefix = " ⚠ risk: "
+            out.append(risk_prefix + clip_text(risk, max(8, width - len(risk_prefix))))
     rule()
-    out.append(f" next: {next_step_hint(state or monitor)}")
+    out.extend(wrap_prefix(" next: ", next_step_hint(state or monitor), width))
     footer = f" refreshed {time.strftime('%H:%M:%S')}"
     if interval:
         footer += f" · every {interval:g}s · Ctrl-C to exit"
-    out.append(footer)
+    out.append(clip_text(footer, width))
     rule("═")
     return "\n".join(out), live
 
