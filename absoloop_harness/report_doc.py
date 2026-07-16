@@ -1,4 +1,4 @@
-"""Absoloop mission report — Markdown document + lite HTML viewer.
+"""AbsoLoop mission report — Markdown document + lite HTML viewer.
 
 `absoloop report` regenerates `.absoloop/report.md` (source of truth) and
 `.absoloop/report.html` (infographic-style lite viewer), then opens the
@@ -6,14 +6,25 @@ viewer in the default browser.
 """
 from __future__ import annotations
 
+import base64
 import html
 import json
 import os
 import pathlib
+import re
 import subprocess
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from functools import lru_cache
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+BRAND_NAME = "AbsoLoop"
+_LOGO_MARK_REL = pathlib.Path("docs") / "assets" / "absoloop-logo-mark.png"
+_ITER_RE = re.compile(r"iteration-(\d+)", re.IGNORECASE)
+_SKILL_RE = re.compile(
+    r"^\.(claude|codex|agents)/skills/([^/]+)",
+    re.IGNORECASE,
+)
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -36,6 +47,40 @@ class TimelineItem:
     title: str
     detail: str = ""
     tone: str = "neutral"  # ok | warn | err | accent | neutral
+    meta: str = ""  # compact metrics / status chips
+
+
+@dataclass
+class AgentHighlight:
+    """One builder or critic report, parsed from structured agent output."""
+    ts: float
+    role: str  # builder | critic
+    iteration: Optional[int]
+    engine: str
+    headline: str
+    summary: str
+    status_label: str
+    tone: str
+    done: Optional[bool] = None
+    recommendation: str = ""
+    artifacts: List[str] = field(default_factory=list)
+    commands: List[str] = field(default_factory=list)
+    risks: List[str] = field(default_factory=list)
+    blocking_findings: List[str] = field(default_factory=list)
+    cost_usd: float = 0.0
+    cost_exact: bool = True
+    wall_seconds: float = 0.0
+    tokens_label: str = ""
+    result_path: str = ""
+    exit_code: Optional[int] = None
+    limit_reached: str = ""
+
+
+@dataclass
+class SkillEntry:
+    name: str
+    engines: List[str] = field(default_factory=list)
+    paths: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -56,8 +101,10 @@ class MissionReport:
     engine: str
     generated_at: float
     changed_files: List[str] = field(default_factory=list)
+    skills: List[SkillEntry] = field(default_factory=list)
     timeline: List[TimelineItem] = field(default_factory=list)
-    agent_summaries: List[str] = field(default_factory=list)
+    highlights: List[AgentHighlight] = field(default_factory=list)
+    agent_summaries: List[str] = field(default_factory=list)  # legacy: headlines
     critic_path: str = ""
     latest_agent_path: str = ""
     next_step: str = ""
@@ -128,22 +175,147 @@ def _fmt_tokens(tokens: Any) -> str:
         return str(tokens)
 
 
-def _agent_summary(target: pathlib.Path, result_rel: str) -> str:
-    if not result_rel:
+def _as_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = " ".join(value.split())
+        return [text] if text else []
+    if isinstance(value, (list, tuple)):
+        out: List[str] = []
+        for item in value:
+            text = " ".join(str(item).split())
+            if text:
+                out.append(text)
+        return out
+    text = " ".join(str(value).split())
+    return [text] if text else []
+
+
+def _headline(summary: str, *, max_len: int = 160) -> str:
+    text = " ".join(str(summary or "").split())
+    if not text:
         return ""
+    for sep in (". ", "! ", "? "):
+        if sep in text:
+            first = text.split(sep, 1)[0].strip()
+            if len(first) >= 28:
+                text = first + sep.strip()
+                break
+    if len(text) > max_len:
+        cut = text[: max_len - 1]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        text = cut.rstrip(" ,;:") + "…"
+    return text
+
+
+def _role_and_iteration(result_rel: str) -> Tuple[str, Optional[int]]:
+    name = pathlib.Path(result_rel or "").name.lower()
+    role = "critic" if "critic" in name else "builder"
+    match = _ITER_RE.search(result_rel or "")
+    iteration = int(match.group(1)) if match else None
+    return role, iteration
+
+
+def _parse_json_maybe(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "{[":
+        return value
     try:
-        payload = json.loads((target / result_rel).read_text(encoding="utf-8"))
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def _load_agent_structured(
+    target: pathlib.Path, result_rel: str,
+) -> Tuple[dict, dict]:
+    """Return (structured fields, raw payload). Empty dicts when missing."""
+    if not result_rel:
+        return {}, {}
+    path = target / result_rel
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return ""
+        return {}, {}
     if not isinstance(payload, dict):
-        return ""
-    structured = payload.get("structured_output")
-    structured = structured if isinstance(structured, dict) else payload
-    summary = structured.get("summary") or payload.get("result") or ""
-    return " ".join(str(summary).split())
+        return {}, {}
+
+    structured = _parse_json_maybe(payload.get("structured_output"))
+    if not isinstance(structured, dict):
+        structured = {}
+    if not structured:
+        nested = _parse_json_maybe(payload.get("result"))
+        if isinstance(nested, dict) and (
+            "summary" in nested or "recommendation" in nested or "done" in nested
+        ):
+            structured = nested
+
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        error_text = "; ".join(str(e) for e in errors if e)
+    else:
+        error_text = str(errors or "").strip()
+
+    summary = structured.get("summary")
+    if summary is None and isinstance(payload.get("result"), str):
+        raw_result = payload["result"].strip()
+        if raw_result and not raw_result.startswith("{"):
+            summary = raw_result
+
+    return {
+        "summary": " ".join(str(summary or "").split()),
+        "done": structured.get("done") if isinstance(structured.get("done"), bool) else None,
+        "changed_artifacts": _as_str_list(structured.get("changed_artifacts")),
+        "commands_run": _as_str_list(structured.get("commands_run")),
+        "risks": _as_str_list(structured.get("risks")),
+        "recommendation": str(structured.get("recommendation") or "").strip().upper(),
+        "blocking_findings": _as_str_list(structured.get("blocking_findings")),
+        "is_error": bool(payload.get("is_error")),
+        "errors": error_text,
+        "num_turns": payload.get("num_turns"),
+    }, payload
 
 
-def _git_changed(target: pathlib.Path) -> List[str]:
+def _builder_status(
+    *,
+    exit_code: Any,
+    limit_reached: Any,
+    done: Optional[bool],
+    is_error: bool,
+    errors: str,
+) -> Tuple[str, str]:
+    """Return (status_label, tone) for a builder run."""
+    if limit_reached:
+        label = str(limit_reached).replace("error_", "").replace("_", " ")
+        return f"Failed · {label}", "warn"
+    if exit_code not in (0, None) or is_error:
+        detail = errors or f"exit {exit_code}"
+        return f"Failed · {detail}", "err" if exit_code not in (0, None) else "warn"
+    if done is True:
+        return "Done claimed", "ok"
+    if done is False:
+        return "In progress", "accent"
+    return "Completed run", "ok"
+
+
+def _critic_status(recommendation: str, exit_code: Any) -> Tuple[str, str]:
+    rec = (recommendation or "").upper()
+    if rec == "PASS":
+        return "PASS", "ok"
+    if rec == "HOLD":
+        return "HOLD", "warn"
+    if rec == "REJECT":
+        return "REJECT", "err"
+    if exit_code not in (0, None):
+        return f"Unreadable · exit {exit_code}", "err"
+    return (rec or "Reviewed"), "accent" if rec else "neutral"
+
+
+def _git_changed_paths(target: pathlib.Path) -> List[str]:
     if not _which("git"):
         return []
     try:
@@ -163,6 +335,32 @@ def _git_changed(target: pathlib.Path) -> List[str]:
         if path and not path.startswith(".absoloop/"):
             files.append(path)
     return files
+
+
+def _split_files_and_skills(
+    paths: Sequence[str],
+) -> Tuple[List[str], List[SkillEntry]]:
+    files: List[str] = []
+    grouped: Dict[str, SkillEntry] = {}
+    for path in paths:
+        match = _SKILL_RE.match(path.replace("\\", "/"))
+        if not match:
+            files.append(path)
+            continue
+        engine = match.group(1).lower()
+        if engine == "agents":
+            engine = "agents"
+        name = match.group(2)
+        entry = grouped.get(name)
+        if entry is None:
+            entry = SkillEntry(name=name)
+            grouped[name] = entry
+        if engine not in entry.engines:
+            entry.engines.append(engine)
+        if path not in entry.paths:
+            entry.paths.append(path)
+    skills = sorted(grouped.values(), key=lambda s: s.name.lower())
+    return files, skills
 
 
 def _which(name: str) -> bool:
@@ -195,47 +393,160 @@ def _delivery_detail(delivery: dict) -> str:
     return "working tree (unstaged)"
 
 
-def _timeline_from_ledger(target: pathlib.Path) -> Tuple[List[TimelineItem], dict]:
+def _metrics_line(
+    *,
+    cost_usd: float,
+    cost_exact: bool,
+    tokens_label: str,
+    wall_seconds: float,
+    exit_code: Any = None,
+    limit_reached: Any = None,
+    num_turns: Any = None,
+) -> str:
+    exact = "" if cost_exact else "~"
+    parts = [f"{exact}${cost_usd:.2f}"]
+    if tokens_label:
+        parts.append(tokens_label)
+    parts.append(f"{wall_seconds:.0f}s")
+    if isinstance(num_turns, int):
+        parts.append(f"{num_turns} turns")
+    if exit_code not in (0, None):
+        parts.append(f"exit {exit_code}")
+    if limit_reached:
+        parts.append(f"hit {limit_reached}")
+    return " · ".join(parts)
+
+
+def _timeline_from_ledger(
+    target: pathlib.Path,
+) -> Tuple[List[TimelineItem], List[AgentHighlight], dict]:
     items: List[TimelineItem] = []
+    highlights: List[AgentHighlight] = []
     stats: Dict[str, Any] = {
         "agent_runs": 0,
         "wall_seconds": 0.0,
         "integrity_ok": None,
         "human_decision": "",
         "summaries": [],
+        "builder_iters": set(),
     }
+
     for event in _iter_ledger(target):
         ts = float(event.get("ts") or 0)
         kind = event.get("type")
+
         if kind == "agent_run":
             stats["agent_runs"] += 1
-            stats["wall_seconds"] += float(event.get("wall_seconds") or 0)
+            wall = float(event.get("wall_seconds") or 0)
+            stats["wall_seconds"] += wall
             cost = float(event.get("cost_usd") or 0)
-            exact = "" if event.get("cost_is_exact") else "~"
-            tokens = _fmt_tokens(event.get("tokens"))
-            limit = f" · hit {event['limit_reached']}" if event.get("limit_reached") else ""
+            cost_exact = bool(event.get("cost_is_exact", True))
+            tokens_label = _fmt_tokens(event.get("tokens"))
             exit_code = event.get("exit_code")
-            tone = "ok" if exit_code == 0 else "warn"
-            title = f"{event.get('engine', 'agent')} run"
-            detail = (
-                f"exit {exit_code} · {exact}${cost:.2f}"
-                + (f" · {tokens}" if tokens else "")
-                + f" · {float(event.get('wall_seconds') or 0):.0f}s"
-                + limit
+            limit_reached = event.get("limit_reached") or ""
+            engine = str(event.get("engine") or "agent")
+            result_rel = str(event.get("result") or "")
+            role, iteration = _role_and_iteration(result_rel)
+            structured, _payload = _load_agent_structured(target, result_rel)
+
+            if role == "builder":
+                status_label, tone = _builder_status(
+                    exit_code=exit_code,
+                    limit_reached=limit_reached,
+                    done=structured.get("done"),
+                    is_error=bool(structured.get("is_error")),
+                    errors=str(structured.get("errors") or ""),
+                )
+                if iteration is not None:
+                    stats["builder_iters"].add(iteration)
+            else:
+                status_label, tone = _critic_status(
+                    str(structured.get("recommendation") or ""), exit_code,
+                )
+
+            headline = _headline(str(structured.get("summary") or ""))
+            if not headline and structured.get("errors"):
+                headline = _headline(str(structured.get("errors")))
+            if not headline and limit_reached:
+                headline = f"Run stopped early ({limit_reached})."
+            if not headline and exit_code not in (0, None):
+                headline = f"Agent exited with code {exit_code}."
+
+            iter_label = f"Iteration {iteration}" if iteration is not None else "Agent"
+            role_label = "Builder" if role == "builder" else "Critic"
+            title = f"{iter_label} · {role_label}"
+            if status_label:
+                title = f"{title} · {status_label}"
+
+            meta = _metrics_line(
+                cost_usd=cost,
+                cost_exact=cost_exact,
+                tokens_label=tokens_label,
+                wall_seconds=wall,
+                exit_code=exit_code,
+                limit_reached=limit_reached,
+                num_turns=structured.get("num_turns"),
             )
-            summary = _agent_summary(target, str(event.get("result") or ""))
-            if summary:
-                stats["summaries"].append(summary)
-                detail = f"{detail}\n{summary}"
-            items.append(TimelineItem(ts, kind, title, detail, tone))
+            detail_bits = [f"{engine} · {meta}"]
+            if headline:
+                detail_bits.append(headline)
+            items.append(TimelineItem(
+                ts, role, title, "\n".join(detail_bits), tone, meta,
+            ))
+
+            highlight = AgentHighlight(
+                ts=ts,
+                role=role,
+                iteration=iteration,
+                engine=engine,
+                headline=headline or status_label,
+                summary=str(structured.get("summary") or ""),
+                status_label=status_label,
+                tone=tone,
+                done=structured.get("done"),
+                recommendation=str(structured.get("recommendation") or ""),
+                artifacts=list(structured.get("changed_artifacts") or []),
+                commands=list(structured.get("commands_run") or []),
+                risks=list(structured.get("risks") or []),
+                blocking_findings=list(structured.get("blocking_findings") or []),
+                cost_usd=cost,
+                cost_exact=cost_exact,
+                wall_seconds=wall,
+                tokens_label=tokens_label,
+                result_path=result_rel,
+                exit_code=int(exit_code) if isinstance(exit_code, int) else None,
+                limit_reached=str(limit_reached or ""),
+            )
+            highlights.append(highlight)
+            if highlight.headline:
+                stats["summaries"].append(highlight.headline)
+
         elif kind == "iteration":
+            # Builder agent_run already carries the rich arc entry; only keep
+            # a compact done marker when we somehow lack that run.
+            iteration = event.get("iteration")
             done = bool(event.get("done"))
+            if iteration in stats["builder_iters"]:
+                continue
             items.append(TimelineItem(
                 ts, kind,
-                f"Iteration {event.get('iteration')}",
-                "Builder reports DONE" if done else "Still in progress",
+                f"Iteration {iteration} · {'Done claimed' if done else 'Recorded'}",
+                "Builder reports DONE" if done else "No builder artifact linked",
                 "ok" if done else "neutral",
             ))
+
+        elif kind == "bounded_agent_failure":
+            # Duplicate of agent_run failure signals — skip unless isolated.
+            iteration = event.get("iteration")
+            if iteration in stats["builder_iters"]:
+                continue
+            limit = event.get("limit_reached") or f"exit {event.get('exit_code')}"
+            items.append(TimelineItem(
+                ts, kind,
+                f"Iteration {iteration} · Builder · Failed",
+                str(limit), "warn",
+            ))
+
         elif kind == "early_done_claim":
             items.append(TimelineItem(
                 ts, kind, "Early done claim held",
@@ -243,6 +554,7 @@ def _timeline_from_ledger(target: pathlib.Path) -> Tuple[List[TimelineItem], dic
                 f"({event.get('min_iterations')})",
                 "warn",
             ))
+
         elif kind == "integrity_check":
             ok = event.get("exit_code") == 0
             if not ok:
@@ -254,6 +566,7 @@ def _timeline_from_ledger(target: pathlib.Path) -> Tuple[List[TimelineItem], dic
                 "Passed" if ok else "Violation",
                 "ok" if ok else "err",
             ))
+
         elif kind == "human_gate":
             decision = str(event.get("decision") or "")
             stats["human_decision"] = decision
@@ -263,16 +576,19 @@ def _timeline_from_ledger(target: pathlib.Path) -> Tuple[List[TimelineItem], dic
                 ts, kind, f"Human gate · {decision}",
                 str(note), tone,
             ))
+
         elif kind == "delivery":
             items.append(TimelineItem(
                 ts, kind, f"Delivered ({event.get('mode')})",
                 str(event.get("detail") or ""), "accent",
             ))
+
         elif kind == "mission_stop":
             items.append(TimelineItem(
                 ts, kind, f"Stop · {event.get('status')}",
                 str(event.get("reason") or ""), "neutral",
             ))
+
         elif kind == "extension":
             note = event.get("note") or ""
             items.append(TimelineItem(
@@ -281,7 +597,16 @@ def _timeline_from_ledger(target: pathlib.Path) -> Tuple[List[TimelineItem], dic
                 + (f" — {note}" if note else ""),
                 "accent",
             ))
-    return items, stats
+
+        elif kind == "schedule_due":
+            items.append(TimelineItem(
+                ts, kind,
+                f"Schedule · {event.get('schedule_id') or 'due'}",
+                str(event.get("action") or event.get("detail") or ""),
+                "accent",
+            ))
+
+    return items, highlights, stats
 
 
 def collect_report(project: pathlib.Path) -> Optional[MissionReport]:
@@ -296,8 +621,9 @@ def collect_report(project: pathlib.Path) -> Optional[MissionReport]:
         return None
 
     delivery = runtime.get("delivery") if isinstance(runtime.get("delivery"), dict) else {}
-    timeline, stats = _timeline_from_ledger(target)
+    timeline, highlights, stats = _timeline_from_ledger(target)
     status = str(state.get("status") or "IDLE")
+    changed_files, skills = _split_files_and_skills(_git_changed_paths(target))
 
     return MissionReport(
         project=target,
@@ -315,8 +641,10 @@ def collect_report(project: pathlib.Path) -> Optional[MissionReport]:
         tokens_total=state.get("tokens_total"),
         engine=str(runtime.get("engine") or runtime.get("builder") or "—"),
         generated_at=time.time(),
-        changed_files=_git_changed(target),
+        changed_files=changed_files,
+        skills=skills,
         timeline=timeline,
+        highlights=highlights,
         agent_summaries=list(stats.get("summaries") or []),
         critic_path=str(state.get("latest_critic_findings") or ""),
         latest_agent_path=str(state.get("latest_agent_result") or ""),
@@ -353,12 +681,97 @@ def _ts_md(ts: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
 
 
+def _render_arc_markdown(report: MissionReport) -> List[str]:
+    if not report.timeline:
+        return ["_No ledger events yet — the loop has not run._", ""]
+    lines: List[str] = []
+    for item in report.timeline:
+        mark = {
+            "ok": "✓", "warn": "!", "err": "✗", "accent": "◆", "neutral": "·",
+        }.get(item.tone, "·")
+        lines.append(f"- **{_ts_md(item.ts)}** {mark} **{item.title}**")
+        if item.detail:
+            for part in item.detail.split("\n"):
+                part = part.strip()
+                if part:
+                    lines.append(f"  - {part}")
+    lines.append("")
+    return lines
+
+
+def _highlight_heading(hl: AgentHighlight) -> str:
+    iter_label = f"Iteration {hl.iteration}" if hl.iteration is not None else "Run"
+    role = "Builder" if hl.role == "builder" else "Critic"
+    return f"{iter_label} · {role} · {hl.status_label}"
+
+
+def _render_highlights_markdown(report: MissionReport) -> List[str]:
+    if not report.highlights:
+        return ["_No builder/critic reports recorded yet._", ""]
+    lines: List[str] = []
+    for hl in report.highlights:
+        lines.append(f"### {_highlight_heading(hl)}")
+        lines.append("")
+        exact = "" if hl.cost_exact else "~"
+        meta = (
+            f"`{hl.engine}` · {exact}${hl.cost_usd:.2f}"
+            + (f" · {hl.tokens_label}" if hl.tokens_label else "")
+            + f" · {hl.wall_seconds:.0f}s"
+        )
+        if hl.result_path:
+            meta += f" · `{hl.result_path}`"
+        lines.append(meta)
+        lines.append("")
+        if hl.headline:
+            lines.append(f"**{hl.headline}**")
+            lines.append("")
+        if hl.summary and hl.summary != hl.headline:
+            lines.append(hl.summary)
+            lines.append("")
+        if hl.role == "critic":
+            if hl.recommendation:
+                lines.append(f"- **Verdict:** `{hl.recommendation}`")
+            if hl.blocking_findings:
+                lines.append("- **Blocking findings:**")
+                for finding in hl.blocking_findings:
+                    lines.append(f"  - {finding}")
+            elif hl.recommendation == "PASS":
+                lines.append("- **Blocking findings:** none")
+        else:
+            if hl.done is True:
+                lines.append("- **Done claim:** yes")
+            elif hl.done is False:
+                lines.append("- **Done claim:** no — work remains")
+            if hl.limit_reached:
+                lines.append(f"- **Limit:** `{hl.limit_reached}`")
+        if hl.artifacts:
+            lines.append("- **Artifacts:**")
+            for path in hl.artifacts[:12]:
+                lines.append(f"  - `{path}`")
+            if len(hl.artifacts) > 12:
+                lines.append(f"  - _+{len(hl.artifacts) - 12} more_")
+        if hl.commands:
+            lines.append("- **Verified commands:**")
+            for cmd in hl.commands[:10]:
+                lines.append(f"  - `{cmd}`")
+            if len(hl.commands) > 10:
+                lines.append(f"  - _+{len(hl.commands) - 10} more_")
+        if hl.risks:
+            lines.append("- **Risks / remaining:**")
+            for risk in hl.risks[:8]:
+                lines.append(f"  - {risk}")
+            if len(hl.risks) > 8:
+                lines.append(f"  - _+{len(hl.risks) - 8} more_")
+        lines.append("")
+    return lines
+
+
 def render_markdown(report: MissionReport) -> str:
     """Infographic-oriented Markdown — readable raw, great in the lite viewer."""
     tokens = _fmt_tokens(report.tokens_total)
     gen = time.strftime("%Y-%m-%d %H:%M", time.localtime(report.generated_at))
     lines: List[str] = [
-        f"# Absoloop Report",
+        f"# {BRAND_NAME} Report",
         "",
         f"**{report.status_label}** · `{report.mission_id}` · loop `{report.loop_id}`",
         "",
@@ -413,32 +826,28 @@ def render_markdown(report: MissionReport) -> str:
     if report.agent_runs:
         chips.append(f"`{report.agent_runs} runs`")
     lines += ["### Snapshot", "", " · ".join(chips), "", "---", "", "## Run arc", ""]
-
-    if not report.timeline:
-        lines.append("_No ledger events yet — the loop has not run._")
-        lines.append("")
-    else:
-        for item in report.timeline:
-            mark = {
-                "ok": "✓", "warn": "!", "err": "✗", "accent": "◆", "neutral": "·",
-            }.get(item.tone, "·")
-            detail = item.detail.replace("\n", " — ") if item.detail else ""
-            lines.append(f"- **{_ts_md(item.ts)}** {mark} **{item.title}**"
-                         + (f" — {detail}" if detail else ""))
-        lines.append("")
-
-    if report.agent_summaries:
-        lines += ["---", "", "## Builder highlights", ""]
-        for i, summary in enumerate(report.agent_summaries[-5:], 1):
-            lines.append(f"{i}. {summary}")
-        lines.append("")
-
+    lines += _render_arc_markdown(report)
+    lines += ["---", "", "## Builder highlights", ""]
+    lines += _render_highlights_markdown(report)
     lines += ["---", "", "## Changed files", ""]
     if report.changed_files:
         for path in report.changed_files:
             lines.append(f"- `{path}`")
     else:
         lines.append("_None detected (or clean tree)._")
+    lines.append("")
+
+    lines += ["---", "", "## Skills", ""]
+    if report.skills:
+        for skill in report.skills:
+            engines = ", ".join(skill.engines) if skill.engines else "—"
+            lines.append(f"- `{skill.name}` · {engines}")
+            for path in skill.paths[:4]:
+                lines.append(f"  - `{path}`")
+            if len(skill.paths) > 4:
+                lines.append(f"  - _+{len(skill.paths) - 4} more paths_")
+    else:
+        lines.append("_No skill tree changes detected._")
     lines.append("")
 
     lines += ["---", "", "## Pointers", ""]
@@ -458,7 +867,7 @@ def render_markdown(report: MissionReport) -> str:
         "",
         "---",
         "",
-        f"_Absoloop · {report.project.name} · `{report.mission_id}`_",
+        f"_{BRAND_NAME} · {report.project.name} · `{report.mission_id}`_",
         "",
     ]
     return "\n".join(lines)
@@ -515,11 +924,21 @@ body {
   margin-bottom: 22px;
 }
 .brand {
-  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
-  letter-spacing: 0.04em; text-transform: uppercase;
-  font-size: 12px; color: var(--muted); font-weight: 600;
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
 }
-.brand strong { color: var(--accent); font-size: 13px; letter-spacing: 0.12em; }
+.brand-logo {
+  display: block; height: 44px; width: auto;
+  flex: 0 0 auto;
+}
+.brand-copy {
+  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  letter-spacing: 0.04em; font-size: 12px; color: var(--muted); font-weight: 600;
+}
+.brand-copy strong {
+  color: var(--ink); font-size: 15px; letter-spacing: -0.01em;
+  font-weight: 750; text-transform: none;
+}
+.brand-copy span { text-transform: uppercase; letter-spacing: 0.1em; }
 .status-pill {
   display: inline-flex; align-items: center; gap: 8px;
   margin-top: 14px; padding: 8px 14px; border-radius: 999px;
@@ -614,15 +1033,25 @@ body {
 .timeline li.accent::before { background: var(--accent); }
 .t-time { font-family: var(--mono); font-size: 11px; color: var(--muted); }
 .t-title { font-weight: 700; margin-top: 2px; }
-.t-detail { color: var(--muted); font-size: 13px; margin-top: 3px; white-space: pre-wrap; }
+.t-meta {
+  margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--muted);
+}
+.t-detail { color: #c5d2e0; font-size: 13px; margin-top: 4px; line-height: 1.45; }
 .files { columns: 1; gap: 8px; }
 @media (min-width: 640px) { .files { columns: 2; } }
-.files code {
+.files code, .skill-paths code {
   display: block; break-inside: avoid; font-family: var(--mono);
   font-size: 12px; padding: 6px 8px; margin-bottom: 6px;
   background: rgba(255,255,255,0.03); border-radius: 8px;
   border: 1px solid var(--line); color: #c9d7e8;
 }
+.skill-list { display: grid; gap: 12px; }
+.skill-item {
+  padding: 12px 14px; border-radius: 10px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--line);
+}
+.skill-item .name { font-weight: 700; margin-bottom: 4px; }
+.skill-item .engines { font-size: 12px; color: var(--muted); font-family: var(--mono); }
 .next {
   border-left: 3px solid var(--accent);
   padding: 4px 0 4px 14px; font-size: 15px;
@@ -631,8 +1060,37 @@ body {
   margin-top: 10px; text-align: center; color: var(--muted);
   font-size: 12px; font-family: var(--mono);
 }
-.highlights { margin: 0; padding-left: 18px; }
-.highlights li { margin: 0 0 8px; color: #d5e0ec; }
+.hl-list { display: grid; gap: 14px; }
+.hl-card {
+  padding: 16px 16px 14px; border-radius: 12px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--line);
+}
+.hl-card.ok { border-color: rgba(40,205,120,0.28); }
+.hl-card.warn { border-color: rgba(255,145,20,0.28); }
+.hl-card.err { border-color: rgba(255,25,95,0.28); }
+.hl-card.accent { border-color: rgba(0,205,225,0.28); }
+.hl-head {
+  display: flex; flex-wrap: wrap; gap: 8px 12px;
+  align-items: baseline; justify-content: space-between;
+}
+.hl-title { font-weight: 750; font-size: 15px; }
+.hl-meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.hl-headline {
+  margin-top: 10px; font-size: 14px; color: #e7eef7; line-height: 1.45;
+}
+.hl-summary {
+  margin-top: 8px; font-size: 13px; color: var(--muted); line-height: 1.5;
+}
+.hl-block { margin-top: 12px; }
+.hl-block h3 {
+  margin: 0 0 6px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--muted); font-weight: 700;
+}
+.hl-block ul { margin: 0; padding-left: 18px; }
+.hl-block li { margin: 0 0 4px; font-size: 13px; color: #d5e0ec; }
+.hl-block code {
+  font-family: var(--mono); font-size: 12px; color: #c9d7e8;
+}
 .empty { color: var(--muted); font-style: italic; }
 """
 
@@ -641,16 +1099,180 @@ def _esc(text: Any) -> str:
     return html.escape(str(text), quote=True)
 
 
+@lru_cache(maxsize=1)
+def _brand_logo_data_uri() -> str:
+    """Embed the HQ infinity mark so file:// report.html stays self-contained."""
+    from .platform_util import tooling_home
+
+    path = tooling_home() / _LOGO_MARK_REL
+    if not path.is_file():
+        # Package-relative fallback when ABSOLOOP_HOME points elsewhere.
+        alt = pathlib.Path(__file__).resolve().parent.parent / _LOGO_MARK_REL
+        path = alt if alt.is_file() else path
+    if not path.is_file():
+        return ""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return ""
+    return "data:image/png;base64," + base64.standard_b64encode(raw).decode("ascii")
+
+
+def _brand_html() -> str:
+    uri = _brand_logo_data_uri()
+    logo = (
+        f'<img class="brand-logo" src="{uri}" alt="{_esc(BRAND_NAME)}" width="160" height="70">'
+        if uri else ""
+    )
+    return (
+        f'<div class="brand">{logo}'
+        f'<div class="brand-copy"><strong>{_esc(BRAND_NAME)}</strong>'
+        f'<span>mission report</span></div></div>'
+    )
+
+
 def _bar_html(used: float, cap: float) -> str:
     pct = _pct(used, cap)
     warn = " warn" if pct >= 90 else ""
     return f'<div class="bar{warn}"><i style="width:{pct:.1f}%"></i></div>'
 
 
+def _render_arc_html(report: MissionReport) -> str:
+    if not report.timeline:
+        return '<p class="empty">No ledger events yet — the loop has not run.</p>'
+    parts = ['<ol class="timeline">']
+    for item in report.timeline:
+        detail_lines = [ln.strip() for ln in item.detail.split("\n") if ln.strip()]
+        meta = ""
+        headline = ""
+        if detail_lines:
+            meta = detail_lines[0]
+            if len(detail_lines) > 1:
+                headline = detail_lines[1]
+        parts.append(
+            f'<li class="{_esc(item.tone)}">'
+            f'<div class="t-time">{_esc(_ts_md(item.ts))}</div>'
+            f'<div class="t-title">{_esc(item.title)}</div>'
+            + (f'<div class="t-meta">{_esc(meta)}</div>' if meta else "")
+            + (f'<div class="t-detail">{_esc(headline)}</div>' if headline else "")
+            + "</li>"
+        )
+    parts.append("</ol>")
+    return "".join(parts)
+
+
+def _hl_list_block(title: str, items: Sequence[str], *, code: bool = False,
+                   limit: int = 12) -> str:
+    if not items:
+        return ""
+    shown = list(items[:limit])
+    lis = []
+    for item in shown:
+        body = f"<code>{_esc(item)}</code>" if code else _esc(item)
+        lis.append(f"<li>{body}</li>")
+    extra = len(items) - limit
+    if extra > 0:
+        lis.append(f'<li class="empty">+{extra} more</li>')
+    return (
+        f'<div class="hl-block"><h3>{_esc(title)}</h3>'
+        f'<ul>{"".join(lis)}</ul></div>'
+    )
+
+
+def _render_highlights_html(report: MissionReport) -> str:
+    if not report.highlights:
+        return '<p class="empty">No builder/critic reports recorded yet.</p>'
+    cards: List[str] = []
+    for hl in report.highlights:
+        exact = "" if hl.cost_exact else "~"
+        meta = (
+            f"{hl.engine} · {exact}${hl.cost_usd:.2f}"
+            + (f" · {hl.tokens_label}" if hl.tokens_label else "")
+            + f" · {hl.wall_seconds:.0f}s"
+        )
+        blocks: List[str] = []
+        if hl.role == "critic":
+            if hl.recommendation:
+                blocks.append(
+                    '<div class="hl-block"><h3>Verdict</h3>'
+                    f'<ul><li><code>{_esc(hl.recommendation)}</code></li></ul></div>'
+                )
+            if hl.blocking_findings:
+                blocks.append(_hl_list_block("Blocking findings", hl.blocking_findings))
+            elif hl.recommendation == "PASS":
+                blocks.append(
+                    '<div class="hl-block"><h3>Blocking findings</h3>'
+                    '<ul><li class="empty">none</li></ul></div>'
+                )
+        else:
+            claim = (
+                "yes" if hl.done is True
+                else "no — work remains" if hl.done is False
+                else ""
+            )
+            if claim:
+                blocks.append(
+                    '<div class="hl-block"><h3>Done claim</h3>'
+                    f"<ul><li>{_esc(claim)}</li></ul></div>"
+                )
+            if hl.limit_reached:
+                blocks.append(
+                    '<div class="hl-block"><h3>Limit</h3>'
+                    f'<ul><li><code>{_esc(hl.limit_reached)}</code></li></ul></div>'
+                )
+        blocks.append(_hl_list_block("Artifacts", hl.artifacts, code=True))
+        blocks.append(_hl_list_block("Verified commands", hl.commands, code=True, limit=10))
+        blocks.append(_hl_list_block("Risks / remaining", hl.risks, limit=8))
+        summary = ""
+        if hl.summary and hl.summary != hl.headline:
+            summary = f'<div class="hl-summary">{_esc(hl.summary)}</div>'
+        cards.append(
+            f'<article class="hl-card {hl.tone}">'
+            f'<div class="hl-head">'
+            f'<div class="hl-title">{_esc(_highlight_heading(hl))}</div>'
+            f'<div class="hl-meta">{_esc(meta)}</div>'
+            f"</div>"
+            + (f'<div class="hl-headline">{_esc(hl.headline)}</div>' if hl.headline else "")
+            + summary
+            + "".join(blocks)
+            + "</article>"
+        )
+    return f'<div class="hl-list">{"".join(cards)}</div>'
+
+
+def _render_files_html(paths: Sequence[str]) -> str:
+    if not paths:
+        return '<p class="empty">None detected (or clean tree).</p>'
+    body = "".join(f"<code>{_esc(path)}</code>" for path in paths)
+    return f'<div class="files">{body}</div>'
+
+
+def _render_skills_html(skills: Sequence[SkillEntry]) -> str:
+    if not skills:
+        return '<p class="empty">No skill tree changes detected.</p>'
+    cards: List[str] = []
+    for skill in skills:
+        engines = ", ".join(skill.engines) if skill.engines else "—"
+        paths = "".join(
+            f"<code>{_esc(path)}</code>" for path in skill.paths[:6]
+        )
+        extra = len(skill.paths) - 6
+        if extra > 0:
+            paths += f'<p class="empty">+{extra} more paths</p>'
+        cards.append(
+            f'<div class="skill-item">'
+            f'<div class="name"><code>{_esc(skill.name)}</code></div>'
+            f'<div class="engines">{_esc(engines)}</div>'
+            f'<div class="skill-paths" style="margin-top:8px">{paths}</div>'
+            f"</div>"
+        )
+    return f'<div class="skill-list">{"".join(cards)}</div>'
+
+
 def render_html(report: MissionReport) -> str:
     tokens = _fmt_tokens(report.tokens_total)
     gen = time.strftime("%Y-%m-%d %H:%M", time.localtime(report.generated_at))
-    title = f"Absoloop Report · {report.mission_id}"
+    title = f"{BRAND_NAME} Report · {report.mission_id}"
 
     chips: List[str] = [
         f'<span class="chip {report.status_tone}">{_esc(report.status_label)}</span>',
@@ -666,37 +1288,10 @@ def render_html(report: MissionReport) -> str:
     if report.agent_runs:
         chips.append(f'<span class="chip accent">{report.agent_runs} agent runs</span>')
 
-    timeline_html: List[str] = []
-    if not report.timeline:
-        timeline_html.append('<p class="empty">No ledger events yet — the loop has not run.</p>')
-    else:
-        timeline_html.append('<ol class="timeline">')
-        for item in report.timeline:
-            timeline_html.append(
-                f'<li class="{_esc(item.tone)}">'
-                f'<div class="t-time">{_esc(_ts_md(item.ts))}</div>'
-                f'<div class="t-title">{_esc(item.title)}</div>'
-                + (f'<div class="t-detail">{_esc(item.detail)}</div>' if item.detail else "")
-                + "</li>"
-            )
-        timeline_html.append("</ol>")
-
-    files_html: List[str] = []
-    if report.changed_files:
-        files_html.append('<div class="files">')
-        for path in report.changed_files:
-            files_html.append(f"<code>{_esc(path)}</code>")
-        files_html.append("</div>")
-    else:
-        files_html.append('<p class="empty">None detected (or clean tree).</p>')
-
-    highlights = ""
-    if report.agent_summaries:
-        items = "".join(f"<li>{_esc(s)}</li>" for s in report.agent_summaries[-5:])
-        highlights = (
-            '<section class="section"><h2>Builder highlights</h2>'
-            f'<ol class="highlights">{items}</ol></section>'
-        )
+    timeline_html = _render_arc_html(report)
+    highlights_html = _render_highlights_html(report)
+    files_html = _render_files_html(report.changed_files)
+    skills_html = _render_skills_html(report.skills)
 
     stop = f" · {_esc(report.stop_reason)}" if report.stop_reason else ""
     spend_sub = f"of ${_esc(f'{report.max_cost_usd:.2f}')}"
@@ -706,7 +1301,7 @@ def render_html(report: MissionReport) -> str:
     body = f"""
 <div class="wrap">
   <header class="hero">
-    <div class="brand"><strong>Absoloop</strong><span>mission report</span></div>
+    {_brand_html()}
     <div class="status-pill {report.status_tone}">{_esc(report.status_label)}</div>
     <h1>{_esc(report.project.name)}</h1>
     <div class="meta">
@@ -753,14 +1348,22 @@ def render_html(report: MissionReport) -> str:
 
   <section class="section">
     <h2>Run arc</h2>
-    {"".join(timeline_html)}
+    {timeline_html}
   </section>
 
-  {highlights}
+  <section class="section">
+    <h2>Builder highlights</h2>
+    {highlights_html}
+  </section>
 
   <section class="section">
     <h2>Changed files</h2>
-    {"".join(files_html)}
+    {files_html}
+  </section>
+
+  <section class="section">
+    <h2>Skills</h2>
+    {skills_html}
   </section>
 
   <section class="section">
@@ -768,7 +1371,7 @@ def render_html(report: MissionReport) -> str:
     <div class="next">{_esc(report.next_step)}</div>
   </section>
 
-  <p class="footer">Absoloop report · source <code>report.md</code> · viewer <code>report.html</code></p>
+  <p class="footer">{_esc(BRAND_NAME)} report · source <code>report.md</code> · viewer <code>report.html</code></p>
 </div>
 """
     return (
@@ -805,7 +1408,7 @@ def render_terminal(report: MissionReport, *, color: bool = True) -> str:
     w = 64
     lines = [
         f"{c['cyan']}{'═' * w}{c['reset']}",
-        f"{c['bold']} ABSOLOOP REPORT{c['reset']}  "
+        f"{c['bold']} {BRAND_NAME} REPORT{c['reset']}  "
         f"{tone_color}{report.status_label}{c['reset']}",
         f"{c['dim']} {report.mission_id} · {report.loop_id}{c['reset']}",
         f"{c['cyan']}{'─' * w}{c['reset']}",
@@ -831,9 +1434,11 @@ def render_terminal(report: MissionReport, *, color: bool = True) -> str:
     else:
         for item in report.timeline[-12:]:
             mark = {"ok": "✓", "warn": "!", "err": "✗", "accent": "◆"}.get(item.tone, "·")
-            detail = item.detail.split("\n", 1)[0] if item.detail else ""
+            parts = [ln.strip() for ln in item.detail.split("\n") if ln.strip()]
+            # Prefer the headline line when present; else the metrics line.
+            detail = parts[1] if len(parts) > 1 else (parts[0] if parts else "")
             lines.append(f"  {_ts_md(item.ts)[5:]}  {mark} {item.title}"
-                         + (f" — {detail[:48]}" if detail else ""))
+                         + (f" — {detail[:56]}" if detail else ""))
     lines += [
         f"{c['cyan']}{'─' * w}{c['reset']}",
         f" next: {report.next_step}",

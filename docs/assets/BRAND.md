@@ -1,9 +1,13 @@
-# Absoloop brand assets
+# AbsoLoop brand assets
 
 | File | Use |
 |---|---|
 | [`absoloop-logo.png`](absoloop-logo.png) | Primary mark — README hero, docs, social |
+| [`absoloop-logo-mark.png`](absoloop-logo-mark.png) | Infinity ribbon only — mission report HTML header (embedded) |
 | [`absoloop-logo-pixel.png`](absoloop-logo-pixel.png) | Pixel / terminal-adjacent mark — profile flair, CLI culture |
+
+Wordmark spelling is **AbsoLoop** (capital L). Prefer the mark PNG plus HTML/CSS
+wordmark when the raster wordmark still reads “Absoloop”.
 
 ## Palette (infinity ribbon)
 
@@ -20,4 +24,4 @@ Backgrounds for dark surfaces: near-black `#0c1118`–`#121a24`, not flat pure b
 ## Voice
 
 Short. Evidence over narrative. Loops are bounded. Critics are adversarial.
-No hype about “autonomous AGI” — Absoloop is an orchestrator with receipts.
+No hype about “autonomous AGI” — AbsoLoop is an orchestrator with receipts.
