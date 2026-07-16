@@ -1,0 +1,193 @@
+"""Cross-platform helpers for Absoloop (Linux / macOS / Windows).
+
+Keeps OS branching out of adapters and CLI so Codex Micro, provider spawns,
+cancel, and report viewing behave the same everywhere.
+"""
+from __future__ import annotations
+
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+from typing import List, Optional, Sequence
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+def tooling_home(env: Optional[dict] = None,
+                 *,
+                 anchor: Optional[pathlib.Path] = None) -> pathlib.Path:
+    """Resolve Absoloop's install root.
+
+    Precedence:
+      1. ABSOLOOP_HOME (env)
+      2. Directory containing this package's parent (the checkout / install)
+      3. ~/absoloop (legacy default)
+    """
+    environ = env if env is not None else os.environ
+    raw = environ.get("ABSOLOOP_HOME")
+    if raw:
+        return pathlib.Path(raw).expanduser().resolve()
+    if anchor is None:
+        # absoloop_harness/platform_util.py → repo / install root
+        anchor = pathlib.Path(__file__).resolve().parent.parent
+    if (anchor / "absoloop_harness").is_dir():
+        return anchor
+    return (pathlib.Path.home() / "absoloop").resolve()
+
+
+def ensure_home_on_path(home: Optional[pathlib.Path] = None) -> pathlib.Path:
+    """Insert tooling home on sys.path and export ABSOLOOP_HOME for children."""
+    root = home or tooling_home()
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    os.environ.setdefault("ABSOLOOP_HOME", str(root))
+    return root
+
+
+def resolve_executable(name_or_path: str) -> Optional[str]:
+    """Resolve a CLI for argv-array spawn (Windows .cmd/.exe aware)."""
+    if not name_or_path:
+        return None
+    candidate = pathlib.Path(name_or_path).expanduser()
+    if candidate.is_file():
+        # Windows .cmd/.bat are not always os.X_OK; accept existing files.
+        if is_windows() or os.access(candidate, os.X_OK):
+            try:
+                return str(candidate.resolve())
+            except OSError:
+                return str(candidate)
+    found = shutil.which(name_or_path)
+    if found:
+        return found
+    if is_windows() and not pathlib.Path(name_or_path).suffix:
+        for suffix in os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD").split(";"):
+            suffix = suffix.strip()
+            if not suffix:
+                continue
+            found = shutil.which(name_or_path + suffix)
+            if found:
+                return found
+    return None
+
+
+def kill_process_tree(pid: int) -> bool:
+    """Best-effort terminate of a process and its descendants.
+
+    Unix callers should prefer killpg when they own a session; this helper
+    covers Windows trees and last-resort single-PID kills.
+    """
+    if pid <= 0:
+        return False
+    if is_windows():
+        try:
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, text=True, timeout=20, check=False)
+            # 0 = killed, 128 = not found (already gone) — both OK for cancel.
+            return result.returncode in (0, 128)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                os.kill(pid, 15)  # SIGTERM equivalent via Python on Windows
+                return True
+            except OSError:
+                return False
+    try:
+        os.kill(pid, 15)
+        return True
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+
+
+def open_path(path: pathlib.Path) -> bool:
+    """Open a file with the platform default handler (browser for .html)."""
+    target = pathlib.Path(path).resolve()
+    try:
+        if is_windows():
+            os.startfile(str(target))  # type: ignore[attr-defined]
+            return True
+        if sys.platform == "darwin":
+            subprocess.run(["open", str(target)], check=False)
+            return True
+        opener = shutil.which("xdg-open")
+        if opener:
+            subprocess.run([opener, str(target)], check=False)
+            return True
+    except OSError:
+        pass
+    try:
+        import webbrowser
+        return bool(webbrowser.open(target.as_uri()))
+    except Exception:
+        return False
+
+
+def python_gate_command(suffix: str = "-m unittest discover -s tests") -> str:
+    """Gate command using the interpreter currently running Absoloop."""
+    exe = sys.executable or "python"
+    # Quote for shell=True on Windows paths with spaces.
+    if " " in exe:
+        return f'"{exe}" {suffix}'
+    return f"{exe} {suffix}"
+
+
+def rewrite_python_gate(command: str) -> str:
+    """Rewrite leading python/python3 to the Absoloop interpreter.
+
+    Leaves `py -3 …` alone (Windows launcher) when that is what the user
+    configured; defaults use `python` which we rewrite to sys.executable.
+    """
+    stripped = command.strip()
+    if not stripped:
+        return command
+    parts = stripped.split(None, 1)
+    head = parts[0].strip("\"'")
+    if pathlib.Path(head).name.lower() in ("python", "python3"):
+        rest = parts[1] if len(parts) > 1 else ""
+        return python_gate_command(rest) if rest else sys.executable
+    return command
+
+
+def tty_raw_listen_supported() -> bool:
+    """True when termios/tty raw chord listen can work."""
+    if is_windows():
+        return False
+    try:
+        import termios  # noqa: F401
+        import tty  # noqa: F401
+        import select  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def prerequisite_checks() -> List[str]:
+    """Human-readable environment notes for `absoloop doctor`."""
+    notes: List[str] = []
+    home = tooling_home()
+    notes.append(f"ABSOLOOP_HOME={home}")
+    if not (home / "absoloop_harness").is_dir():
+        notes.append(
+            "fix: ABSOLOOP_HOME does not contain absoloop_harness/ — "
+            "set ABSOLOOP_HOME to your Absoloop checkout")
+    py = sys.executable or "?"
+    notes.append(f"python={py} ({sys.version.split()[0]})")
+    git = shutil.which("git")
+    if git:
+        notes.append(f"git={git}")
+    else:
+        notes.append(
+            "fix: git not on PATH — harness worktrees and mission git "
+            "delivery require git")
+    if is_windows():
+        notes.append(
+            "platform=windows — use `absoloop do <action>` or line protocol "
+            "for Codex Micro; TTY chord listen is Unix-only")
+    else:
+        notes.append(f"platform={sys.platform}")
+    return notes

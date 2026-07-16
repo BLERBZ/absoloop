@@ -1,0 +1,80 @@
+# Absoloop multi-provider harness configuration.
+# Copy to <your-project>/absoloop.toml (project scope) or
+# ~/.absoloop/absoloop.toml (user scope). Precedence: CLI > project > user >
+# built-in defaults. Inspect the resolved values with: absoloop config
+
+[providers.grok]
+command = "grok"            # executable name or absolute path
+model = "grok-build-0.1"    # Absoloop default = best available for this engine
+timeout_seconds = 1800
+# Passed through to the child so native auth / subagents work under the
+# harness env allowlist (everything else is stripped).
+env_allowlist = ["XAI_API_KEY", "GROK_HOME"]
+
+[providers.claude]
+command = "claude"
+model = "best"              # Fable 5 when available, else latest Opus
+timeout_seconds = 1800
+# CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS enables native Agent Teams; the
+# Claude adapter also injects =1 even if the parent shell never set it.
+env_allowlist = ["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "ANTHROPIC_API_KEY"]
+
+[providers.codex]
+command = "codex"
+model = "gpt-5.6-sol"       # GPT-5.6 flagship coding model
+timeout_seconds = 1800
+env_allowlist = ["OPENAI_API_KEY"]
+# Resume argv shape when Codex builds differ:
+#   exec-resume            — codex exec resume <id> --json --cd … -  (default)
+#   exec-flags-then-resume — codex exec --json --cd … resume <id> -
+# resume_style = "exec-resume"
+
+[permissions]
+# read: read-only tools / plan mode / read-only sandbox
+# edit: workspace edits auto-approved, dangerous commands still gated
+# full: unattended (--yolo / bypassPermissions / danger-full-access)
+default_profile = "edit"
+
+[gates]
+# Deterministic quality gates run in each candidate worktree. A candidate
+# that fails a required gate is rejected no matter what any reviewer says.
+required = ["tests"]
+
+[gates.commands]
+tests = "python -m unittest discover -s tests"   # rewritten to this Python at gate time
+lint = ""
+typecheck = ""
+format = ""
+security = ""
+
+[workflows]
+planner = "claude"          # council: who writes the plan
+reviewer = "codex"          # review/council: who verifies
+implementers = ["grok", "claude", "codex"]
+integrator = "claude"
+
+[artifacts]
+keep_worktrees = false      # true (or --keep-worktrees) to debug candidate trees
+retention_runs = 20         # oldest .absoloop/runs/ pruned beyond this
+
+# ---------------------------------------------------------------------------
+# Shortcuts — keyboard + Work Louder Codex Micro
+# See docs/shortcuts.md. Defaults use F13–F24 (macropad-safe).
+# Codex Micro: map keys in Input to these chords, or bind shell
+# `absoloop do <action>` macros (no listener required).
+# ---------------------------------------------------------------------------
+[shortcuts]
+enabled = true
+confirm_dangerous = true
+# status = "f13"
+# watch = "f14"
+# report = "f15"
+# goal = "f16"
+# approve = "f17"
+# reject = "f18"
+# resume = "f19"
+# brief = "f20"
+# cancel = "f21"
+# doctor = "f22"
+# inspect = "f23"
+# run = "f24"

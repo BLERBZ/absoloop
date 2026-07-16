@@ -1,0 +1,13 @@
+{
+  "completionPct": 0,
+  "errorRate": 0,
+  "tasksPerHour": 0,
+  "phases": [
+    { "phase": 0, "name": "Scaffold", "progress": 0 },
+    { "phase": 1, "name": "Execute", "progress": 0 },
+    { "phase": 2, "name": "Integrity", "progress": 0 },
+    { "phase": 3, "name": "Critic", "progress": 0 },
+    { "phase": 4, "name": "Human Gate", "progress": 0 },
+    { "phase": 5, "name": "Deliver", "progress": 0 }
+  ]
+}

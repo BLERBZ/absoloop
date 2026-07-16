@@ -16,24 +16,38 @@ import subprocess
 import sys
 import time
 
-ABSOLOOP_HOME = pathlib.Path(os.environ.get("ABSOLOOP_HOME", pathlib.Path.home() / "absoloop"))
+def _detect_absoloop_home() -> pathlib.Path:
+    """Install root: env override, then the checkout that owns this CLI,
+    then the legacy ~/absoloop fallback. Makes harness/Micro work without
+    a manual export when bin/ is on PATH."""
+    env = os.environ.get("ABSOLOOP_HOME")
+    if env:
+        return pathlib.Path(env).expanduser().resolve()
+    here = pathlib.Path(__file__).resolve().parent.parent
+    if (here / "absoloop_harness").is_dir() and (here / "templates").is_dir():
+        return here
+    return (pathlib.Path.home() / "absoloop").resolve()
+
+
+ABSOLOOP_HOME = _detect_absoloop_home()
+os.environ.setdefault("ABSOLOOP_HOME", str(ABSOLOOP_HOME))
 TEMPLATES = ABSOLOOP_HOME / "templates"
 
 
-def render_logo(*, compact: bool = False) -> str:
+def render_logo(*, compact: bool = False, height: int | None = None) -> str:
     """Render the Absoloop logo from the sibling bin/absoloop_logo.py, in full
     color ('color always'). Best-effort: a logo problem must never block the
     CLI, so any failure yields an empty string and the command runs as before."""
     try:
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
         from absoloop_logo import build_logo
-        return build_logo(compact=compact, color_mode="always")
+        return build_logo(compact=compact, color_mode="always", height=height)
     except Exception:
         return ""
 
 
-def print_banner(*, compact: bool = False) -> None:
-    logo = render_logo(compact=compact)
+def print_banner(*, compact: bool = False, height: int | None = None) -> None:
+    logo = render_logo(compact=compact, height=height)
     if logo:
         print(logo + "\n")
 
@@ -47,42 +61,38 @@ class BannerParser(argparse.ArgumentParser):
 
 EPILOG = """\
 examples:
-  absoloop                      # fully interactive
-  absoloop my-mission           # prompts only for the objective
-  absoloop my-mission -o "Make all tests pass" --start
-                                  # one shot: scaffold and start the loop
-  absoloop existing-project     # adopts an existing directory in place
-  absoloop .                    # adopt the directory you are already in
-  absoloop status               # where is the mission? what should I do next?
-  absoloop watch                # live dashboard: phase, budgets, and a
-                                  # streaming feed of agent actions (--once
-                                  # for a single frame, -n 5 to refresh slower)
-  absoloop report               # iteration-by-iteration results timeline
-  absoloop goal                 # show the generated /goal contract
-                                  # (--regen rebuilds it; --check validates the
-                                  #  mission config it is generated from)
-  absoloop my-mission -d out    # deliver accepted work to ~/absoloop/out/<loop_id>/
-                                  # (-d git commits to a branch; -d local leaves
-                                  #  changes unstaged; prompted when omitted)
-  absoloop resume               # re-enter the active mission's loop in place
-  absoloop resume --extend      # follow-on run for a COMPLETED mission: fresh
-                                  budgets, previous work carried in as context
-  absoloop resume --extend -m "finish the CLI flags too" --hours 4 --iterations 30
-                                  # extended follow-on run with a focus note —
-                                  # the note becomes a binding definition-of-done
-                                  # item (--min-iterations N sets the floor before
-                                  # a done claim is accepted; default 3 with a note)
-  absoloop approve              # accept a mission stopped at the human gate
-  absoloop reject "use the v2 API instead"
-                                  # answer the agent; feedback lands in the
-                                  # next iteration's prompt — then resume
+  absoloop setup                        # first-run wizard (PATH · providers · defaults)
+  absoloop                              # briefing: one prompt → review → launch
+  absoloop "Make all tests pass"        # objective first; review card; Enter
+  absoloop . -o "Fix the parser crash"  # adopt cwd, review, go
+  absoloop my-mission -o "…" -d local --start -y
+                                          # one shot: skip review, launch now
+  absoloop status · watch · report · goal
+  absoloop resume · resume --extend
+  absoloop approve · reject "guidance"
+  absoloop schedule add|list|tick|daemon   # cron / interval mission triggers
 
-New directories are scaffolded; existing ones are adopted — ABSOLOOP files
-are added only where missing, and an existing .absoloop/runtime.json is
-reused (pass -o to update the mission in place).
+Mission Briefing keys: Enter launch · o objective · e engine · d delivery
+                       n rename · g preview /goal · q abort
 
-Runner exit codes: 0 = completed, 3 = accepted & awaiting your approval,
-2 = stopped safely (see stop_reason in the printed state).
+ZComb Kanban UI (optional · needs Node.js 18+):
+  absoloop --zcomb                      # same briefing/launch as absoloop, plus Kanban
+  absoloop "…" --zcomb                  # objective + launch with Kanban UI
+  absoloop zcomb [-C ./mission]         # dashboard only (monitor a running mission)
+  → http://localhost:3141
+
+Harness: doctor · providers · run · build · review · cancel · inspect · apply
+
+Shortcuts (keyboard + Codex Micro):
+  absoloop shortcuts list|layout|export|listen|bind
+  absoloop do status          # same actions the Micro keys fire
+
+Schedule (never auto-approves the human gate):
+  absoloop schedule add --cron "0 0 * * 5" --tz America/New_York --action extend
+  absoloop schedule tick --once
+  absoloop schedule daemon start|stop|status
+
+Runner exit codes: 0 completed · 3 awaiting approval · 2 stopped safely.
 """
 
 CRITIC_PROMPT = """\
@@ -90,7 +100,7 @@ You are an independent adversarial reviewer. Attempt to disprove that the
 current working tree satisfies the mission contract. Inspect the relevant
 files yourself with read-only tools; do not trust any builder narrative.
 Look for weakened tests, unverifiable claims, regressions, and scope drift.
-Mission skills under .claude/skills/ or .codex/skills/ are authorized loop
+Mission skills under .claude/skills/, .codex/skills/, or .grok/skills/ are authorized loop
 infrastructure, not scope drift — but audit them like any artifact: a skill
 must do exactly what its description says and must not weaken the mission's
 acceptance bar.
@@ -159,7 +169,11 @@ def sync_runner(target: pathlib.Path) -> None:
 # Each engine's native project-skill discovery path: both CLIs scan their
 # directory at session startup, so a skill installed here is available with
 # no extra flags — the standardized SKILL.md format works in both unchanged.
-ENGINE_SKILL_DIRS = {"claude": ".claude/skills", "codex": ".codex/skills"}
+ENGINE_SKILL_DIRS = {
+    "claude": ".claude/skills",
+    "codex": ".codex/skills",
+    "grok": ".grok/skills",
+}
 
 
 def toolbox_manifest() -> dict:
@@ -468,7 +482,7 @@ def generate_goal_markdown(config: dict) -> str:
         "## Skills — the mission's capability pipeline",
         "",
         "Reusable skills live in your engine's skills directory in this project",
-        "(`.claude/skills/` for claude, `.codex/skills/` for codex — the",
+        "(`.claude/skills/` / `.codex/skills/` / `.grok/skills/` — the",
         "iteration prompt lists what is installed). A standard toolbox is",
         "seeded at setup (skill-creator, ai-ready, tdd, agent-browser,",
         "mcp-builder, frontend-design, plus engine-specific references); skills",
@@ -612,11 +626,13 @@ def write_goal(target: pathlib.Path, config: dict) -> pathlib.Path:
     return goal_path
 
 
-def runtime_config(objective: str, loop_id: str, delivery_mode: str) -> dict:
+def runtime_config(objective: str, loop_id: str, delivery_mode: str,
+                   model: str = "") -> dict:
     return {
         "mission_id": "ABS-MINIMAL-001",
         "loop_id": loop_id,
         "objective": objective,
+        "model": model,
         "definition_of_done": [
             "The objective is achieved and demonstrated in the working tree.",
             "An independent critic finds no blocking issue.",
@@ -643,6 +659,12 @@ def runtime_config(objective: str, loop_id: str, delivery_mode: str) -> dict:
             "critic": {"sandbox": "read-only", "max_budget_usd": 2.0,
                        "max_wall_seconds": 600, "model_reasoning_effort": "high"},
         },
+        "grok": {
+            "builder": {"permission_profile": "edit", "max_turns": 30,
+                        "max_budget_usd": 5.0, "max_wall_seconds": 1200},
+            "critic": {"permission_profile": "read", "max_turns": 12,
+                       "max_budget_usd": 2.0, "max_wall_seconds": 600},
+        },
     }
 
 
@@ -654,7 +676,7 @@ def ask(prompt: str) -> str:
         sys.exit(1)
 
 
-ENGINES = ("claude", "codex")
+ENGINES = ("claude", "codex", "grok")
 
 
 def default_engine() -> str | None:
@@ -723,6 +745,44 @@ def budget_bar(used: float, cap: float, width: int = 22) -> str:
     frac = min(1.0, max(0.0, used / cap))
     filled = int(round(frac * width))
     return f"[{'█' * filled}{'░' * (width - filled)}] {100 * frac:.0f}%"
+
+
+def terminal_columns(fallback: int = 80) -> int:
+    """Current terminal width; falls back for pipes / dumb terminals."""
+    try:
+        return max(1, shutil.get_terminal_size((fallback, 24)).columns)
+    except OSError:
+        return fallback
+
+
+def clip_text(text: str, max_len: int) -> str:
+    """Truncate to max_len characters, appending an ellipsis when clipped."""
+    text = str(text).replace("\n", " ")
+    if max_len <= 0:
+        return ""
+    if len(text) <= max_len:
+        return text
+    if max_len == 1:
+        return "…"
+    return text[: max_len - 1] + "…"
+
+
+def wrap_prefix(prefix: str, value: str, width: int) -> list[str]:
+    """Wrap `value` after `prefix` to `width`, hanging-indent on continuations."""
+    avail = max(12, width - len(prefix))
+    text = " ".join(str(value).split())
+    if not text:
+        return [prefix.rstrip()]
+    lines: list[str] = []
+    while text:
+        chunk, text = text[:avail], text[avail:]
+        lines.append((prefix if not lines else " " * len(prefix)) + chunk)
+    return lines
+
+
+def wrap_field(label: str, value: str, width: int) -> list[str]:
+    """Labeled field wrapped to `width` (` label     : value`)."""
+    return wrap_prefix(f" {label:<10}: ", value, width)
 
 
 def load_runtime(target: pathlib.Path) -> dict:
@@ -837,7 +897,10 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
                  monitor: dict, feed_lines: int, interval: float | None) -> tuple[str, bool]:
     """One frame of the live dashboard. Returns (text, loop_is_live)."""
     live = monitor_is_live(monitor)
-    width = 72
+    # Re-read each frame so resizing the terminal expands the dashboard live.
+    # Floor keeps labels readable; ceiling avoids absurdly long single lines.
+    width = max(56, min(terminal_columns(80), 240))
+    bar_w = max(18, min(48, width // 3))
     out: list[str] = []
     def rule(char="─"):
         out.append(char * width)
@@ -846,12 +909,14 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
     phase = str(monitor.get("phase") or "").strip()
     badge = "● LIVE" if live else ("■ " + status if status in TERMINAL_STATUSES
                                    else "○ loop not running")
+    mission = state.get("mission_id") or monitor.get("mission_id") or "?"
+    loop_id = runtime.get("loop_id", "no loop id")
     rule("═")
-    out.append(f" ABSOLOOP WATCH — {state.get('mission_id') or monitor.get('mission_id') or '?'} "
-               f"({runtime.get('loop_id', 'no loop id')})   [{badge}]")
+    out.append(clip_text(
+        f" ABSOLOOP WATCH — {mission} ({loop_id})   [{badge}]", width))
     rule("═")
     if runtime.get("objective"):
-        out.append(f" objective : {runtime['objective']}")
+        out.extend(wrap_field("objective", runtime["objective"], width))
     engine = monitor.get("engine")
     line = f" status    : {status}"
     if live and phase:
@@ -860,37 +925,44 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
         line += f" ({state['stop_reason']})"
     if engine:
         line += f" · engine {engine}"
-    out.append(line)
+    out.append(clip_text(line, width))
 
     max_iter = int(runtime.get("max_iterations") or 0)
     iteration = int((monitor if live else state).get("iteration") or 0)
-    out.append(f" iteration : {iteration} of {max_iter or '?'}   "
-               f"{budget_bar(iteration, max_iter)}")
+    out.append(clip_text(
+        f" iteration : {iteration} of {max_iter or '?'}   "
+        f"{budget_bar(iteration, max_iter, bar_w)}", width))
     cap = float(runtime.get("max_cost_usd") or 0)
     source = monitor if live else state
     spent = float(source.get("cost_usd") or 0)
-    out.append(f" spend     : {with_tokens(f'${spent:.2f}', source.get('tokens_total'))} "
-               f"of ${cap:.2f}   {budget_bar(spent, cap)}")
+    out.append(clip_text(
+        f" spend     : {with_tokens(f'${spent:.2f}', source.get('tokens_total'))} "
+        f"of ${cap:.2f}   {budget_bar(spent, cap, bar_w)}", width))
     started = (monitor.get("started_at") if live else state.get("started_at")) or 0
     max_wall = float(runtime.get("max_wall_seconds") or 0)
     if started and max_wall and (live or status == "EXECUTING"):
         elapsed = time.time() - float(started)
-        out.append(f" wall clock: {fmt_age(elapsed)} of {fmt_age(max_wall)}   "
-                   f"{budget_bar(elapsed, max_wall)}")
+        out.append(clip_text(
+            f" wall clock: {fmt_age(elapsed)} of {fmt_age(max_wall)}   "
+            f"{budget_bar(elapsed, max_wall, bar_w)}", width))
     if live:
         if monitor.get("thinking_level"):
-            out.append(f" thinking  : {monitor['thinking_level']} "
-                       f"(repeated failures: {monitor.get('repeated_failure_count', 0)})")
+            out.append(clip_text(
+                f" thinking  : {monitor['thinking_level']} "
+                f"(repeated failures: {monitor.get('repeated_failure_count', 0)})",
+                width))
         agent = monitor.get("agent")
         if agent:
             agent_started = monitor.get("agent_started")
             running = (f" — working for {fmt_age(time.time() - agent_started)}"
                        if isinstance(agent_started, (int, float)) else "")
-            out.append(f" agent     : {agent}{running}")
+            out.append(clip_text(f" agent     : {agent}{running}", width))
         activity = monitor.get("last_activity")
         if isinstance(activity, dict) and activity.get("detail"):
             age = fmt_age(time.time() - float(activity.get("ts") or time.time()))
-            out.append(f" doing     : {activity['detail'][:width - 22]} ({age} ago)")
+            suffix = f" ({age} ago)"
+            detail = clip_text(activity["detail"], max(12, width - 13 - len(suffix)))
+            out.append(f" doing     : {detail}{suffix}")
 
     feed = live_tail(target, feed_lines)
     if feed:
@@ -900,8 +972,10 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
             stamp = time.strftime("%H:%M:%S", time.localtime(event.get("ts", 0)))
             marker = {"say": "💬", "think": "…", "tool": "→", "verdict": "⚖",
                       "error": "✗", "usage": "·", "start": "▶"}.get(event.get("kind"), "→")
-            detail = str(event.get("detail", ""))[:width - 26]
-            out.append(f"  {stamp} {event.get('agent', '?'):<8}{marker} {detail}")
+            agent_name = str(event.get("agent", "?") or "?")[:8]
+            prefix = f"  {stamp} {agent_name:<8}{marker} "
+            detail = clip_text(event.get("detail", ""), max(8, width - len(prefix)))
+            out.append(prefix + detail)
 
     report = latest_builder_report(target, state)
     summary = str(report.get("summary") or "").strip()
@@ -910,15 +984,17 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
     if summary or risks:
         rule()
         if summary:
-            out.append(" builder's last report: " + " ".join(summary.split())[:width - 25])
+            out.extend(wrap_prefix(
+                " builder's last report: ", " ".join(summary.split()), width))
         for risk in risks[:3]:
-            out.append(f" ⚠ risk: {risk[:width - 10]}")
+            risk_prefix = " ⚠ risk: "
+            out.append(risk_prefix + clip_text(risk, max(8, width - len(risk_prefix))))
     rule()
-    out.append(f" next: {next_step_hint(state or monitor)}")
+    out.extend(wrap_prefix(" next: ", next_step_hint(state or monitor), width))
     footer = f" refreshed {time.strftime('%H:%M:%S')}"
     if interval:
         footer += f" · every {interval:g}s · Ctrl-C to exit"
-    out.append(footer)
+    out.append(clip_text(footer, width))
     rule("═")
     return "\n".join(out), live
 
@@ -926,8 +1002,10 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
 def watch_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="absoloop watch",
-        description="Live dashboard for a running mission: phase, budgets, and "
-                    "a streaming feed of what the agent is doing right now.")
+        description="Live terminal dashboard for a running mission: phase, "
+                    "budgets, and a streaming feed of what the agent is doing "
+                    "right now. Prefer 'absoloop zcomb' for the browser "
+                    "Kanban UI (or 'absoloop --zcomb' to brief + launch with it).")
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
     parser.add_argument("-n", "--interval", type=float, default=2.0,
@@ -1050,92 +1128,56 @@ def agent_summary(target: pathlib.Path, result_rel: str) -> str:
 
 
 def report_command(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
+    parser = BannerParser(
         prog="absoloop report",
-        description="Iteration-by-iteration results view for the mission.")
+        description="Regenerate the mission report (Markdown) and open the "
+                    "lite infographic viewer.")
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
+    parser.add_argument("--no-open", action="store_true",
+                        help="write report.md + report.html without opening the viewer")
+    parser.add_argument("--terminal", action="store_true",
+                        help="print a terminal summary instead of opening the browser")
+    parser.add_argument("--md-only", action="store_true",
+                        help="only write report.md (skip HTML viewer)")
     args = parser.parse_args(argv)
     target = pathlib.Path(args.project).expanduser().resolve()
-    state = read_state(target)
-    if state is None:
+    if not (target / ".absoloop").is_dir():
+        print(f"error: no .absoloop/ under {target} — not an ABSOLOOP project.",
+              file=sys.stderr)
         return 1
-    runtime = load_runtime(target)
+    # Prefer the checkout that owns this CLI, then ABSOLOOP_HOME.
+    for candidate in (pathlib.Path(__file__).resolve().parent.parent, ABSOLOOP_HOME):
+        if (candidate / "absoloop_harness").is_dir():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            break
+    from absoloop_harness import report_doc
 
-    width = 62
-    def rule(char="─"):
-        print(char * width)
+    written = report_doc.write_report_docs(target, write_html=not args.md_only)
+    if written is None:
+        print(f"error: no readable mission state under {target}/.absoloop/",
+              file=sys.stderr)
+        return 1
 
-    rule("═")
-    print(f" ABSOLOOP REPORT — {state.get('mission_id')} "
-          f"({runtime.get('loop_id', 'no loop id')})")
-    rule("═")
-    if runtime.get("objective"):
-        print(f" objective : {runtime['objective']}")
-    delivery = runtime.get("delivery") or {}
-    if delivery:
-        detail = delivery.get("branch") if delivery.get("mode") == "git" else \
-                 delivery.get("out_dir") if delivery.get("mode") == "out" else \
-                 "working tree (unstaged)"
-        print(f" delivery  : {delivery.get('mode', 'local')} → {detail}")
-    print(f" status    : {state.get('status')}"
-          + (f"  ({state.get('stop_reason')})" if state.get("stop_reason") else ""))
-    cap = float(runtime.get("max_cost_usd") or 0)
-    spent = float(state.get("cost_usd", 0))
-    print(f" spend     : {with_tokens(f'${spent:.2f}', state.get('tokens_total'))} "
-          f"of ${cap:.2f}  {budget_bar(spent, cap)}")
-    max_iter = int(runtime.get("max_iterations") or 0)
-    done_iter = int(state.get("iteration", 0))
-    print(f" iterations: {done_iter} of {max_iter}  {budget_bar(done_iter, max_iter)}")
-    rule()
+    md_rel = written.markdown_path.relative_to(target)
+    print(report_doc.render_terminal(written.report))
+    print(f" document : {md_rel}")
+    if written.html_path.is_file() and not args.md_only:
+        print(f" viewer   : {written.html_path.relative_to(target)}")
 
-    # Stitch the ledger into one line per loop event, oldest first.
-    events = list(iter_ledger(target))
-    if not events:
-        print(" (no ledger yet — the loop has not run)")
-        rule()
-        return 0
-    print(" timeline")
-    for event in events:
-        ts = time.strftime("%m-%d %H:%M", time.localtime(event.get("ts", 0)))
-        kind = event.get("type")
-        if kind == "agent_run":
-            cost = f"${float(event.get('cost_usd', 0)):.2f}"
-            exact = "" if event.get("cost_is_exact") else "~"
-            limit = f" [hit {event['limit_reached']}]" if event.get("limit_reached") else ""
-            print(f"  {ts}  {event.get('engine')} run — exit {event.get('exit_code')}, "
-                  f"{with_tokens(exact + cost, event.get('tokens'))}, "
-                  f"{float(event.get('wall_seconds', 0)):.0f}s{limit}")
-            summary = agent_summary(target, str(event.get("result", "")))
-            if summary:
-                print(f"           └ {summary[:110]}")
-        elif kind == "iteration":
-            mark = "✓ builder reports DONE" if event.get("done") else "… not done yet"
-            print(f"  {ts}  iteration {event.get('iteration')}: {mark}")
-        elif kind == "early_done_claim":
-            print(f"  {ts}  done claim at iteration {event.get('iteration')} not "
-                  f"accepted (floor: {event.get('min_iterations')} iterations)")
-        elif kind == "integrity_check":
-            mark = "✓" if event.get("exit_code") == 0 else "✗ VIOLATION"
-            print(f"  {ts}  integrity check {mark}")
-        elif kind == "human_gate":
-            note = event.get("feedback") or event.get("note") or ""
-            print(f"  {ts}  human gate: {event.get('decision')}"
-                  + (f" — {note}" if note else ""))
-        elif kind == "delivery":
-            print(f"  {ts}  delivered ({event.get('mode')}): {event.get('detail', '')}")
-        elif kind == "mission_stop":
-            print(f"  {ts}  ■ stop: {event.get('status')} ({event.get('reason')})")
-        elif kind == "extension":
-            note = event.get("note") or ""
-            print(f"  {ts}  ▶ extended: {event.get('previous_loop_id')} → "
-                  f"{event.get('loop_id')}" + (f" — {note}" if note else ""))
-    rule()
-    print(f" next: {next_step_hint(state)}")
-    report_md = target / ".absoloop" / "report.md"
-    if report_md.is_file():
-        print(f" full report: {report_md.relative_to(target)}")
-    rule()
+    should_open = (
+        not args.no_open
+        and not args.terminal
+        and not args.md_only
+        and written.html_path.is_file()
+    )
+    if should_open:
+        opened = report_doc.open_viewer(written.html_path)
+        if opened:
+            print(" opened   : lite viewer in your browser")
+        else:
+            print(f" open manually: {written.html_path}", file=sys.stderr)
     return 0
 
 
@@ -1203,8 +1245,10 @@ def status_command(argv: list[str]) -> int:
         if state.get(key):
             print(f"latest {label}: {state[key]}")
     print(f"next:       {next_step_hint(state)}")
-    print("more:       'absoloop watch' is a live dashboard; 'absoloop report' "
-          "shows the full timeline; 'absoloop goal' shows the contract")
+    print("more:       'absoloop watch' is a live terminal dashboard; "
+          "'absoloop zcomb' opens the browser Kanban UI; "
+          "'absoloop report' shows the full timeline; "
+          "'absoloop goal' shows the contract")
     return 0
 
 
@@ -1310,7 +1354,7 @@ def resume_command(argv: list[str]) -> int:
                     "follow-on run that completes a finished mission's work.")
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
-    parser.add_argument("--engine", choices=["claude", "codex"],
+    parser.add_argument("--engine", choices=["claude", "codex", "grok"],
                         help="engine for the loop (default: first one found on PATH)")
     parser.add_argument("--extend", action="store_true",
                         help="start a follow-on run of a finished mission: fresh "
@@ -1338,7 +1382,8 @@ def resume_command(argv: list[str]) -> int:
         return 1
     engine = args.engine or default_engine()
     if engine is None:
-        print("error: no engine available — install 'claude' or 'codex'.", file=sys.stderr)
+        print("error: no engine available — install 'claude', 'codex', or 'grok'.",
+              file=sys.stderr)
         return 1
     status = state.get("status")
     if args.extend:
@@ -1452,89 +1497,72 @@ def gate_command(action: str, argv: list[str]) -> int:
     return 0
 
 
-def start_loop(target: pathlib.Path, engine: str) -> int:
+def start_loop(target: pathlib.Path, engine: str, model: str = "") -> int:
     sync_runner(target)
     sync_skills(target, engines=(engine,))
     runner = target / "scripts" / "absoloop-run"
-    print(f"\nStarting loop with engine '{engine}'...\n")
-    return subprocess.run([sys.executable, str(runner), "--engine", engine],
-                          cwd=target).returncode
+    cmd = [sys.executable, str(runner), "--engine", engine]
+    if model:
+        cmd += ["--model", model]
+    print(f"  engine {engine} · model {model or 'CLI default'} · "
+          f"working tree {target}\n")
+    return subprocess.run(cmd, cwd=target).returncode
 
 
-def main(argv: list[str]) -> int:
-    if argv and argv[0] in ("approve", "reject"):
-        return gate_command(argv[0], argv[1:])
-    if argv and argv[0] == "status":
-        return status_command(argv[1:])
-    if argv and argv[0] == "watch":
-        return watch_command(argv[1:])
-    if argv and argv[0] == "report":
-        return report_command(argv[1:])
-    if argv and argv[0] == "goal":
-        return goal_command(argv[1:])
-    if argv and argv[0] == "resume":
-        return resume_command(argv[1:])
+def _ensure_harness_path() -> None:
+    """Put the install that owns this CLI (and ABSOLOOP_HOME) on sys.path."""
+    for candidate in (pathlib.Path(__file__).resolve().parent.parent, ABSOLOOP_HOME):
+        if (candidate / "absoloop_harness").is_dir():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            os.environ.setdefault("ABSOLOOP_HOME", str(candidate))
+            return
+    if str(ABSOLOOP_HOME) not in sys.path:
+        sys.path.insert(0, str(ABSOLOOP_HOME))
 
-    parser = BannerParser(
-        prog="absoloop",
-        description="Scaffold and start an ABSOLOOP mission loop project.",
-        epilog=EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument("name", nargs="?", help="project name (prompted if omitted)")
-    parser.add_argument("-o", "--objective", help="mission objective (one sentence)")
-    parser.add_argument("-d", "--deliver", choices=sorted(DELIVERY_MODES),
-                        help="where accepted work lands: git (commit to branch), "
-                             "local (leave unstaged), out (~/absoloop/out/<loop_id>/)")
-    parser.add_argument("--engine", choices=["claude", "codex"],
-                        help="engine for the loop (implies --start)")
-    parser.add_argument("--start", action="store_true",
-                        help="start the loop immediately after scaffolding")
-    args = parser.parse_args(argv)
 
-    print_banner()
+def _load_harness():
+    """The multi-provider harness package lives in the tooling home; import
+    it lazily so legacy mission commands never pay for (or break on) it."""
+    _ensure_harness_path()
+    from absoloop_harness import cli as harness_cli
+    return harness_cli
 
-    runner_template = TEMPLATES / "absoloop-run"
-    if not runner_template.is_file():
-        print(f"error: missing template {runner_template}", file=sys.stderr)
+
+def _load_briefing():
+    _ensure_harness_path()
+    from absoloop_harness import briefing
+    return briefing
+
+
+def _run_setup(argv: list[str]):
+    """Guided first-run wizard. Returns an int exit code, or a
+    (code, SetupResult) tuple when callers want the handoff object."""
+    _ensure_harness_path()
+    from absoloop_harness import setup_wizard
+    print_banner(compact=True)
+    # Parse flags ourselves so we can return the result object for chaining.
+    yes = "-y" in argv or "--yes" in argv
+    force = "--force" in argv
+    if "--check" in argv:
+        return setup_wizard.setup_command(["--check"])
+    if "--reset" in argv:
+        return setup_wizard.setup_command(["--reset"])
+    result = setup_wizard.run_wizard(yes=yes, force=force)
+    if result.aborted:
         return 1
-
-    if shutil.which("jq") is None:
-        print("warning: 'jq' not found on PATH — some blueprint recipes use it.", file=sys.stderr)
-    if default_engine() is None:
-        print("warning: neither 'claude' nor 'codex' CLI found on PATH — "
-              "install one before running the loop.", file=sys.stderr)
-
-    name = args.name or ""
-    name_from_arg = bool(name)
-    while True:
-        if not name:
-            name = ask("Project name (or path to an existing project): ")
-        if re.fullmatch(r"[A-Za-z0-9._-]+", name) or pathlib.Path(name).expanduser().is_dir():
-            break
-        print("Use only letters, numbers, dots, dashes, underscores — "
-              "or the path of an existing directory.", file=sys.stderr)
-        name = ""
-
-    target = (pathlib.Path.cwd() / pathlib.Path(name).expanduser()).resolve()
-    if target.exists() and not target.is_dir():
-        print(f"error: {target} exists and is not a directory.", file=sys.stderr)
+    if not result.completed:
         return 1
-    adopting = target.is_dir()
+    return (0 if result.providers_ready or yes else 2, result)
 
-    # Only confirm when the name came from an interactive prompt; passing it
-    # on the command line is confirmation enough.
-    if not name_from_arg:
-        question = (f"Set up ABSOLOOP in existing directory {target}? [y/N] " if adopting
-                    else f"Create ABSOLOOP project at {target}? [y/N] ")
-        if ask(question).lower() not in ("y", "yes"):
-            print("Aborted.")
-            return 1
 
+def scaffold_mission(target: pathlib.Path, objective: str,
+                     delivery_mode: str,
+                     model: str = "") -> tuple[dict, pathlib.Path]:
+    """Create/adopt project files and write runtime + /goal. Returns
+    (config, goal_path)."""
     scripts = target / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
-    # The runner is a managed file: always kept in step with the installed
-    # template so scaffolded projects pick up loop fixes on re-adoption.
     sync_runner(target)
     sync_skills(target)
     for tmpl in ("absoloop-init",):
@@ -1543,15 +1571,15 @@ def main(argv: list[str]) -> int:
         if not src.is_file():
             continue
         if dest.exists():
-            print(f"kept existing scripts/{tmpl}")
             continue
         shutil.copy(src, dest)
         if os.name != "nt":
             os.chmod(dest, 0o755)
 
     if shutil.which("git"):
-        inside = subprocess.run(["git", "-C", str(target), "rev-parse", "--is-inside-work-tree"],
-                                capture_output=True, text=True)
+        inside = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True)
         if inside.returncode != 0:
             subprocess.run(["git", "init", "-q", str(target)], check=False)
 
@@ -1564,63 +1592,29 @@ def main(argv: list[str]) -> int:
         if (scripts / legacy).exists():
             print(f"note: scripts/{legacy} is from the old ABSOLUTION name and can be "
                   f"deleted; {legacy.replace('absolution', 'absoloop')} replaces it.")
+
     runtime_path = abs_dir / "runtime.json"
     existing_config = None
     if runtime_path.is_file():
         try:
             existing_config = json.loads(runtime_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
-            print(f"warning: {runtime_path} is unreadable — rebuilding it.", file=sys.stderr)
-
-    objective = (args.objective or "").strip()
-    if existing_config:
-        objective = objective or str(existing_config.get("objective", "")).strip()
-    if not objective:
-        status = "adopted" if adopting else "created"
-        print(f"\nProject '{target.name}' {status}. Now define the mission:")
-    while not objective:
-        objective = ask("Mission objective (one sentence): ")
-
-    # Delivery: flag wins, then an existing config's choice, then a prompt.
-    delivery_mode = args.deliver or ""
-    if not delivery_mode and existing_config:
-        delivery_mode = str((existing_config.get("delivery") or {}).get("mode", ""))
-    if delivery_mode and delivery_mode not in DELIVERY_MODES:
-        print(f"warning: unknown delivery mode {delivery_mode!r} in existing config — "
-              "asking again.", file=sys.stderr)
-        delivery_mode = ""
-    if not delivery_mode:
-        if sys.stdin.isatty():
-            print("\nWhere should accepted loop results land?")
-            ordered = ("git", "local", "out")
-            for index, mode in enumerate(ordered, 1):
-                print(f"  {index}. {mode:<5} — {DELIVERY_MODES[mode]}")
-            while not delivery_mode:
-                answer = ask("Delivery [1-3, or git/local/out] (default: local): ") or "local"
-                if answer in DELIVERY_MODES:
-                    delivery_mode = answer
-                elif answer in ("1", "2", "3"):
-                    delivery_mode = ordered[int(answer) - 1]
-                else:
-                    print("Answer 1, 2, 3, git, local, or out.", file=sys.stderr)
-        else:
-            delivery_mode = "local"
+            print(f"warning: {runtime_path} is unreadable — rebuilding it.",
+                  file=sys.stderr)
 
     for sub in ("tmp", "checkpoints", "schemas", "prompts"):
         (abs_dir / sub).mkdir(parents=True, exist_ok=True)
     schema_path = abs_dir / "schemas" / "agent-result.schema.json"
     if not schema_path.exists():
-        schema_path.write_text(json.dumps(RESULT_SCHEMA, indent=2) + "\n", encoding="utf-8")
+        schema_path.write_text(json.dumps(RESULT_SCHEMA, indent=2) + "\n",
+                               encoding="utf-8")
     critic_path = abs_dir / "prompts" / "critic-final-review.md"
     if not critic_path.exists():
         critic_path.write_text(CRITIC_PROMPT, encoding="utf-8")
 
     if existing_config:
-        # Preserve any hand-tuned settings; only refresh the mission fields.
         previous_objective = str(existing_config.get("objective", "")).strip()
         existing_config["objective"] = objective
-        # The ladder derives from the objective's mission type: rebuild it when
-        # the mission changed or it is missing/invalid; keep a valid hand-tuned one.
         if (objective != previous_objective
                 or validate_thinking_ladder(existing_config.get("thinking_ladder"))):
             existing_config["thinking_ladder"] = build_thinking_ladder(
@@ -1628,51 +1622,322 @@ def main(argv: list[str]) -> int:
         existing_config.pop("verify_command", None)
         critic_path_cfg = str(existing_config.get("critic_prompt_path", ""))
         if critic_path_cfg.startswith(".absolution/"):
-            existing_config["critic_prompt_path"] = ".absoloop/" + critic_path_cfg[len(".absolution/"):]
+            existing_config["critic_prompt_path"] = (
+                ".absoloop/" + critic_path_cfg[len(".absolution/"):])
         existing_config.setdefault("loop_id", new_loop_id())
         existing_config.setdefault("goal_path", ".absoloop/goal.md")
-        existing_config["delivery"] = default_delivery(delivery_mode,
-                                                       existing_config["loop_id"])
+        existing_config["delivery"] = default_delivery(
+            delivery_mode, existing_config["loop_id"])
+        if model:
+            existing_config["model"] = model
         config = existing_config
-        print("reusing existing .absoloop/runtime.json (mission fields updated)")
     else:
-        config = runtime_config(objective, new_loop_id(), delivery_mode)
+        config = runtime_config(objective, new_loop_id(), delivery_mode,
+                                model=model)
+
     runtime_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-
     goal_path = write_goal(target, config)
-    print(f"goal contract written to {goal_path.relative_to(target)} "
-          "(view or tweak with 'absoloop goal')")
-    print(f"delivery: {delivery_mode} — {DELIVERY_MODES[delivery_mode]}")
 
-    # Keep per-iteration loop scratch out of git; delivered commits stay clean.
     gitignore = target / ".gitignore"
     ignore_line = ".absoloop/tmp/"
     existing_ignores = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
     if ignore_line not in existing_ignores.splitlines():
-        gitignore.write_text(existing_ignores
-                             + ("" if existing_ignores.endswith("\n") or not existing_ignores else "\n")
-                             + ignore_line + "\n", encoding="utf-8")
+        gitignore.write_text(
+            existing_ignores
+            + ("" if existing_ignores.endswith("\n") or not existing_ignores else "\n")
+            + ignore_line + "\n", encoding="utf-8")
+    return config, goal_path
 
-    engine = args.engine or ""
-    if not engine and sys.stdin.isatty():
-        engine = choose_engine()
-    engine = engine or default_engine()
 
-    if args.start or args.engine:
-        if engine is None:
-            print("error: no engine available — install 'claude' or 'codex'.", file=sys.stderr)
+def _resolve_target(name: str) -> pathlib.Path:
+    return (pathlib.Path.cwd() / pathlib.Path(name).expanduser()).resolve()
+
+
+def _engine_labels() -> dict:
+    labels = {}
+    for engine in ENGINES:
+        labels[engine] = ("✓ on PATH" if shutil.which(engine)
+                          else "✗ not found")
+    return labels
+
+
+def main(argv: list[str]) -> int:
+    # Lightweight peel of --zcomb before any subcommand dispatch.
+    want_zcomb = False
+    if "--zcomb" in argv:
+        _ensure_harness_path()
+        from absoloop_harness import zcomb as zcomb_mod
+        argv, want_zcomb = zcomb_mod.extract_zcomb_flag(argv)
+    else:
+        zcomb_mod = None  # type: ignore[assignment]
+
+    if argv and argv[0] == "zcomb":
+        _ensure_harness_path()
+        from absoloop_harness import zcomb as zcomb_mod
+        return zcomb_mod.zcomb_command(argv[1:])
+    # ZComb-only flags without a mission → dashboard (e.g. --port / -C / --once).
+    # Bare `absoloop --zcomb` falls through to the same briefing/launch as
+    # `absoloop`, then opens the Kanban UI when the loop starts.
+    if want_zcomb and zcomb_mod is not None and argv and argv[0].startswith("-") \
+            and not any(a in ("-o", "--objective", "--engine", "--start", "-y",
+                              "--yes", "--no-start", "-d", "--deliver")
+                        for a in argv):
+        # e.g. absoloop --zcomb -C ./proj --port 3141
+        return zcomb_mod.zcomb_command(argv)
+
+    if argv and argv[0] in ("approve", "reject"):
+        return gate_command(argv[0], argv[1:])
+    if argv and argv[0] == "status":
+        return status_command(argv[1:])
+    if argv and argv[0] == "watch":
+        return watch_command(argv[1:])
+    if argv and argv[0] == "report":
+        return report_command(argv[1:])
+    if argv and argv[0] == "goal":
+        return goal_command(argv[1:])
+    if argv and argv[0] == "resume":
+        harness = _load_harness()
+        outcome = harness.harness_resume_command(argv[1:])
+        if outcome is not None:
+            return outcome
+        return resume_command(argv[1:])
+    if argv and argv[0] in ("setup", "wizard", "onboard", "getting-started"):
+        outcome = _run_setup(argv[1:])
+        if isinstance(outcome, tuple):
+            code, result = outcome
+            yes = "-y" in argv[1:] or "--yes" in argv[1:]
+            if not yes and result.completed and result.providers_ready:
+                _ensure_harness_path()
+                from absoloop_harness import setup_wizard as setup_ux
+                objective = setup_ux.offer_first_mission(False, result)
+                if objective:
+                    return main([objective] + (["--zcomb"] if want_zcomb else []))
+            return code
+        return outcome
+    if argv and argv[0] in ("doctor", "providers", "run", "build", "review",
+                            "cancel", "inspect", "apply", "config"):
+        return _load_harness().dispatch(argv[0], argv[1:])
+    if argv and argv[0] in ("shortcuts", "shortcut", "do"):
+        _ensure_harness_path()
+        from absoloop_harness import shortcuts as sc
+        if argv[0] == "do":
+            return sc.do_command(argv[1:])
+        return sc.shortcuts_command(argv[1:])
+    if argv and argv[0] in ("schedule", "schedules"):
+        _ensure_harness_path()
+        from absoloop_harness import schedule as sched
+        return sched.schedule_command(argv[1:])
+
+    parser = BannerParser(
+        prog="absoloop",
+        description="Absoloop — bounded AI repair loops. Briefing, then launch.",
+        epilog=EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "mission", nargs="?",
+        help="project name, '.', or a quoted objective "
+             "(e.g. absoloop \"Make all tests pass\")")
+    parser.add_argument("-o", "--objective", help="mission objective (one sentence)")
+    parser.add_argument("-d", "--deliver", choices=sorted(DELIVERY_MODES),
+                        help="where accepted work lands (default: local)")
+    parser.add_argument("--engine", choices=list(ENGINES),
+                        help="engine for the loop")
+    parser.add_argument("--model", default=None,
+                        help="model id/alias for the engine "
+                             "(default: best available for that engine)")
+    parser.add_argument("--start", action="store_true",
+                        help="launch after scaffolding (default on TTY after review)")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="skip the interactive briefing review and launch")
+    parser.add_argument("--no-start", action="store_true",
+                        help="scaffold only; do not launch the loop")
+    parser.add_argument(
+        "--zcomb", action="store_true",
+        help="same briefing/launch as absoloop, then open ZComb Kanban "
+             "(Node.js 18+; dashboard-only: absoloop zcomb)")
+    args = parser.parse_args(argv)
+    # Flag may arrive via argparse (after extract) only if someone passes it
+    # again; prefer the early extract.
+    want_zcomb = want_zcomb or bool(getattr(args, "zcomb", False))
+
+    # Full infinity + wordmark — compact one-liner is too small on briefing /
+    # --zcomb entry. Setup wizard keeps the compact mark.
+    print_banner(compact=False)
+    ux = _load_briefing()
+
+    # First-time TTY users with no objective → offer the setup wizard.
+    _ensure_harness_path()
+    from absoloop_harness import setup_wizard as setup_ux
+    bare = not (args.mission or args.objective)
+    if bare and setup_ux.should_offer_first_run() and not args.yes:
+        gate = setup_ux.first_run_gate()
+        if gate == "quit":
+            return 0
+        if gate == "setup":
+            outcome = _run_setup([])
+            if isinstance(outcome, tuple):
+                code, result = outcome
+                objective = setup_ux.offer_first_mission(False, result)
+                if objective:
+                    args.objective = objective
+                else:
+                    return code
+            else:
+                return outcome
+
+    runner_template = TEMPLATES / "absoloop-run"
+    if not runner_template.is_file():
+        print(f"error: missing template {runner_template}", file=sys.stderr)
+        return 1
+
+    available = tuple(e for e in ENGINES if shutil.which(e))
+    print(ux.opening_line(available))
+    print()
+
+    # --- parse positional: name vs free-text objective -----------------------
+    positional = (args.mission or "").strip()
+    objective = (args.objective or "").strip()
+    name = ""
+    if positional:
+        if ux.looks_like_objective(positional) and not objective:
+            objective = positional
+        else:
+            name = positional
+
+    # Peek at an existing runtime for defaults when adopting a named path.
+    peek_target = _resolve_target(name or ".")
+    existing_objective = ""
+    existing_delivery = ""
+    if (peek_target / ".absoloop" / "runtime.json").is_file():
+        try:
+            peek = json.loads(
+                (peek_target / ".absoloop" / "runtime.json").read_text(encoding="utf-8"))
+            existing_objective = str(peek.get("objective", "")).strip()
+            existing_delivery = str((peek.get("delivery") or {}).get("mode", ""))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    objective = objective or existing_objective
+    delivery = args.deliver or existing_delivery or "local"
+    if delivery not in DELIVERY_MODES:
+        delivery = "local"
+    engine = args.engine or (available[0] if available else ENGINES[0])
+
+    _ensure_harness_path()
+    from absoloop_harness.models import resolve_model
+    model = resolve_model(engine, args.model or "")
+
+    # Default project: adopt cwd (fewest steps). Rename from the briefing card.
+    if not name:
+        name = "." if not objective else (
+            "." if peek_target.is_dir() else ux.slug_from_objective(objective))
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
+    # Only ask for the one thing we cannot invent: the objective.
+    if not objective:
+        if not interactive:
+            print("error: pass -o/--objective or a quoted mission string.",
+                  file=sys.stderr)
             return 1
-        return start_loop(target, engine)
+        print(ux.tint("bold", "What's the mission?"))
+        print(ux.tint("dim", "  one sentence — what should be true when we stop?"))
+        objective = ux.ask("  objective")
+        while not objective:
+            objective = ux.ask("  objective (required)")
 
-    if engine and shutil.which(engine) and sys.stdin.isatty():
-        if ask(f"\nMission ready. Start the loop now with '{engine}'? [Y/n] ").lower() in ("", "y", "yes"):
-            return start_loop(target, engine)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) and name != "." \
+            and not pathlib.Path(name).expanduser().is_dir():
+        print("error: project name must be letters/numbers/._- or '.'",
+              file=sys.stderr)
+        return 1
 
-    run_cmd = "python scripts/absoloop-run" if os.name == "nt" else "./scripts/absoloop-run"
-    steps = [] if target == pathlib.Path.cwd().resolve() else [f"cd {os.path.relpath(target)}"]
-    steps.append(f"{run_cmd} --engine {engine or 'claude'}")
-    print("\nMission ready. Next:\n  " + "\n  ".join(steps))
-    return 0
+    target = _resolve_target(name)
+    if target.exists() and not target.is_dir():
+        print(f"error: {target} exists and is not a directory.", file=sys.stderr)
+        return 1
+
+    brief = ux.Briefing(
+        target=str(target),
+        # Keep '.' as '.' so post-review path resolution adopts cwd —
+        # never rewrites to cwd/<basename>.
+        target_name=name or ".",
+        adopting=target.is_dir(),
+        objective=objective,
+        delivery=delivery,
+        engine=engine,
+        model=model,
+        kinds=classify_mission(objective) or ["general"],
+        engines_available=available,
+    )
+
+    def preview_goal(b) -> None:
+        from_text = generate_goal_markdown(
+            runtime_config(b.objective, "preview", b.delivery, model=b.model))
+        print()
+        print(ux.tint("dim", "  ── /goal preview ──"))
+        for line in from_text.splitlines()[:40]:
+            print("  " + line)
+        if from_text.count("\n") > 40:
+            print(ux.tint("dim", "  …"))
+        print()
+
+    if interactive and not args.yes and not args.no_start:
+        confirmed = ux.review_loop(
+            brief,
+            engines=ENGINES,
+            engine_labels=_engine_labels(),
+            deliveries=("local", "git", "out"),
+            classify=classify_mission,
+            preview_goal=preview_goal,
+        )
+        if confirmed is None:
+            return 1
+        brief = confirmed
+    else:
+        print(ux.render_card(brief))
+
+    # Resolve project path from the (possibly renamed) briefing.
+    if brief.target_name in (".",):
+        target = pathlib.Path.cwd().resolve()
+    else:
+        target = _resolve_target(brief.target_name)
+    brief = __import__("dataclasses").replace(
+        brief, target=str(target), adopting=target.is_dir())
+
+    if target.exists() and not target.is_dir():
+        print(f"error: {target} exists and is not a directory.", file=sys.stderr)
+        return 1
+
+    model = resolve_model(brief.engine, brief.model)
+    brief = __import__("dataclasses").replace(brief, model=model)
+    _config, goal_path = scaffold_mission(
+        target, brief.objective, brief.delivery, model=brief.model)
+    ux.celebrate_scaffold(brief, str(goal_path.relative_to(target)))
+
+    launch = not args.no_start
+    if not launch:
+        run_cmd = ("python scripts/absoloop-run" if os.name == "nt"
+                   else "./scripts/absoloop-run")
+        steps = ([] if target == pathlib.Path.cwd().resolve()
+                 else [f"cd {os.path.relpath(target)}"])
+        model_flag = f" --model {brief.model}" if brief.model else ""
+        steps.append(f"{run_cmd} --engine {brief.engine}{model_flag}")
+        print("\n" + ux.tint("dim", "  Scaffold ready. Launch when you are:"))
+        print("  " + "\n  ".join(steps))
+        return 0
+
+    if brief.engine not in available:
+        print(f"error: engine '{brief.engine}' not on PATH — "
+              f"install it or re-run and pick another (e).", file=sys.stderr)
+        return 1
+    if want_zcomb:
+        if zcomb_mod is None:
+            _ensure_harness_path()
+            from absoloop_harness import zcomb as zcomb_mod
+        zcomb_mod.spawn_background(target)
+    return start_loop(target, brief.engine, brief.model)
 
 
 if __name__ == "__main__":

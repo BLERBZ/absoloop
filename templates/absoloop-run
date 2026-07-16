@@ -32,11 +32,47 @@ LIVE_PATH = TMP / "live.jsonl"
 # 'absoloop' seeds the loopers-toolbox into each engine's native project-skill
 # discovery path (both CLIs scan theirs at session startup); the builder
 # creates/enhances further skills there via skill-creator.
-ENGINE_SKILL_DIRS = {"claude": ".claude/skills", "codex": ".codex/skills"}
+ENGINE_SKILL_DIRS = {
+    "claude": ".claude/skills",
+    "codex": ".codex/skills",
+    "grok": ".grok/skills",
+}
+
+# Two-layer teams: Absoloop spawns the engine CLI; the engine fans out with
+# native subagents / Agent Teams when the task warrants it.
+_DELEGATION_POSTURE = {
+    "claude": (
+        "## Native delegation (Claude Agent Teams)\n"
+        "Agent Teams are enabled for this session. When the task fans out across "
+        "independent workstreams (research, implement, test, review), spawn "
+        "teammates in parallel rather than doing every step serially. Keep the "
+        "lead focused on coordination and synthesis; give each teammate a clear "
+        "owned slice. Do not spawn teams for trivial single-file edits."
+    ),
+    "codex": (
+        "## Native delegation (Codex subagents)\n"
+        "When the task fans out across independent workstreams, spawn subagents "
+        "in parallel (e.g. explore vs implement vs test) rather than serial tool "
+        "loops. Ask for parallel agents explicitly when useful. Do not spawn "
+        "subagents for trivial single-file edits."
+    ),
+    "grok": (
+        "## Native delegation (Grok subagents)\n"
+        "When the task fans out across independent workstreams, use "
+        "`spawn_subagent` in parallel (research / build / review) rather than "
+        "serial tool loops. Prefer worktree isolation when subagents would "
+        "conflict on the same files. Do not spawn subagents for trivial "
+        "single-file edits."
+    ),
+}
 
 
 def skills_root(engine: str) -> pathlib.Path:
     return ROOT / ENGINE_SKILL_DIRS.get(engine, ".claude/skills")
+
+
+def delegation_posture(engine: str) -> str:
+    return _DELEGATION_POSTURE.get(engine, "")
 
 # Thinking escalation: as the same failure repeats, both engines are pushed to
 # spend more reasoning depth instead of re-trying the same shallow fix.
@@ -529,6 +565,32 @@ def claude_stream_events(line: str) -> list[tuple[str, str]]:
     return []
 
 
+def grok_stream_events(line: str) -> list[tuple[str, str]]:
+    """(kind, detail) narration for one grok streaming-json line."""
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(event, dict):
+        return []
+    etype = str(event.get("type", ""))
+    if etype == "text":
+        text = " ".join(str(event.get("data", "")).split())
+        return [("say", text)] if text else []
+    if etype == "thought":
+        text = " ".join(str(event.get("data", "")).split())
+        return [("think", text)] if text else []
+    if etype == "error":
+        return [("say", str(event.get("message", "error"))[:200])]
+    if etype == "end":
+        return [("start", "run completed")]
+    # Preserve unknown types (incl. subagent markers) for watch/live.jsonl.
+    if etype and etype not in ("heartbeat",):
+        preview = json.dumps(event, sort_keys=True)[:160]
+        return [("tool", f"{etype}: {preview}")]
+    return []
+
+
 def codex_stream_events(line: str) -> list[tuple[str, str]]:
     """(kind, detail) narration for one codex --json event line."""
     try:
@@ -735,6 +797,12 @@ def build_iteration_prompt(
             f"({rung.get('claude_thinking_tokens', '?')} thinking tokens, escalated "
             f"from {state.repeated_failure_count} repeated failure(s))."
         )
+    elif engine == "grok":
+        thinking_block = (
+            f"Reasoning posture for this iteration (budget scale "
+            f"×{float(rung.get('budget_scale', 1.0)):g}, escalated from "
+            f"{state.repeated_failure_count} repeated failure(s)): {posture}"
+        )
     else:
         thinking_block = (
             f"Reasoning posture for this iteration ({rung['codex_effort']} effort, "
@@ -742,10 +810,13 @@ def build_iteration_prompt(
             f"{posture}"
         )
 
+    native_block = delegation_posture(engine)
+    native_section = f"\n{native_block}\n" if native_block else ""
+
     return f"""# ABSOLOOP bounded repair iteration
 
 {thinking_block}
-
+{native_section}
 ## Mission goal contract (ground truth — overrides any other narrative)
 
 {load_goal(runtime).strip()}
@@ -788,7 +859,8 @@ delivery is handled by the loop after acceptance, per the goal contract.
 def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
                json_schema: dict[str, Any] | None = None,
                label: str = "claude agent",
-               extra_env: dict[str, str] | None = None) -> AgentRun:
+               extra_env: dict[str, str] | None = None,
+               model: str = "") -> AgentRun:
     schema = json.dumps(json_schema) if json_schema else RESULT_SCHEMA.read_text(encoding="utf-8")
     command = [
         # shutil.which resolves claude.cmd/.exe on Windows (PATHEXT), where a
@@ -803,10 +875,13 @@ def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
         # still delivering the same final result payload as a terminal event.
         "--output-format", "stream-json",
         "--verbose",
-        prompt,
     ]
+    if model:
+        command += ["--model", model]
+    command.append(prompt)
     say(f"{label}: starting (limits: {cfg['max_turns']} turns, "
-        f"${cfg['max_budget_usd']}, {cfg.get('max_wall_seconds', 600)}s wall)")
+        f"${cfg['max_budget_usd']}, {cfg.get('max_wall_seconds', 600)}s wall"
+        + (f", model={model}" if model else "") + ")")
     started = time.time()
     result_event: dict[str, Any] = {}
 
@@ -939,7 +1014,8 @@ def codex_usage_to_usd(totals: dict[str, int] | None,
 
 def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None,
               out_path: pathlib.Path, schema_path: pathlib.Path,
-              label: str = "codex agent") -> AgentRun:
+              label: str = "codex agent",
+              model: str = "") -> AgentRun:
     # codex exec is non-interactive and never prompts; the sandbox policy is
     # the enforcement boundary for scripted runs. Codex has no per-run dollar
     # cap flag, so max_budget_usd is the accounting reserve when parsing fails.
@@ -951,11 +1027,14 @@ def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None
         "--json",
         "-o", str(out_path),
     ]
+    if model:
+        command += ["--model", model]
     if effort:
         command += ["-c", f"model_reasoning_effort={effort}"]
     command.append(prompt)
     say(f"{label}: starting (limits: sandbox={cfg['sandbox']}, "
         f"{cfg.get('max_wall_seconds', 600)}s wall"
+        + (f", model={model}" if model else "")
         + (f", reasoning={effort}" if effort else "") + ")")
     started = time.time()
     events_path = out_path.with_suffix(".events.jsonl")
@@ -1009,7 +1088,184 @@ def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None
     return run
 
 
-def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict[str, Any] | None, AgentRun]:
+def grok_permission_flags(profile: str) -> list[str]:
+    """Map Absoloop permission profiles to Grok Build CLI flags (fail closed)."""
+    if profile == "read":
+        return ["--tools", "read_file,grep,list_dir,glob"]
+    if profile == "edit":
+        return ["--allow", "Edit", "--allow", "Write", "--allow", "Read",
+                "--allow", "Grep", "--allow", "Bash",
+                "--deny", "Bash(sudo*)", "--deny", "Bash(rm -rf /*)"]
+    if profile == "full":
+        return ["--yolo"]
+    return grok_permission_flags("edit")
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    """Best-effort: last JSON object in a blob (Grok has no --json-schema)."""
+    decoder = json.JSONDecoder()
+    last: dict[str, Any] | None = None
+    index = 0
+    while index < len(text):
+        start = text.find("{", index)
+        if start < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            index = start + 1
+            continue
+        if isinstance(value, dict):
+            last = value
+        index = end
+    return last
+
+
+def run_grok(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
+             schema: dict[str, Any] | None = None,
+             label: str = "grok agent",
+             model: str = "") -> AgentRun:
+    """Spawn Grok Build headless (streaming-json + --prompt-file)."""
+    profile = str(cfg.get("permission_profile") or "edit")
+    schema = schema or json.loads(RESULT_SCHEMA.read_text(encoding="utf-8"))
+    schema_path = out_path.with_suffix(".schema.json")
+    schema_path.write_text(json.dumps(schema, indent=2) + "\n", encoding="utf-8")
+    result_instruction = (
+        f"\n\n## Absoloop structured result (required)\n"
+        f"When finished, write a single JSON object that validates against the "
+        f"schema at `{schema_path}` to `{out_path}`. The JSON must be the only "
+        f"contents of that file. Also print the same JSON object as your final "
+        f"message so the loop can recover it if the file write fails.\n"
+    )
+    prompt_path = out_path.with_suffix(".prompt.md")
+    prompt_path.write_text(prompt.rstrip() + result_instruction, encoding="utf-8")
+    command = [
+        shutil.which("grok") or "grok",
+        "--prompt-file", str(prompt_path),
+        "--output-format", "streaming-json",
+        "--cwd", str(ROOT),
+        "--no-auto-update",
+    ]
+    if model:
+        command += ["-m", model]
+    max_turns = cfg.get("max_turns")
+    if isinstance(max_turns, int) and max_turns > 0:
+        command += ["--max-turns", str(max_turns)]
+    command += grok_permission_flags(profile)
+    say(f"{label}: starting (limits: profile={profile}, "
+        f"{cfg.get('max_wall_seconds', 600)}s wall"
+        + (f", model={model}" if model else "")
+        + (f", {max_turns} turns" if isinstance(max_turns, int) else "") + ")")
+    started = time.time()
+    stream_path = out_path.with_suffix(".stream.jsonl")
+    text_chunks: list[str] = []
+    usage: dict[str, Any] = {}
+    cost_box: list[float | None] = [None]
+
+    def on_line(line: str) -> None:
+        narrate(label, grok_stream_events(line))
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(event, dict):
+            return
+        if event.get("type") == "text":
+            text_chunks.append(str(event.get("data", "")))
+        elif event.get("type") == "end":
+            if isinstance(event.get("usage"), dict):
+                usage.update(event["usage"])
+            cost = event.get("total_cost_usd")
+            if isinstance(cost, (int, float)):
+                cost_box[0] = float(cost)
+            elif isinstance(usage.get("cost_usd"), (int, float)):
+                cost_box[0] = float(usage["cost_usd"])
+
+    with heartbeat(label):
+        exit_code, timed_out, stdout, stderr = stream_process(
+            command, float(cfg.get("max_wall_seconds", 600)), on_line)
+    stream_path.write_text(stdout, encoding="utf-8")
+    end_cost = cost_box[0]
+    if timed_out:
+        out_path.with_suffix(".stderr.log").write_text(
+            stderr + "\nAGENT_WALL_TIMEOUT\n", encoding="utf-8")
+        run = AgentRun(124, float(cfg["max_budget_usd"]), False, "wall_timeout", out_path)
+        say(f"{label}: KILLED at {cfg.get('max_wall_seconds', 600)}s wall-clock limit", "err")
+        append_ledger({"type": "agent_run", "engine": "grok", "exit_code": 124,
+                       "wall_seconds": time.time() - started, "cost_usd": run.cost_usd,
+                       "cost_is_exact": False, "limit_reached": "wall_timeout",
+                       "result": str(out_path.relative_to(ROOT))})
+        return run
+    out_path.with_suffix(".stderr.log").write_text(stderr, encoding="utf-8")
+
+    # Prefer a file the agent wrote; fall back to JSON embedded in streamed text.
+    structured: dict[str, Any] | None = None
+    if out_path.is_file():
+        try:
+            candidate = json.loads(out_path.read_text(encoding="utf-8"))
+            if isinstance(candidate, dict):
+                structured = candidate
+        except (OSError, json.JSONDecodeError):
+            structured = None
+    if structured is None:
+        structured = _extract_json_object("".join(text_chunks)) or _extract_json_object(stdout)
+        if structured is not None:
+            out_path.write_text(json.dumps(structured, indent=2) + "\n", encoding="utf-8")
+    if structured is None:
+        out_path.write_text(json.dumps({
+            "done": False,
+            "summary": "grok produced no schema-valid JSON result",
+            "changed_artifacts": [],
+            "commands_run": [],
+            "evidence": [],
+            "risks": ["unreadable structured result"],
+        }, indent=2) + "\n", encoding="utf-8")
+        say(f"{label}: stream ended without schema-valid JSON — treating as unfinished",
+            "warn")
+
+    tokens = None
+    if usage:
+        counted = [int(usage[key]) for key in
+                   ("input_tokens", "output_tokens", "total_tokens")
+                   if isinstance(usage.get(key), (int, float))]
+        if counted:
+            tokens = sum(counted) if "total_tokens" not in usage else int(usage["total_tokens"])
+
+    cost_is_exact = isinstance(end_cost, float)
+    run = AgentRun(
+        exit_code=exit_code,
+        cost_usd=float(end_cost) if cost_is_exact else float(cfg["max_budget_usd"]),
+        cost_is_exact=cost_is_exact,
+        limit_reached=None,
+        output_path=out_path,
+        tokens=tokens,
+    )
+    say(f"{label}: {'finished' if run.exit_code == 0 else 'FAILED'} in "
+        f"{time.time() - started:.0f}s, cost ${run.cost_usd:.2f}"
+        + (f" ({fmt_tokens(run.tokens)})" if fmt_tokens(run.tokens) else "")
+        + f"{'' if run.cost_is_exact else ' (estimated)'}",
+        "ok" if run.exit_code == 0 else "err")
+    append_ledger({
+        "type": "agent_run",
+        "engine": "grok",
+        "exit_code": run.exit_code,
+        "wall_seconds": time.time() - started,
+        "cost_usd": run.cost_usd,
+        "cost_is_exact": run.cost_is_exact,
+        "tokens": run.tokens,
+        "result": str(out_path.relative_to(ROOT)),
+        "events": str(stream_path.relative_to(ROOT)),
+    })
+    return run
+
+
+def mission_model(runtime: dict[str, Any], override: str = "") -> str:
+    """Model id/alias for this mission — CLI override wins, else runtime.json."""
+    return (override or str(runtime.get("model") or "")).strip()
+
+
+def run_critic(engine: str, runtime: dict[str, Any], state: State,
+               model: str = "") -> tuple[dict[str, Any] | None, AgentRun]:
     """Independent read-only review. The critic sees the contract, never the
     builder's narrative — it must gather its own evidence from the tree."""
     prompt_path = ROOT / runtime["critic_prompt_path"]
@@ -1034,17 +1290,24 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
     verdict: dict[str, Any] | None = None
     if engine == "claude":
         run = run_claude(prompt, runtime["claude"]["critic"], out_path,
-                         json_schema=CRITIC_SCHEMA, label="critic")
+                         json_schema=CRITIC_SCHEMA, label="critic", model=model)
         try:
             payload = json.loads(out_path.read_text(encoding="utf-8"))
             candidate = payload.get("structured_output") if isinstance(payload, dict) else None
+        except (OSError, json.JSONDecodeError):
+            candidate = None
+    elif engine == "grok":
+        run = run_grok(prompt, runtime["grok"]["critic"], out_path,
+                       schema=CRITIC_SCHEMA, label="critic", model=model)
+        try:
+            candidate = json.loads(out_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             candidate = None
     else:
         schema_path = TMP / "critic-schema.json"
         atomic_write_json(schema_path, CRITIC_SCHEMA)
         run = run_codex(prompt, runtime["codex"]["critic"], runtime["codex"].get("pricing"),
-                        out_path, schema_path, label="critic")
+                        out_path, schema_path, label="critic", model=model)
         try:
             candidate = json.loads(out_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1068,7 +1331,8 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
 
 
 def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
-                     check_timeout: int) -> tuple[str, str] | None:
+                     check_timeout: int,
+                     model: str = "") -> tuple[str, str] | None:
     """Layered acceptance: optional integrity check, independent critic, then
     the human gate. Returns (stop_reason, terminal_status) when the mission
     should stop, or None when the repair loop should continue."""
@@ -1087,7 +1351,7 @@ def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
             # Weakened tests or edited checks are an automatic failure (14.3).
             return "integrity_violation", "REJECTED"
 
-    verdict, run = run_critic(engine, runtime, state)
+    verdict, run = run_critic(engine, runtime, state, model=model)
     state.cost_usd += run.cost_usd
     state.tokens_total += run.tokens or 0
     if not run.cost_is_exact:
@@ -1149,32 +1413,69 @@ def git_changed_files() -> list[str]:
 
 
 def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
-    """Human-readable mission report, regenerated at every stop so it always
-    reflects the latest state. 'absoloop report' renders the same story live."""
+    """Human-readable mission report Markdown, regenerated at every stop.
+
+    Structure matches the infographic document that `absoloop report` regenerates
+    and opens in the lite HTML viewer. The runner stays stdlib-standalone, so
+    this writes Markdown only; the CLI adds the viewer on demand.
+    """
     report_path = ABS / "report.md"
     changed = [p for p in git_changed_files() if not p.startswith(".absoloop/")]
     delivery = runtime.get("delivery") or {"mode": "local"}
+    mode = delivery.get("mode", "local")
+    if mode == "git":
+        delivery_detail = delivery.get("branch") or "absoloop/<loop>"
+    elif mode == "out":
+        delivery_detail = str(delivery.get("out_dir") or "~/absoloop/out/<loop>")
+    else:
+        delivery_detail = "working tree (unstaged)"
+    tokens_note = fmt_tokens(state.tokens_total)
+    gen = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+    max_iter = runtime.get("max_iterations", "?")
+    max_cost = float(runtime.get("max_cost_usd", 0))
     lines = [
-        f"# ABSOLOOP report — {state.mission_id} ({runtime.get('loop_id', 'no loop id')})",
+        "# Absoloop Report",
         "",
-        f"- objective: {runtime.get('objective', '')}",
-        f"- status: **{state.status}**"
-        + (f" (stop reason: {state.stop_reason})" if state.stop_reason else ""),
-        f"- iterations: {state.iteration} of {runtime.get('max_iterations', '?')}",
-        f"- total cost: ${state.cost_usd:.2f} of "
-        f"${float(runtime.get('max_cost_usd', 0)):.2f}"
-        + (f" ({fmt_tokens(state.tokens_total)})" if fmt_tokens(state.tokens_total) else ""),
-        f"- delivery mode: {delivery.get('mode', 'local')}",
+        f"**{state.status}** · `{state.mission_id}` · loop `{runtime.get('loop_id', '—')}`",
         "",
-        "## Changed files (uncommitted, excluding .absoloop/)",
+        f"> Generated {gen}",
+        "",
+        "---",
+        "",
+        "## Mission",
+        "",
+        (runtime.get("objective") or "_(no objective recorded)_").strip(),
+        "",
+        "| | |",
+        "|---|---|",
+        f"| **Engine** | `{runtime.get('engine') or runtime.get('builder') or '—'}` |",
+        f"| **Delivery** | `{mode}` → {delivery_detail} |",
+        f"| **Status** | **{state.status}**"
+        + (f" ({state.stop_reason})" if state.stop_reason else "")
+        + " |",
+        "",
+        "---",
+        "",
+        "## At a glance",
+        "",
+        "| Metric | Used | Budget |",
+        "|---|---:|---:|",
+        f"| Iterations | {state.iteration} | {max_iter} |",
+        f"| Spend | ${state.cost_usd:.2f}"
+        + (f" ({tokens_note})" if tokens_note else "")
+        + f" | ${max_cost:.2f} |",
+        "",
+        "---",
+        "",
+        "## Run arc",
         "",
     ]
-    lines += [f"- `{path}`" for path in changed] or ["- (none detected)"]
-    lines += ["", "## Iteration timeline", ""]
     try:
         ledger_lines = LEDGER_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         ledger_lines = []
+    if not ledger_lines:
+        lines.append("_No ledger events yet — the loop has not run._")
     for raw in ledger_lines:
         try:
             event = json.loads(raw)
@@ -1183,30 +1484,57 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(event.get("ts", 0)))
         kind = event.get("type")
         if kind == "iteration":
-            outcome = "builder reports DONE" if event.get("done") else "not done yet"
-            lines.append(f"- {ts} — iteration {event.get('iteration')}: {outcome}")
+            outcome = "Builder reports DONE" if event.get("done") else "Still in progress"
+            lines.append(f"- **{ts}** · **Iteration {event.get('iteration')}** — {outcome}")
         elif kind == "early_done_claim":
-            lines.append(f"- {ts} — done claim at iteration {event.get('iteration')} "
-                         f"not accepted (floor: {event.get('min_iterations')})")
+            lines.append(f"- **{ts}** · **Early done claim held** — iteration "
+                         f"{event.get('iteration')} below floor ({event.get('min_iterations')})")
         elif kind == "agent_run":
-            tokens_note = fmt_tokens(event.get("tokens"))
-            lines.append(f"- {ts} — {event.get('engine')} run: exit {event.get('exit_code')}, "
-                         f"${float(event.get('cost_usd', 0)):.2f}"
-                         + (f" ({tokens_note})" if tokens_note else "")
-                         + f", {float(event.get('wall_seconds', 0)):.0f}s")
+            tok = fmt_tokens(event.get("tokens"))
+            lines.append(
+                f"- **{ts}** · **{event.get('engine')} run** — exit {event.get('exit_code')}, "
+                f"${float(event.get('cost_usd', 0)):.2f}"
+                + (f" ({tok})" if tok else "")
+                + f", {float(event.get('wall_seconds', 0)):.0f}s"
+            )
+        elif kind == "integrity_check":
+            mark = "Passed" if event.get("exit_code") == 0 else "Violation"
+            lines.append(f"- **{ts}** · **Integrity check** — {mark}")
         elif kind == "human_gate":
-            lines.append(f"- {ts} — human gate: {event.get('decision')}")
+            note = event.get("feedback") or event.get("note") or ""
+            lines.append(f"- **{ts}** · **Human gate · {event.get('decision')}**"
+                         + (f" — {note}" if note else ""))
         elif kind == "delivery":
-            lines.append(f"- {ts} — delivered ({event.get('mode')}): {event.get('detail', '')}")
+            lines.append(f"- **{ts}** · **Delivered ({event.get('mode')})** — "
+                         f"{event.get('detail', '')}")
         elif kind == "mission_stop":
-            lines.append(f"- {ts} — stop: {event.get('status')} ({event.get('reason')})")
-    lines += ["", "## Pointers", ""]
-    for key, label in (("latest_agent_result", "latest agent result"),
-                       ("latest_critic_findings", "latest critic findings")):
+            lines.append(f"- **{ts}** · **Stop · {event.get('status')}** — "
+                         f"{event.get('reason')}")
+        elif kind == "extension":
+            note = event.get("note") or ""
+            lines.append(f"- **{ts}** · **Mission extended** — "
+                         f"{event.get('previous_loop_id')} → {event.get('loop_id')}"
+                         + (f" — {note}" if note else ""))
+    lines += ["", "---", "", "## Changed files", ""]
+    lines += [f"- `{path}`" for path in changed] or ["_None detected (or clean tree)._"]
+    lines += ["", "---", "", "## Pointers", ""]
+    pointers = False
+    for key, label in (("latest_agent_result", "Latest agent result"),
+                       ("latest_critic_findings", "Latest critic findings")):
         value = getattr(state, key)
         if value:
             lines.append(f"- {label}: `{value}`")
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            pointers = True
+    if not pointers:
+        lines.append("_No saved agent/critic artifacts yet._")
+    lines += [
+        "",
+        "---",
+        "",
+        f"_Absoloop · `{state.mission_id}` — open with `absoloop report` for the lite viewer_",
+        "",
+    ]
+    report_path.write_text("\n".join(lines), encoding="utf-8")
     return report_path
 
 
@@ -1281,6 +1609,24 @@ def deliver_results(runtime: dict[str, Any], state: State) -> bool:
     return False
 
 
+def chime_mission(status: str, mission_id: str = "", detail: str = "") -> None:
+    """Out-of-CLI chime + banner when the loop needs attention. Never raises."""
+    home = os.environ.get("ABSOLOOP_HOME", "")
+    if home and home not in sys.path:
+        sys.path.insert(0, home)
+    try:
+        from absoloop_harness.notify import notify_mission
+        notify_mission(status, mission_id=mission_id, detail=detail or None)
+    except Exception:
+        if status in ("AWAITING_APPROVAL", "COMPLETED", "BLOCKED", "REJECTED",
+                      "BUDGET_EXHAUSTED"):
+            try:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+
 def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int:
     state.stop_reason = reason
     state.status = status
@@ -1297,6 +1643,8 @@ def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int
         deliver_results(runtime, state)
     report_path = write_report(runtime, state)
     say(f"report: {report_path.relative_to(ROOT)} (or run 'absoloop report')")
+    chime_mission(status, mission_id=state.mission_id,
+                  detail=f"{reason} · {state.iteration} iteration(s)")
     if status == "COMPLETED":
         checkpoint(state, "terminal")  # persist any delivery bookkeeping
         return 0
@@ -1311,7 +1659,9 @@ def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--engine", choices=["claude", "codex"])
+    parser.add_argument("--engine", choices=["claude", "codex", "grok"])
+    parser.add_argument("--model", default="",
+                        help="model id/alias (overrides runtime.json model)")
     parser.add_argument("--deliver-only", action="store_true",
                         help="skip the loop: apply the mission's delivery mode to the "
                              "current results and regenerate the report (used by "
@@ -1319,6 +1669,7 @@ def main() -> int:
     args = parser.parse_args()
 
     runtime = load_json(RUNTIME_PATH)
+    model = mission_model(runtime, args.model)
     TMP.mkdir(parents=True, exist_ok=True)
 
     # Keep the live activity feed bounded: trim to its most recent tail when a
@@ -1361,10 +1712,13 @@ def main() -> int:
     check_timeout = min(900, int(max_wall))
 
     say(f"mission {state.mission_id}: {runtime['objective']}", "bold")
-    say(f"budgets: {runtime['max_iterations']} iterations, ${runtime['max_cost_usd']:.2f}, "
-        f"{int(max_wall)}s wall clock")
+    say(f"engine {args.engine}"
+        + (f" · model {model}" if model else "")
+        + f" · budgets: {runtime['max_iterations']} iterations, "
+        f"${runtime['max_cost_usd']:.2f}, {int(max_wall)}s wall clock")
     MONITOR.update(mission_id=state.mission_id, loop_id=runtime.get("loop_id"),
                    objective=runtime.get("objective"), engine=args.engine,
+                   model=model or None,
                    status="RUNNING", phase="starting",
                    iteration=state.iteration,
                    max_iterations=int(runtime["max_iterations"]),
@@ -1421,8 +1775,12 @@ def main() -> int:
         rung = thinking_rung(runtime, state)
         scale = float(rung.get("budget_scale", 1.0))
         scale = scale if scale >= 1.0 else 1.0
-        thinking_level = (rung["claude_keyword"] if args.engine == "claude"
-                          else rung["codex_effort"])
+        if args.engine == "claude":
+            thinking_level = rung["claude_keyword"]
+        elif args.engine == "grok":
+            thinking_level = f"budget×{scale:g}"
+        else:
+            thinking_level = rung["codex_effort"]
         say(f"thinking level: {thinking_level} "
             f"(repeated failures: {state.repeated_failure_count}, "
             f"per-run budgets ×{scale:g})")
@@ -1444,13 +1802,19 @@ def main() -> int:
 
         result_path = TMP / f"iteration-{state.iteration:04d}-agent-result.json"
         if args.engine == "claude":
-            extra_env: dict[str, str] = {}
+            extra_env: dict[str, str] = {
+                # Two-layer teams: enable Claude Agent Teams inside the builder.
+                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+            }
             tokens = rung.get("claude_thinking_tokens")
             if isinstance(tokens, (int, float)) and tokens > 0:
                 # Real extended-thinking budget to match the prompt keyword.
                 extra_env["MAX_THINKING_TOKENS"] = str(int(tokens))
             run = run_claude(prompt, scaled(runtime["claude"]["builder"]), result_path,
-                             label="builder", extra_env=extra_env)
+                             label="builder", extra_env=extra_env, model=model)
+        elif args.engine == "grok":
+            run = run_grok(prompt, scaled(runtime["grok"]["builder"]), result_path,
+                           label="builder", model=model)
         else:
             builder_cfg = scaled(runtime["codex"]["builder"])
             configured = str(builder_cfg.get("model_reasoning_effort", "medium"))
@@ -1460,7 +1824,7 @@ def main() -> int:
                 builder_cfg["model_reasoning_effort"] = codex_effort
             run = run_codex(prompt, builder_cfg,
                             runtime["codex"].get("pricing"), result_path, RESULT_SCHEMA,
-                            label="builder")
+                            label="builder", model=model)
 
         state.cost_usd += run.cost_usd
         state.tokens_total += run.tokens or 0
@@ -1500,7 +1864,9 @@ def main() -> int:
 
         if builder_done:
             checkpoint(state, "builder-done")
-            verdict = final_acceptance(runtime, state, args.engine, check_timeout)
+            verdict = final_acceptance(runtime, state, args.engine, check_timeout,
+                                       model=model)
+
             if verdict is not None:
                 return stop(state, *verdict, runtime)
             checkpoint(state, "critic-hold")

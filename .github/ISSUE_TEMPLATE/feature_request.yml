@@ -1,0 +1,40 @@
+name: Feature request
+description: Propose an improvement to Absoloop
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What friction or gap does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: Concrete behavior, CLI shape, or UX sketch.
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Mission loop
+        - Harness / providers
+        - Observability (watch/report)
+        - Shortcuts
+        - Docs / contributor experience
+        - Other
+    validations:
+      required: true
+  - type: checkboxes
+    id: constraints
+    attributes:
+      label: Constraints you already considered
+      options:
+        - label: Keeps bin/ + runner stdlib-only (Python 3.9+)
+        - label: Does not weaken integrity → critic → human gate
+        - label: Preserves provider-native auth/tools/sessions
