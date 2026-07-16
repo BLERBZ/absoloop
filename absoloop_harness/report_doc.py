@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+import math
 import os
 import pathlib
 import re
@@ -909,7 +910,7 @@ body {
     radial-gradient(700px 400px at 50% 100%, rgba(255,145,20,0.08), transparent 55%),
     var(--bg0);
 }
-.wrap { max-width: 880px; margin: 0 auto; padding: 32px 20px 64px; }
+.wrap { max-width: 960px; margin: 0 auto; padding: 32px 20px 64px; }
 .hero {
   position: relative;
   overflow: hidden;
@@ -923,56 +924,85 @@ body {
   box-shadow: var(--shadow);
   margin-bottom: 22px;
 }
+.hero-top {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 20px; margin-bottom: 8px; flex-wrap: wrap;
+}
+@media (max-width: 520px) {
+  .hero-top { flex-direction: column-reverse; align-items: flex-start; }
+  .brand { align-items: flex-start; text-align: left; }
+  .brand-logo { height: 58px; }
+  .report-mark { letter-spacing: 0.32em; }
+}
+.report-mark {
+  font-size: clamp(1.35rem, 3.2vw, 1.85rem);
+  font-weight: 750; letter-spacing: 0.42em;
+  color: var(--ink);
+  line-height: 1.1;
+  padding-top: 6px;
+  text-indent: 0.08em;
+  background: linear-gradient(110deg, #e8eef6 0%, var(--accent) 45%, var(--ok) 100%);
+  -webkit-background-clip: text; background-clip: text;
+  color: transparent;
+  text-transform: uppercase;
+}
 .brand {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  display: flex; flex-direction: column; align-items: center;
+  gap: 8px; flex: 0 0 auto; text-align: center;
 }
 .brand-logo {
-  display: block; height: 44px; width: auto;
+  display: block; height: 72px; width: auto;
   flex: 0 0 auto;
+  filter: drop-shadow(0 8px 18px rgba(0,0,0,0.35));
 }
-.brand-copy {
-  display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
-  letter-spacing: 0.04em; font-size: 12px; color: var(--muted); font-weight: 600;
+.brand-name {
+  color: var(--ink); font-size: 1.15rem; letter-spacing: -0.01em;
+  font-weight: 750; line-height: 1;
 }
-.brand-copy strong {
-  color: var(--ink); font-size: 15px; letter-spacing: -0.01em;
-  font-weight: 750; text-transform: none;
-}
-.brand-copy span { text-transform: uppercase; letter-spacing: 0.1em; }
-.status-pill {
-  display: inline-flex; align-items: center; gap: 8px;
-  margin-top: 14px; padding: 8px 14px; border-radius: 999px;
-  font-weight: 700; font-size: 14px; letter-spacing: 0.02em;
-  border: 1px solid transparent;
-}
-.status-pill.ok { background: rgba(40,205,120,0.15); color: var(--ok); border-color: rgba(40,205,120,0.35); }
-.status-pill.warn { background: rgba(255,145,20,0.15); color: var(--warn); border-color: rgba(255,145,20,0.35); }
-.status-pill.err { background: rgba(255,25,95,0.15); color: var(--err); border-color: rgba(255,25,95,0.35); }
-.status-pill.accent { background: rgba(0,205,225,0.15); color: var(--accent); border-color: rgba(0,205,225,0.35); }
-.status-pill.dim { background: rgba(255,255,255,0.06); color: var(--muted); border-color: var(--line); }
 .hero h1 {
-  margin: 12px 0 8px; font-size: clamp(1.55rem, 3.5vw, 2.1rem);
-  font-weight: 750; letter-spacing: -0.02em; line-height: 1.2;
+  margin: 10px 0 8px; font-size: clamp(1.7rem, 4vw, 2.35rem);
+  font-weight: 750; letter-spacing: -0.02em; line-height: 1.15;
+  max-width: 16ch;
 }
 .meta { color: var(--muted); font-size: 13px; font-family: var(--mono); }
 .meta code { color: var(--ink); }
 .objective {
   margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line);
-  font-size: 1.05rem; max-width: 62ch;
+  font-size: 1.05rem; max-width: 68ch;
 }
+.metrics-block { margin-bottom: 22px; }
 .grid {
   display: grid; gap: 12px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-bottom: 22px;
+  margin-bottom: 12px;
 }
 @media (min-width: 720px) {
   .grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+.summary-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: 1fr;
+  margin-bottom: 12px;
+}
+@media (min-width: 720px) {
+  .summary-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+.viz-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: 1fr;
+  margin-bottom: 12px;
+}
+@media (min-width: 720px) {
+  .viz-grid { grid-template-columns: 1fr 1fr; }
 }
 .card {
   background: var(--card); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 16px 16px 14px;
   backdrop-filter: blur(6px);
+  position: relative;
 }
+.card.viz { padding: 18px 18px 16px; min-height: 0; }
+.card.summary { padding: 18px 18px 16px; }
 .card .label {
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
   color: var(--muted); font-weight: 650; margin-bottom: 6px;
@@ -982,6 +1012,42 @@ body {
   font-variant-numeric: tabular-nums;
 }
 .card .sub { margin-top: 4px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
+.card .lead {
+  font-size: 14px; font-weight: 650; color: #e7eef7; line-height: 1.4;
+  margin: 4px 0 10px;
+}
+.stat-row {
+  display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 10px;
+}
+.stat-pill {
+  font-size: 11px; font-family: var(--mono); font-weight: 650;
+  padding: 4px 8px; border-radius: 999px;
+  background: rgba(255,255,255,0.05); border: 1px solid var(--line);
+  color: #c9d7e8;
+}
+.stat-pill.ok { color: var(--ok); border-color: rgba(40,205,120,0.3); }
+.stat-pill.warn { color: var(--warn); border-color: rgba(255,145,20,0.3); }
+.stat-pill.err { color: var(--err); border-color: rgba(255,25,95,0.3); }
+.stat-pill.accent { color: var(--accent); border-color: rgba(0,205,225,0.3); }
+.pulse-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.pulse-list li {
+  font-size: 13px; color: #d5e0ec; line-height: 1.4;
+  padding-left: 14px; position: relative;
+}
+.pulse-list li::before {
+  content: ""; position: absolute; left: 0; top: 0.55em;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+}
+.pulse-list li.warn::before { background: var(--warn); }
+.pulse-list li.ok::before { background: var(--ok); }
+.pulse-list li.err::before { background: var(--err); }
+.pulse-list li.accent::before { background: var(--accent); }
+.pulse-list li.muted { color: var(--muted); font-style: italic; }
+.pulse-list li.muted::before { display: none; }
+.pulse-list li .tag {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  text-transform: uppercase; letter-spacing: 0.04em; margin-right: 6px;
+}
 .bar {
   margin-top: 10px; height: 7px; border-radius: 999px;
   background: rgba(255,255,255,0.06); overflow: hidden;
@@ -991,6 +1057,85 @@ body {
   background: linear-gradient(90deg, var(--accent), var(--ok) 55%, var(--gold));
 }
 .bar.warn > i { background: linear-gradient(90deg, var(--warn), var(--err)); }
+.donut-wrap {
+  display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+  margin-top: 8px;
+}
+.donut-svg { width: 148px; height: 148px; flex: 0 0 auto; }
+.donut-center-label {
+  font-size: 1.35rem; font-weight: 750; letter-spacing: -0.02em;
+  fill: var(--ink); font-family: var(--font);
+}
+.donut-center-sub {
+  font-size: 10px; fill: var(--muted); font-family: var(--mono);
+  letter-spacing: 0.06em; text-transform: uppercase;
+}
+.legend { display: grid; gap: 8px; flex: 1 1 140px; min-width: 120px; }
+.legend-row {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: #c9d7e8;
+}
+.legend-swatch {
+  width: 10px; height: 10px; border-radius: 3px; flex: 0 0 auto;
+}
+.legend-val {
+  margin-left: auto; font-family: var(--mono); color: var(--muted); font-size: 11px;
+}
+.heatmap {
+  display: grid; gap: 4px; margin-top: 10px;
+  grid-template-columns: 52px repeat(var(--hm-cols, 2), minmax(0, 1fr));
+}
+.heatmap .hm-corner, .heatmap .hm-col, .heatmap .hm-row {
+  font-size: 10px; color: var(--muted); font-family: var(--mono);
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.heatmap .hm-col { text-align: center; padding-bottom: 2px; }
+.heatmap .hm-row {
+  display: flex; align-items: center; justify-content: flex-end;
+  padding-right: 6px;
+}
+.heatmap .hm-cell {
+  min-height: 36px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 11px; font-weight: 650;
+  border: 1px solid rgba(255,255,255,0.06);
+  color: rgba(232,238,246,0.92);
+}
+.iter-bars { display: grid; gap: 8px; margin-top: 10px; }
+.iter-bar-row {
+  display: grid; grid-template-columns: 42px 1fr auto; gap: 10px;
+  align-items: center;
+}
+.iter-bar-row .ib-label {
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+}
+.iter-bar-row .ib-track {
+  height: 18px; border-radius: 8px; background: rgba(255,255,255,0.05);
+  overflow: hidden; position: relative; display: flex;
+}
+.iter-bar-row .ib-fill {
+  height: 100%;
+  background: linear-gradient(90deg, rgba(0,105,255,0.85), rgba(0,205,225,0.9));
+}
+.iter-bar-row .ib-fill.critic {
+  background: linear-gradient(90deg, rgba(255,145,20,0.75), rgba(255,190,15,0.9));
+}
+.iter-bar-row .ib-meta {
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  white-space: nowrap;
+}
+.verdict-chip {
+  display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 999px;
+  font-size: 10px; font-weight: 750; letter-spacing: 0.04em;
+  border: 1px solid var(--line); margin-left: 6px;
+}
+.verdict-chip.ok { color: var(--ok); border-color: rgba(40,205,120,0.35); }
+.verdict-chip.warn { color: var(--warn); border-color: rgba(255,145,20,0.35); }
+.verdict-chip.err { color: var(--err); border-color: rgba(255,25,95,0.35); }
+.verdict-chip.accent { color: var(--accent); border-color: rgba(0,205,225,0.35); }
+.viz-empty {
+  margin-top: 18px; color: var(--muted); font-style: italic; font-size: 13px;
+}
 .section {
   background: var(--bg1); border: 1px solid var(--line);
   border-radius: var(--radius); padding: 22px 22px 18px;
@@ -1121,13 +1266,12 @@ def _brand_logo_data_uri() -> str:
 def _brand_html() -> str:
     uri = _brand_logo_data_uri()
     logo = (
-        f'<img class="brand-logo" src="{uri}" alt="{_esc(BRAND_NAME)}" width="160" height="70">'
+        f'<img class="brand-logo" src="{uri}" alt="{_esc(BRAND_NAME)}" width="220" height="96">'
         if uri else ""
     )
     return (
         f'<div class="brand">{logo}'
-        f'<div class="brand-copy"><strong>{_esc(BRAND_NAME)}</strong>'
-        f'<span>mission report</span></div></div>'
+        f'<strong class="brand-name">{_esc(BRAND_NAME)}</strong></div>'
     )
 
 
@@ -1135,6 +1279,498 @@ def _bar_html(used: float, cap: float) -> str:
     pct = _pct(used, cap)
     warn = " warn" if pct >= 90 else ""
     return f'<div class="bar{warn}"><i style="width:{pct:.1f}%"></i></div>'
+
+
+def _polar(cx: float, cy: float, r: float, deg: float) -> Tuple[float, float]:
+    rad = math.radians(deg - 90)
+    return cx + r * math.cos(rad), cy + r * math.sin(rad)
+
+
+def _donut_arc_path(
+    cx: float, cy: float, r_outer: float, r_inner: float,
+    start_deg: float, sweep_deg: float,
+) -> str:
+    if sweep_deg <= 0:
+        return ""
+    sweep = min(359.999, sweep_deg)
+    large = 1 if sweep > 180 else 0
+    x0, y0 = _polar(cx, cy, r_outer, start_deg)
+    x1, y1 = _polar(cx, cy, r_outer, start_deg + sweep)
+    x2, y2 = _polar(cx, cy, r_inner, start_deg + sweep)
+    x3, y3 = _polar(cx, cy, r_inner, start_deg)
+    return (
+        f"M {x0:.2f} {y0:.2f} A {r_outer:.2f} {r_outer:.2f} 0 {large} 1 "
+        f"{x1:.2f} {y1:.2f} L {x2:.2f} {y2:.2f} "
+        f"A {r_inner:.2f} {r_inner:.2f} 0 {large} 0 {x3:.2f} {y3:.2f} Z"
+    )
+
+
+def _render_budget_donut_html(report: MissionReport) -> str:
+    """Donut of budget utilization across iterations / spend / wall."""
+    colors = ("#00cde1", "#28cd78", "#ffbe0f")
+    segments: List[Tuple[str, float, float, str]] = []
+    # (label, used_pct 0-100, display value, color)
+    segments.append((
+        "Iterations",
+        _pct(report.iteration, report.max_iterations),
+        f"{report.iteration}/{report.max_iterations or '—'}",
+        colors[0],
+    ))
+    segments.append((
+        "Spend",
+        _pct(report.cost_usd, report.max_cost_usd),
+        f"${report.cost_usd:.2f}",
+        colors[1],
+    ))
+    if report.max_wall_seconds or report.wall_seconds:
+        segments.append((
+            "Agent wall",
+            _pct(report.wall_seconds, report.max_wall_seconds),
+            f"{report.wall_seconds:.0f}s",
+            colors[2],
+        ))
+    weights = [max(0.0, s[1]) for s in segments]
+    total_w = sum(weights)
+    if total_w <= 0:
+        # Empty ring — show unused budgets.
+        weights = [1.0 for _ in segments]
+        total_w = float(len(weights))
+        ring_colors = ["rgba(255,255,255,0.08)"] * len(segments)
+    else:
+        ring_colors = [s[3] for s in segments]
+
+    avg_pct = sum(s[1] for s in segments) / max(1, len(segments))
+    cx = cy = 74.0
+    r_outer, r_inner = 66.0, 42.0
+    paths: List[str] = []
+    angle = 0.0
+    gap = 2.5 if len(segments) > 1 else 0.0
+    usable = 360.0 - gap * len(segments)
+    for i, seg in enumerate(segments):
+        sweep = usable * (weights[i] / total_w)
+        d = _donut_arc_path(cx, cy, r_outer, r_inner, angle, sweep)
+        if d:
+            paths.append(
+                f'<path d="{d}" fill="{ring_colors[i]}" '
+                f'stroke="rgba(12,17,24,0.55)" stroke-width="1.5"/>'
+            )
+        angle += sweep + gap
+
+    legend = "".join(
+        f'<div class="legend-row">'
+        f'<span class="legend-swatch" style="background:{_esc(seg[3])}"></span>'
+        f'<span>{_esc(seg[0])}</span>'
+        f'<span class="legend-val">{_esc(seg[2])} · {seg[1]:.0f}%</span>'
+        f"</div>"
+        for seg in segments
+    )
+    svg = (
+        f'<svg class="donut-svg" viewBox="0 0 148 148" role="img" '
+        f'aria-label="Budget utilization donut">'
+        f'<circle cx="{cx}" cy="{cy}" r="{(r_outer + r_inner) / 2:.1f}" '
+        f'fill="none" stroke="rgba(255,255,255,0.06)" '
+        f'stroke-width="{r_outer - r_inner:.1f}"/>'
+        + "".join(paths)
+        + f'<text x="{cx}" y="{cy - 4}" text-anchor="middle" '
+        f'class="donut-center-label">{avg_pct:.0f}%</text>'
+        f'<text x="{cx}" y="{cy + 14}" text-anchor="middle" '
+        f'class="donut-center-sub">budget used</text>'
+        f"</svg>"
+    )
+    return (
+        f'<div class="card viz">'
+        f'<div class="label">Budget mix</div>'
+        f'<div class="donut-wrap">{svg}<div class="legend">{legend}</div></div>'
+        f"</div>"
+    )
+
+
+def _unique_keep_order(items: Sequence[str], *, limit: int = 5) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        text = " ".join(str(item or "").split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _verdict_tone(rec: str) -> str:
+    rec = (rec or "").upper()
+    if rec == "PASS":
+        return "ok"
+    if rec == "HOLD":
+        return "warn"
+    if rec == "REJECT":
+        return "err"
+    return "accent"
+
+
+def _render_mission_pulse_html(report: MissionReport) -> str:
+    """Narrative Tasks / Decisions / Results summary cards."""
+    builders = [h for h in report.highlights if h.role == "builder"]
+    critics = [h for h in report.highlights if h.role == "critic"]
+    latest_builder = builders[-1] if builders else None
+    latest_critic = critics[-1] if critics else None
+
+    done_yes = sum(1 for h in builders if h.done is True)
+    done_no = sum(1 for h in builders if h.done is False)
+    artifacts = _unique_keep_order(
+        [a for h in builders for a in h.artifacts], limit=4,
+    )
+    commands = _unique_keep_order(
+        [c for h in builders for c in h.commands], limit=3,
+    )
+    risks = _unique_keep_order(
+        [r for h in builders for r in h.risks], limit=3,
+    )
+    blocking = _unique_keep_order(
+        [b for h in critics for b in h.blocking_findings], limit=3,
+    )
+
+    # --- Tasks ---
+    task_lead = (
+        (latest_builder.headline if latest_builder and latest_builder.headline else "")
+        or (latest_builder.summary if latest_builder else "")
+        or "No builder work recorded yet."
+    )
+    task_stats = [
+        f'<span class="stat-pill accent">{len(builders)} builder runs</span>',
+        f'<span class="stat-pill ok">{done_yes} done claimed</span>',
+        f'<span class="stat-pill warn">{done_no} still open</span>',
+        f'<span class="stat-pill">{len(artifacts)} artifacts</span>',
+    ]
+    task_items: List[str] = []
+    for path in artifacts:
+        task_items.append(
+            f'<li><span class="tag">file</span><code>{_esc(path)}</code></li>'
+        )
+    for cmd in commands:
+        task_items.append(
+            f'<li class="warn"><span class="tag">cmd</span>{_esc(cmd)}</li>'
+        )
+    if not task_items:
+        task_items.append('<li class="muted">No artifacts or commands yet.</li>')
+    tasks_html = (
+        '<div class="card summary">'
+        '<div class="label">Tasks</div>'
+        f'<div class="lead">{_esc(task_lead)}</div>'
+        f'<div class="stat-row">{"".join(task_stats)}</div>'
+        f'<ul class="pulse-list">{"".join(task_items)}</ul>'
+        "</div>"
+    )
+
+    # --- Decisions ---
+    if latest_critic and latest_critic.recommendation:
+        dec_lead = (
+            f"Latest critic · {latest_critic.recommendation}"
+            + (f" (iteration {latest_critic.iteration})"
+               if latest_critic.iteration is not None else "")
+        )
+        if latest_critic.headline:
+            dec_lead = latest_critic.headline
+    elif report.human_decision:
+        dec_lead = f"Human gate · {report.human_decision}"
+    elif latest_builder and latest_builder.done is True:
+        dec_lead = "Builder claimed done — awaiting critic / gate."
+    else:
+        dec_lead = "No critic or gate decisions yet."
+
+    pass_n = sum(1 for h in critics if (h.recommendation or "").upper() == "PASS")
+    hold_n = sum(1 for h in critics if (h.recommendation or "").upper() == "HOLD")
+    reject_n = sum(1 for h in critics if (h.recommendation or "").upper() == "REJECT")
+    dec_stats = [
+        f'<span class="stat-pill ok">PASS {pass_n}</span>',
+        f'<span class="stat-pill warn">HOLD {hold_n}</span>',
+        f'<span class="stat-pill err">REJECT {reject_n}</span>',
+    ]
+    if report.human_decision:
+        tone = "ok" if report.human_decision.lower() in ("approve", "approved") else "warn"
+        dec_stats.append(
+            f'<span class="stat-pill {tone}">Gate: {_esc(report.human_decision)}</span>'
+        )
+    if report.integrity_ok is True:
+        dec_stats.append('<span class="stat-pill ok">Integrity ✓</span>')
+    elif report.integrity_ok is False:
+        dec_stats.append('<span class="stat-pill err">Integrity ✗</span>')
+
+    dec_items: List[str] = []
+    for h in critics[-4:]:
+        rec = (h.recommendation or h.status_label or "reviewed").upper()
+        tone = _verdict_tone(rec)
+        iter_bit = f"i{h.iteration}" if h.iteration is not None else "run"
+        detail = h.headline or h.status_label or rec
+        dec_items.append(
+            f'<li class="{tone}"><span class="tag">{_esc(iter_bit)} · {_esc(rec)}</span>'
+            f"{_esc(detail)}</li>"
+        )
+    if latest_builder and latest_builder.done is not None:
+        tone = "ok" if latest_builder.done else "warn"
+        claim = "Done claimed" if latest_builder.done else "Work remains"
+        dec_items.append(
+            f'<li class="{tone}"><span class="tag">builder</span>{claim}</li>'
+        )
+    for finding in blocking:
+        dec_items.append(
+            f'<li class="err"><span class="tag">block</span>{_esc(finding)}</li>'
+        )
+    if not dec_items:
+        dec_items.append('<li class="muted">No decisions recorded.</li>')
+    decisions_html = (
+        '<div class="card summary">'
+        '<div class="label">Decisions</div>'
+        f'<div class="lead">{_esc(dec_lead)}</div>'
+        f'<div class="stat-row">{"".join(dec_stats)}</div>'
+        f'<ul class="pulse-list">{"".join(dec_items)}</ul>'
+        "</div>"
+    )
+
+    # --- Results ---
+    status_line = report.status
+    if report.stop_reason:
+        status_line = f"{report.status} ({report.stop_reason})"
+    result_lead = (
+        (latest_critic.headline if latest_critic and latest_critic.headline else "")
+        or (latest_builder.headline if latest_builder and latest_builder.headline else "")
+        or status_line
+    )
+    file_n = len(report.changed_files)
+    skill_n = len(report.skills)
+    result_stats = [
+        f'<span class="stat-pill {report.status_tone}">{_esc(report.status_label)}</span>',
+        f'<span class="stat-pill">{file_n} files changed</span>',
+        f'<span class="stat-pill">{skill_n} skills</span>',
+        f'<span class="stat-pill accent">{report.agent_runs} agent runs</span>',
+    ]
+    result_items: List[str] = [
+        f'<li class="{report.status_tone}"><span class="tag">status</span>'
+        f"{_esc(status_line)}</li>",
+        f'<li><span class="tag">delivery</span>{_esc(report.delivery_mode)}'
+        f" → {_esc(report.delivery_detail)}</li>",
+    ]
+    for path in report.changed_files[:3]:
+        result_items.append(
+            f'<li class="ok"><span class="tag">diff</span><code>{_esc(path)}</code></li>'
+        )
+    for risk in risks:
+        result_items.append(
+            f'<li class="warn"><span class="tag">risk</span>{_esc(risk)}</li>'
+        )
+    if report.next_step:
+        result_items.append(
+            f'<li class="accent"><span class="tag">next</span>{_esc(report.next_step)}</li>'
+        )
+    results_html = (
+        '<div class="card summary">'
+        '<div class="label">Results</div>'
+        f'<div class="lead">{_esc(result_lead)}</div>'
+        f'<div class="stat-row">{"".join(result_stats)}</div>'
+        f'<ul class="pulse-list">{"".join(result_items)}</ul>'
+        "</div>"
+    )
+    return (
+        f'<div class="summary-grid">{tasks_html}{decisions_html}{results_html}</div>'
+    )
+
+
+def _render_outcome_donut_html(report: MissionReport) -> str:
+    """Donut of critic verdicts + builder done claims."""
+    critics = [h for h in report.highlights if h.role == "critic"]
+    builders = [h for h in report.highlights if h.role == "builder"]
+    counts = {
+        "PASS": sum(1 for h in critics if (h.recommendation or "").upper() == "PASS"),
+        "HOLD": sum(1 for h in critics if (h.recommendation or "").upper() == "HOLD"),
+        "REJECT": sum(1 for h in critics if (h.recommendation or "").upper() == "REJECT"),
+        "Done": sum(1 for h in builders if h.done is True),
+        "Open": sum(1 for h in builders if h.done is False),
+    }
+    palette = {
+        "PASS": "#28cd78",
+        "HOLD": "#ff9114",
+        "REJECT": "#ff195f",
+        "Done": "#00cde1",
+        "Open": "#8a9bb0",
+    }
+    segments = [(k, float(v), palette[k]) for k, v in counts.items() if v > 0]
+    if not segments:
+        return (
+            '<div class="card viz">'
+            '<div class="label">Outcomes</div>'
+            '<p class="viz-empty">No verdicts or done claims yet.</p>'
+            "</div>"
+        )
+
+    total = sum(v for _, v, _ in segments) or 1.0
+    cx = cy = 74.0
+    r_outer, r_inner = 66.0, 42.0
+    paths: List[str] = []
+    angle = 0.0
+    gap = 2.5 if len(segments) > 1 else 0.0
+    usable = 360.0 - gap * len(segments)
+    for label, value, color in segments:
+        sweep = usable * (value / total)
+        d = _donut_arc_path(cx, cy, r_outer, r_inner, angle, sweep)
+        if d:
+            paths.append(
+                f'<path d="{d}" fill="{color}" '
+                f'stroke="rgba(12,17,24,0.55)" stroke-width="1.5"/>'
+            )
+        angle += sweep + gap
+
+    primary = max(segments, key=lambda s: s[1])
+    legend = "".join(
+        f'<div class="legend-row">'
+        f'<span class="legend-swatch" style="background:{color}"></span>'
+        f'<span>{_esc(label)}</span>'
+        f'<span class="legend-val">{int(value)}</span>'
+        f"</div>"
+        for label, value, color in segments
+    )
+    svg = (
+        f'<svg class="donut-svg" viewBox="0 0 148 148" role="img" '
+        f'aria-label="Outcome mix donut">'
+        f'<circle cx="{cx}" cy="{cy}" r="{(r_outer + r_inner) / 2:.1f}" '
+        f'fill="none" stroke="rgba(255,255,255,0.06)" '
+        f'stroke-width="{r_outer - r_inner:.1f}"/>'
+        + "".join(paths)
+        + f'<text x="{cx}" y="{cy - 4}" text-anchor="middle" '
+        f'class="donut-center-label">{_esc(primary[0])}</text>'
+        f'<text x="{cx}" y="{cy + 14}" text-anchor="middle" '
+        f'class="donut-center-sub">top outcome</text>'
+        f"</svg>"
+    )
+    return (
+        '<div class="card viz">'
+        '<div class="label">Outcomes</div>'
+        '<div class="sub">Critic verdicts · builder claims</div>'
+        f'<div class="donut-wrap">{svg}<div class="legend">{legend}</div></div>'
+        "</div>"
+    )
+
+
+def _render_iteration_bars_html(report: MissionReport) -> str:
+    """Per-iteration spend bars with latest critic verdict chip."""
+    by_iter: Dict[int, Dict[str, Any]] = {}
+    for hl in report.highlights:
+        if hl.iteration is None:
+            continue
+        bucket = by_iter.setdefault(hl.iteration, {
+            "builder_cost": 0.0, "critic_cost": 0.0, "verdict": "", "tone": "accent",
+        })
+        if hl.role == "builder":
+            bucket["builder_cost"] += float(hl.cost_usd or 0)
+        else:
+            bucket["critic_cost"] += float(hl.cost_usd or 0)
+            if hl.recommendation:
+                bucket["verdict"] = hl.recommendation.upper()
+                bucket["tone"] = _verdict_tone(hl.recommendation)
+
+    if not by_iter:
+        return (
+            '<div class="card viz">'
+            '<div class="label">Iteration spend</div>'
+            '<p class="viz-empty">No iteration spend yet.</p>'
+            "</div>"
+        )
+
+    max_cost = max(
+        (b["builder_cost"] + b["critic_cost"]) for b in by_iter.values()
+    ) or 1.0
+    rows: List[str] = []
+    for it in sorted(by_iter):
+        bucket = by_iter[it]
+        total = bucket["builder_cost"] + bucket["critic_cost"]
+        builder_pct = 100.0 * bucket["builder_cost"] / max_cost
+        critic_pct = 100.0 * bucket["critic_cost"] / max_cost
+        chip = ""
+        if bucket["verdict"]:
+            chip = (
+                f'<span class="verdict-chip {bucket["tone"]}">'
+                f'{_esc(bucket["verdict"])}</span>'
+            )
+        fills = (
+            f'<div class="ib-fill" style="width:{builder_pct:.1f}%"></div>'
+            if builder_pct > 0 else ""
+        )
+        if critic_pct > 0:
+            fills += (
+                f'<div class="ib-fill critic" style="width:{critic_pct:.1f}%"></div>'
+            )
+        rows.append(
+            f'<div class="iter-bar-row">'
+            f'<div class="ib-label">i{it}</div>'
+            f'<div class="ib-track" title="builder ${bucket["builder_cost"]:.2f}'
+            f' · critic ${bucket["critic_cost"]:.2f}">{fills}</div>'
+            f'<div class="ib-meta">${total:.2f}{chip}</div>'
+            f"</div>"
+        )
+
+    return (
+        '<div class="card viz">'
+        '<div class="label">Iteration spend</div>'
+        '<div class="sub">Builder (teal) · critic (gold) · verdict</div>'
+        f'<div class="iter-bars">{"".join(rows)}</div>'
+        "</div>"
+    )
+
+
+def _render_run_heatmap_html(report: MissionReport) -> str:
+    """Heatmap of cost intensity by iteration × role."""
+    cells: Dict[Tuple[int, str], float] = {}
+    iters: List[int] = []
+    for hl in report.highlights:
+        if hl.iteration is None:
+            continue
+        key = (hl.iteration, hl.role)
+        cells[key] = cells.get(key, 0.0) + max(0.0, float(hl.cost_usd or 0))
+        if hl.iteration not in iters:
+            iters.append(hl.iteration)
+    if not cells:
+        # Fall back to empty placeholder still structured for layout.
+        return (
+            '<div class="card viz">'
+            '<div class="label">Run heatmap</div>'
+            '<p class="viz-empty">No timed agent runs yet.</p>'
+            "</div>"
+        )
+    iters = sorted(iters)
+    roles = ["builder", "critic"]
+    max_v = max(cells.values()) or 1.0
+    parts = [
+        f'<div class="heatmap" style="--hm-cols:{len(roles)}">'
+        '<div class="hm-corner"></div>'
+    ]
+    for role in roles:
+        parts.append(f'<div class="hm-col">{_esc(role)}</div>')
+    for it in iters:
+        parts.append(f'<div class="hm-row">i{it}</div>')
+        for role in roles:
+            val = cells.get((it, role), 0.0)
+            intensity = val / max_v if max_v else 0.0
+            if role == "builder":
+                bg = (
+                    f"rgba(0,205,225,{0.12 + 0.72 * intensity:.2f})"
+                )
+            else:
+                bg = (
+                    f"rgba(255,145,20,{0.12 + 0.72 * intensity:.2f})"
+                )
+            label = f"${val:.2f}" if val else "—"
+            parts.append(
+                f'<div class="hm-cell" style="background:{bg}">{_esc(label)}</div>'
+            )
+    parts.append("</div>")
+    return (
+        '<div class="card viz">'
+        '<div class="label">Run heatmap</div>'
+        '<div class="sub">Cost by iteration × role</div>'
+        + "".join(parts)
+        + "</div>"
+    )
 
 
 def _render_arc_html(report: MissionReport) -> str:
@@ -1292,17 +1928,30 @@ def render_html(report: MissionReport) -> str:
     highlights_html = _render_highlights_html(report)
     files_html = _render_files_html(report.changed_files)
     skills_html = _render_skills_html(report.skills)
+    pulse_html = _render_mission_pulse_html(report)
+    donut_html = _render_budget_donut_html(report)
+    outcome_html = _render_outcome_donut_html(report)
+    heatmap_html = _render_run_heatmap_html(report)
+    iter_bars_html = _render_iteration_bars_html(report)
 
     stop = f" · {_esc(report.stop_reason)}" if report.stop_reason else ""
     spend_sub = f"of ${_esc(f'{report.max_cost_usd:.2f}')}"
     if tokens:
         spend_sub = f"{_esc(tokens)} · {spend_sub}"
 
+    latest_verdict = ""
+    for hl in reversed(report.highlights):
+        if hl.role == "critic" and hl.recommendation:
+            latest_verdict = hl.recommendation.upper()
+            break
+
     body = f"""
 <div class="wrap">
   <header class="hero">
-    {_brand_html()}
-    <div class="status-pill {report.status_tone}">{_esc(report.status_label)}</div>
+    <div class="hero-top">
+      <div class="report-mark" aria-label="Report">R E P O R T</div>
+      {_brand_html()}
+    </div>
     <h1>{_esc(report.project.name)}</h1>
     <div class="meta">
       <code>{_esc(report.mission_id)}</code> · loop <code>{_esc(report.loop_id)}</code>
@@ -1311,28 +1960,40 @@ def render_html(report: MissionReport) -> str:
     <div class="objective">{_esc(report.objective or "No objective recorded.")}</div>
   </header>
 
-  <div class="grid">
-    <div class="card">
-      <div class="label">Iterations</div>
-      <div class="value">{report.iteration}<span style="color:var(--muted);font-size:1rem"> / {report.max_iterations or "—"}</span></div>
-      {_bar_html(report.iteration, report.max_iterations)}
+  <div class="metrics-block">
+    <div class="grid">
+      <div class="card">
+        <div class="label">Iterations</div>
+        <div class="value">{report.iteration}<span style="color:var(--muted);font-size:1rem"> / {report.max_iterations or "—"}</span></div>
+        {_bar_html(report.iteration, report.max_iterations)}
+      </div>
+      <div class="card">
+        <div class="label">Spend</div>
+        <div class="value">${report.cost_usd:.2f}</div>
+        <div class="sub">{spend_sub}</div>
+        {_bar_html(report.cost_usd, report.max_cost_usd)}
+      </div>
+      <div class="card">
+        <div class="label">Agent wall</div>
+        <div class="value">{report.wall_seconds:.0f}s</div>
+        <div class="sub">budget {report.max_wall_seconds:.0f}s</div>
+        {_bar_html(report.wall_seconds, report.max_wall_seconds)}
+      </div>
+      <div class="card">
+        <div class="label">Delivery</div>
+        <div class="value" style="font-size:1.15rem">{_esc(report.delivery_mode)}</div>
+        <div class="sub">{_esc(report.delivery_detail)}</div>
+        {f'<div class="sub" style="margin-top:8px">critic <strong style="color:var(--ink)">{_esc(latest_verdict)}</strong></div>' if latest_verdict else ""}
+      </div>
     </div>
-    <div class="card">
-      <div class="label">Spend</div>
-      <div class="value">${report.cost_usd:.2f}</div>
-      <div class="sub">{spend_sub}</div>
-      {_bar_html(report.cost_usd, report.max_cost_usd)}
+    {pulse_html}
+    <div class="viz-grid">
+      {donut_html}
+      {outcome_html}
     </div>
-    <div class="card">
-      <div class="label">Agent wall</div>
-      <div class="value">{report.wall_seconds:.0f}s</div>
-      <div class="sub">budget {report.max_wall_seconds:.0f}s</div>
-      {_bar_html(report.wall_seconds, report.max_wall_seconds)}
-    </div>
-    <div class="card">
-      <div class="label">Delivery</div>
-      <div class="value" style="font-size:1.15rem">{_esc(report.delivery_mode)}</div>
-      <div class="sub">{_esc(report.delivery_detail)}</div>
+    <div class="viz-grid">
+      {iter_bars_html}
+      {heatmap_html}
     </div>
   </div>
 
