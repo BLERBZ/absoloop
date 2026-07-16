@@ -162,6 +162,10 @@ class Orchestrator:
             # Gate commands come from trusted config, never from prompts;
             # they are the one legitimate shell=True surface (repo-native
             # invocations like "npm test -- --ci" need shell semantics).
+            # Rewrite python/python3 → current interpreter so Windows OOTB
+            # works when only `py`/`python` exist.
+            from .platform_util import rewrite_python_gate
+            command = rewrite_python_gate(command)
             proc = subprocess.run(command, shell=True, cwd=str(workdir),
                                   capture_output=True, text=True, timeout=1800)
             passed = proc.returncode == 0

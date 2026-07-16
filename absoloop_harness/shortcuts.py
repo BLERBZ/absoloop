@@ -77,7 +77,7 @@ ACTIONS: Dict[str, Action] = {
         "watch", "Live dashboard (phase, budgets, activity)",
         ("watch",), group="mission", micro_slot="thinking"),
     "report": Action(
-        "report", "Iteration timeline with costs and verdicts",
+        "report", "Open the mission report (Markdown + lite viewer)",
         ("report",), group="mission", micro_slot="complete"),
     "goal": Action(
         "goal", "Show the /goal contract",
@@ -291,18 +291,30 @@ def _toml_lit(value: Any) -> str:
 
 def absoloop_bin() -> List[str]:
     """How to re-invoke Absoloop from a shortcut (same interpreter + script)."""
+    from .platform_util import tooling_home
     # Prefer the running entry point when we were launched as bin/absoloop.
     argv0 = pathlib.Path(sys.argv[0]).resolve()
     if argv0.name in ("absoloop", "absoloop.cmd") and argv0.is_file():
-        if argv0.suffix == ".cmd":
-            return [sys.executable, str(argv0.with_suffix(""))]
-        if argv0.read_bytes()[:40].startswith(b"#!") or argv0.suffix == "":
+        if argv0.suffix.lower() == ".cmd":
+            script = argv0.with_suffix("")
+            if script.is_file():
+                return [sys.executable, str(script)]
+        try:
+            head = argv0.read_bytes()[:40]
+        except OSError:
+            head = b""
+        if head.startswith(b"#!") or argv0.suffix == "":
             return [sys.executable, str(argv0)]
     which = shutil.which("absoloop")
     if which:
+        path = pathlib.Path(which)
+        # On Windows, which may return absoloop.CMD — invoke via python + script.
+        if path.suffix.lower() in (".cmd", ".bat"):
+            script = path.with_suffix("")
+            if script.is_file():
+                return [sys.executable, str(script)]
         return [which]
-    home = pathlib.Path(os.environ.get("ABSOLOOP_HOME",
-                                       pathlib.Path.home() / "absoloop"))
+    home = tooling_home()
     candidate = home / "bin" / "absoloop"
     if candidate.is_file():
         return [sys.executable, str(candidate)]
@@ -403,7 +415,8 @@ def _ask(label: str) -> str:
 # Listen (terminal + line protocol for Micro / automation)
 # ---------------------------------------------------------------------------
 
-# CSI sequences for common function keys (xterm / macOS Terminal / iTerm).
+# CSI sequences for common function keys (xterm / macOS Terminal / iTerm /
+# Windows Terminal). F13–F24 match Codex Micro default bindings.
 _FUNC_KEY_CSI = {
     "1": "home", "2": "insert", "3": "delete", "4": "end",
     "5": "pageup", "6": "pagedown",
@@ -412,30 +425,48 @@ _FUNC_KEY_CSI = {
     "23": "f11", "24": "f12",
     "25": "f13", "26": "f14", "28": "f15", "29": "f16",
     "31": "f17", "32": "f18", "33": "f19", "34": "f20",
+    "42": "f21", "43": "f22", "44": "f23", "45": "f24",
 }
 
 
 def listen(cwd: pathlib.Path, *, once: bool = False) -> int:
     """Listen for chords. Two modes:
 
-    - TTY raw: function keys / ctrl+letter (best-effort)
-    - Line protocol (pipe-friendly / Micro via text macros):
+    - TTY raw (Unix): function keys F13–F24 / ctrl+letter (best-effort)
+    - Line protocol (all platforms / Micro shell macros / pipes):
         action:<name>
         chord:<chord>
         <name>                  # bare action name
+
+    On Windows, TTY raw listen is unavailable — use `absoloop do <action>`
+    (recommended for Codex Micro) or pipe the line protocol into listen.
     """
+    from .platform_util import is_windows, tty_raw_listen_supported
+
     cfg = load_shortcuts(cwd)
     if not cfg.enabled:
         print("shortcuts disabled in config", file=sys.stderr)
         return 1
     print(tint("bold", "∞ Absoloop shortcuts listen"))
     print(tint("dim", "  chords · action:<name> · chord:f13 · q to quit"))
-    print(tint("dim", "  Codex Micro: map keys in Input to the chords below"))
+    print(tint("dim", "  Codex Micro: prefer `absoloop do <action>` shell macros"))
     print()
     _print_micro_compact(cfg, layer="mission")
 
     if not sys.stdin.isatty():
         return _listen_lines(cwd, cfg, once=once)
+
+    if not tty_raw_listen_supported():
+        print(tint("warn", "  TTY chord listen needs a Unix terminal (termios)."))
+        if is_windows():
+            print(tint("dim", "  Windows / Codex Micro: map keys to shell macros:"))
+            print(tint("dim", "    absoloop do status"))
+            print(tint("dim", "    absoloop do approve --yes"))
+            print(tint("dim", "  Or pipe:  echo action:status | absoloop shortcuts listen"))
+        print(tint("dim", "  Waiting on stdin (line protocol) — Ctrl+Z Enter to end on Windows."))
+        print()
+        return _listen_lines(cwd, cfg, once=once)
+
     return _listen_tty(cwd, cfg, once=once)
 
 
@@ -482,6 +513,10 @@ def _listen_tty(cwd: pathlib.Path, cfg: ShortcutConfig, *, once: bool) -> int:
     import select
     import termios
     import tty
+    from .platform_util import tty_raw_listen_supported
+    if not tty_raw_listen_supported():
+        print(tint("warn", "  falling back to line protocol"), file=sys.stderr)
+        return _listen_lines(cwd, cfg, once=once)
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:

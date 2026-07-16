@@ -82,25 +82,67 @@ def _event_printer(verbose: bool):
 # ---------------------------------------------------------------------------
 
 def doctor_command(argv: List[str]) -> int:
+    from .platform_util import prerequisite_checks, rewrite_python_gate
+
     cfg = load_config(_root())
-    print("Absoloop doctor — provider health\n")
+    print("Absoloop doctor — environment + provider health\n")
     worst = 0
+
+    print("  environment")
+    for note in prerequisite_checks():
+        if note.startswith("fix:"):
+            worst = 1
+            print(f"           {_tint('33', note)}")
+        else:
+            print(f"           {note}")
+    gate = str(cfg.get("gates", "commands", default={}).get("tests") or "")
+    if gate:
+        rewritten = rewrite_python_gate(gate)
+        print(f"           gate:    {rewritten}")
+    print()
+
+    available_count = 0
     for name in PROVIDERS:
         adapter = make_adapter(name, cfg.get("providers", name, default={}))
         probe = adapter.probe()
         mark = _tint("32", "ok") if probe.available else _tint("31", "missing")
         print(f"  {name:<8} {mark}")
         if probe.available:
+            available_count += 1
             print(f"           path:    {probe.info.executable}")
             print(f"           version: {probe.info.version or 'unknown'}")
-            if probe.info.auth_hint:
-                print(f"           auth:    {probe.info.auth_hint}")
+            auth = probe.info.auth_hint or adapter.auth_hint()
+            if auth:
+                tone = "33" if auth.startswith("no credentials") else "0"
+                label = "auth:    "
+                print(f"           {label}{_tint(tone, auth) if tone != '0' else auth}")
             caps = [key for key, val in probe.capabilities.to_json().items() if val]
             print(f"           caps:    {', '.join(caps)}")
+            if name == "codex":
+                style = adapter.config.get("resume_style") or "exec-resume"
+                print(f"           resume:  {style}")
         for problem in probe.problems:
             worst = 1
             print(f"           {_tint('33', 'fix:')} {problem}")
         print()
+
+    if available_count == 0:
+        worst = 1
+        print(_tint("31", "no providers on PATH — install grok, claude, and/or codex"))
+        print("  macOS/Linux: ensure npm/cargo install bins are on PATH")
+        print("  Windows:    add provider install dirs to PATH; use absoloop.cmd from bin\\")
+        print()
+    elif available_count < len(PROVIDERS):
+        print(f"note: {available_count}/{len(PROVIDERS)} providers available — "
+              "race/council need the ones you list in --providers")
+        print()
+
+    print("  Codex Micro")
+    print("           map keys in Input to `absoloop do <action>` (works on all OS)")
+    print("           or: absoloop shortcuts layout · export --format input")
+    print("           Unix TTY: absoloop shortcuts listen  (F13–F24)")
+    print()
+
     if not (_root() / "absoloop.toml").is_file():
         print("note: no project absoloop.toml — using defaults "
               "(create one to configure gates and providers)")

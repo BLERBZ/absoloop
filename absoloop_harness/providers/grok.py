@@ -35,9 +35,11 @@ class GrokAdapter(ProviderAdapter):
     def auth_hint(self) -> str:
         if os.environ.get("XAI_API_KEY"):
             return "XAI_API_KEY set"
-        if (pathlib.Path(os.environ.get("GROK_HOME", str(pathlib.Path.home() / ".grok")))
-                / "auth.json").is_file():
-            return "cached login found (~/.grok/auth.json)"
+        grok_home = pathlib.Path(
+            os.environ.get("GROK_HOME", str(pathlib.Path.home() / ".grok")))
+        auth = grok_home / "auth.json"
+        if auth.is_file():
+            return f"cached login found ({auth})"
         return "no credentials detected — run 'grok login' or set XAI_API_KEY"
 
     def map_permissions(self, profile: str) -> List[str]:
@@ -58,7 +60,7 @@ class GrokAdapter(ProviderAdapter):
     def build_argv(self, request: AgentRequest, resume: Optional[SessionRef],
                    workdir: pathlib.Path):
         prompt_path = write_prompt_file(workdir, request.prompt)
-        argv = [self.executable() or self.config.get("command", "grok"),
+        argv = [self.argv_program(),
                 "--prompt-file", str(prompt_path),
                 "--output-format", "streaming-json",
                 "--cwd", request.cwd,

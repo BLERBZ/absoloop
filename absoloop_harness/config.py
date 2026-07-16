@@ -27,7 +27,9 @@ DEFAULTS: Dict[str, Any] = {
     "gates": {
         "required": ["tests"],
         "commands": {
-            "tests": "python3 -m unittest discover -s tests",
+            # `python` resolves on Windows + Unix; orchestrator also rewrites
+            # python/python3 to the Absoloop interpreter at gate time.
+            "tests": "python -m unittest discover -s tests",
             "lint": "",
             "typecheck": "",
             "format": "",

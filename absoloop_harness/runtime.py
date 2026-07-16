@@ -178,8 +178,11 @@ def cancel_requested(run_dir: pathlib.Path) -> bool:
 
 
 def kill_process_group(pid: int, pgid: Optional[int] = None) -> bool:
-    """Terminate a process group (or single process on Windows). Returns True
-    when a signal was delivered or the process was already gone."""
+    """Terminate a process group (Unix) or process tree (Windows).
+
+    Returns True when a signal/kill was delivered or the process was already
+    gone.
+    """
     target = pgid if isinstance(pgid, int) and pgid > 0 else pid
     if target <= 0:
         return False
@@ -197,11 +200,15 @@ def kill_process_group(pid: int, pgid: Optional[int] = None) -> bool:
                 os.killpg(target, signal.SIGKILL)
             except ProcessLookupError:
                 return True
-        else:
-            os.kill(pid, signal.SIGTERM)
-        return True
+            return True
+        from .platform_util import kill_process_tree
+        # On Windows pgid == pid (CREATE_NEW_PROCESS_GROUP); kill the tree.
+        return kill_process_tree(pid) or not pid_alive(pid)
     except (ProcessLookupError, PermissionError, OSError):
         try:
+            if os.name == "nt":
+                from .platform_util import kill_process_tree
+                return kill_process_tree(pid) or not pid_alive(pid)
             os.kill(pid, signal.SIGKILL)
             return True
         except OSError:

@@ -19,6 +19,7 @@ form `codex exec resume --help` appears to document.
 """
 from __future__ import annotations
 
+import os
 import pathlib
 import subprocess
 from typing import Any, Dict, List, Optional
@@ -45,6 +46,21 @@ class CodexAdapter(ProviderAdapter):
         streaming_json=True, session_resume=True, structured_output=True,
         permission_modes=False, native_sandbox=True, turn_limit=False,
         prompt_via_stdin=True, cost_reporting=False)
+
+    def auth_hint(self) -> str:
+        if os.environ.get("OPENAI_API_KEY"):
+            return "OPENAI_API_KEY set"
+        if os.environ.get("CODEX_API_KEY"):
+            return "CODEX_API_KEY set"
+        codex_home = pathlib.Path(
+            os.environ.get("CODEX_HOME", str(pathlib.Path.home() / ".codex")))
+        for name in ("auth.json", "config.toml", "credentials.json"):
+            path = codex_home / name
+            if path.is_file():
+                return f"cached login found ({path})"
+        if codex_home.is_dir():
+            return f"codex home present ({codex_home}) — run 'codex login' if prompts fail"
+        return "no credentials detected — run 'codex login' or set OPENAI_API_KEY"
 
     def probe(self) -> ProviderProbe:
         probe = super().probe()
@@ -121,7 +137,7 @@ class CodexAdapter(ProviderAdapter):
 
     def build_argv(self, request: AgentRequest, resume: Optional[SessionRef],
                    workdir: pathlib.Path):
-        exe = self.executable() or self.config.get("command", "codex")
+        exe = self.argv_program()
         style = str(self.config.get("resume_style") or "exec-resume")
         common_flags = ["--json", "--cd", request.cwd]
         model = request.model or self.config.get("model") or ""

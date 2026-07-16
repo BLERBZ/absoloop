@@ -16,6 +16,7 @@ stream-json events:
 """
 from __future__ import annotations
 
+import os
 import pathlib
 from typing import Any, Dict, List, Optional
 
@@ -33,6 +34,26 @@ class ClaudeAdapter(ProviderAdapter):
         permission_modes=True, native_sandbox=False, turn_limit=True,
         prompt_via_stdin=True, cost_reporting=True)
 
+    def auth_hint(self) -> str:
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            return "ANTHROPIC_API_KEY set"
+        home = pathlib.Path.home()
+        candidates = (
+            home / ".claude" / ".credentials.json",
+            home / ".claude" / "credentials.json",
+            home / ".config" / "claude" / ".credentials.json",
+            home / ".config" / "claude-code" / ".credentials.json",
+            home / ".claude.json",
+        )
+        for path in candidates:
+            if path.is_file():
+                return f"cached login found ({path})"
+        # Claude Code also keeps project trust / OAuth under ~/.claude/
+        claude_dir = home / ".claude"
+        if claude_dir.is_dir():
+            return f"claude config dir present ({claude_dir}) — run 'claude login' if prompts fail"
+        return "no credentials detected — run 'claude login' or set ANTHROPIC_API_KEY"
+
     def map_permissions(self, profile: str) -> List[str]:
         self.check_profile(profile)
         mapping = {
@@ -46,7 +67,7 @@ class ClaudeAdapter(ProviderAdapter):
 
     def build_argv(self, request: AgentRequest, resume: Optional[SessionRef],
                    workdir: pathlib.Path):
-        argv = [self.executable() or self.config.get("command", "claude"),
+        argv = [self.argv_program(),
                 "-p", "--output-format", "stream-json", "--verbose"]
         model = request.model or self.config.get("model") or ""
         if model:

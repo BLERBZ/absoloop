@@ -58,12 +58,32 @@ class ProviderAdapter:
     # -- discovery -----------------------------------------------------------
 
     def executable(self) -> Optional[str]:
-        configured = self.config.get("command") or self.name
-        # Absolute / relative paths resolve directly; bare names go through PATH.
-        candidate = pathlib.Path(configured)
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate.resolve())
-        return shutil.which(configured)
+        """Resolved path suitable for argv[0] on Linux/macOS/Windows.
+
+        Never return a bare name that CreateProcess cannot resolve — Windows
+        needs the `.cmd` / `.exe` path from PATH / PATHEXT.
+        """
+        from ..platform_util import resolve_executable
+        configured = str(self.config.get("command") or self.name)
+        return resolve_executable(configured)
+
+    def require_executable(self) -> str:
+        path = self.executable()
+        if path:
+            return path
+        name = self.config.get("command") or self.name
+        raise PermissionMappingError(
+            f"'{name}' not found on PATH — install {self.name} or set "
+            f"providers.{self.name}.command in absoloop.toml")
+
+    def argv_program(self) -> str:
+        """Program for argv construction: resolved path when available.
+
+        Falls back to the configured bare name so unit tests can inspect argv
+        shapes offline. `_run` calls `require_executable()` before spawn so
+        Windows never CreateProcess-es an unresolved bare name in production.
+        """
+        return self.executable() or str(self.config.get("command") or self.name)
 
     def probe(self) -> ProviderProbe:
         path = self.executable()
@@ -148,8 +168,14 @@ class ProviderAdapter:
     def _run(self, request: AgentRequest, session: Optional[SessionRef],
              run_id: str) -> Iterator[AgentEvent]:
         self.check_profile(request.permission_profile)
+        # Fail before spawn if PATH resolution missed (critical on Windows).
+        self.require_executable()
         workdir = pathlib.Path(tempfile.mkdtemp(prefix=f"absoloop-{self.name}-"))
         argv, stdin_text = self.build_argv(request, session, workdir)
+        # Prefer resolved path even if build_argv used a bare fallback.
+        resolved = self.executable()
+        if resolved and argv:
+            argv = [resolved, *argv[1:]]
         env = build_child_env(self.config.get("env_allowlist") or [],
                               request.extra_env)
         secrets_to_hide = secret_values(env)

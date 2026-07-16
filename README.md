@@ -1,272 +1,217 @@
-# ABSOLOOP
+<p align="center">
+  <img src="docs/assets/absoloop-logo.png" alt="Absoloop" width="420" />
+</p>
 
-**Bounded AI looping system** — auditable repair loops for `claude` and
-`codex`, where a mission ends only when the builder reports it done with
-evidence, an independent critic finds no blocking issue, and you approve.
+<h1 align="center">Absoloop</h1>
 
-> Private BLERBZ tooling. Blueprint: `ABSOLOOP_AI_LOOPER_SYSTEM.md` (kept
-> outside this repo).
+<p align="center">
+  <strong>Bounded, auditable AI repair loops</strong><br/>
+  Evidence wins. Budgets bind. The critic does not take your word.
+</p>
 
-## How it works
+<p align="center">
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#how-the-loop-closes">How it works</a> ·
+  <a href="#multi-provider-harness">Harness</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a> ·
+  <a href="docs/">Docs</a>
+</p>
 
+<p align="center">
+  <img alt="Python 3.9+" src="https://img.shields.io/badge/python-3.9%2B-00cde1?style=flat-square" />
+  <img alt="License MIT" src="https://img.shields.io/badge/license-MIT-28cd78?style=flat-square" />
+  <img alt="Stdlib runtime" src="https://img.shields.io/badge/runtime-stdlib%20only-ffbe0f?style=flat-square" />
+  <img alt="Providers" src="https://img.shields.io/badge/providers-Grok%20·%20Claude%20·%20Codex-ff195f?style=flat-square" />
+  <a href="https://github.com/BLERBZ/absoloop/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/BLERBZ/absoloop/ci.yml?style=flat-square&label=CI" /></a>
+</p>
+
+---
+
+Absoloop is an open-source orchestrator for **local agent CLIs**. You state an
+objective; Absoloop runs a checkpointed repair loop until three things agree:
+
+1. the **builder** claims done with evidence  
+2. an independent **critic** finds no blocking issue  
+3. **you** approve  
+
+No cloud Absoloop service. No mystery SaaS. Your machine, your providers,
+your ledger.
+
+```text
+ objective ──► /goal contract ──► builder iterates (thinking escalates)
+                                      │
+                     done? ──► integrity ──► critic ──► human gate
+                                      │
+                               delivery: git · local · out
 ```
-objective ──► /goal contract ──► iterate: builder works, reports done? 
-                                      │ (escalating thinking depth)
-                                      ▼
-                     done ──► integrity ► critic ► human gate
-                                      ▼
-                            delivery (git / local / out)
+
+## Why Absoloop
+
+| Principle | What it means in practice |
+|---|---|
+| **Evidence-gated** | Narratives and “looks good” diffs are not acceptance. |
+| **Adversarial critic** | A read-only reviewer tries to *disprove* the result. |
+| **Hard budgets** | Iterations, wall clock, and dollars — resume or extend anytime. |
+| **Provider-native** | Grok Build, Claude Code, and Codex keep their own auth, tools, and sessions. |
+| **Observable** | Live stream + `watch` dashboard + Markdown report with a lite viewer. |
+| **Stdlib-first** | Core CLI + runner: Python 3.9+, zero pip deps to install. |
+
+<p align="center">
+  <img src="docs/assets/absoloop-logo-pixel.png" alt="Absoloop pixel mark" width="280" />
+</p>
+
+## Quick start
+
+**Requirements:** Python 3.9+ and at least one provider CLI (`claude`, `codex`,
+and/or `grok`).
+
+```bash
+git clone https://github.com/BLERBZ/absoloop.git
+cd absoloop
+# ABSOLOOP_HOME auto-detects from bin/ — export only if you relocate the tree
+mkdir -p ~/.local/bin && ln -sf "$PWD/bin/absoloop" ~/.local/bin/absoloop
+# Windows: add absoloop\bin to PATH (absoloop.cmd sets ABSOLOOP_HOME)
+
+absoloop doctor                    # env + Grok/Claude/Codex + Micro hints
+absoloop "Make all tests pass"     # Mission Briefing → review card → Enter
 ```
 
-- **Evidence-gated** — a "done" claim counts only when it survives the
-  independent critic's inspection of the working tree and your approval.
-  Effort, narratives, and plausible diffs count for nothing.
-- **Adversarial acceptance** — an independent read-only critic tries to
-  disprove the result; weakened tests are an automatic rejection.
-- **Bounded** — hard caps on iterations, wall clock, and dollars, with
-  checkpointed state you can resume or extend at any time.
-- **Engine-agnostic** — the same mission runs under the `claude` or `codex`
-  CLI; the loop handles each engine's flags, budgets, and output shapes.
-- **Observable** — the loop streams every agent action (tool calls, commands,
-  messages) to the console as it happens, and maintains live telemetry
-  (`.absoloop/tmp/monitor.json` + `live.jsonl`) that `absoloop watch` renders
-  as a refreshing dashboard: phase, budget bars, current activity, risk flags.
+**Mission Briefing keys:** `Enter` launch · `o` objective · `e` engine ·
+`d` delivery · `n` rename · `g` preview `/goal` · `q` abort · `-y` skip review.
+
+```bash
+absoloop status · watch · report   # see, stream, then open the report viewer
+absoloop approve                   # accept at the human gate
+absoloop reject "use the v2 API"   # steer the next iteration
+absoloop resume · resume --extend
+```
+
+Runner exit codes: `0` completed · `3` awaiting your approval · `2` stopped safely.
 
 ## Multi-provider harness
 
-Beyond the mission loop, `absoloop` is a provider-neutral harness that runs
-**Grok Build, Claude Code, and Codex** as first-class backends — native
-auth/tools/sessions preserved, isolated git worktrees, normalized event
-streams, deterministic quality gates, and reproducible run artifacts:
+Same UX, three first-class backends — isolated git worktrees, normalized
+events, deterministic gates, cancelable runs:
 
-```
-absoloop doctor                                   # provider health + fixes
-absoloop run --provider grok "Fix the tests"     # single provider
-absoloop build --strategy race --providers grok,claude,codex "Issue #123"
+```bash
+absoloop run --provider grok "Fix the failing tests"
+absoloop build --strategy race --providers grok,claude,codex "Implement #123"
 absoloop review --implementer claude --reviewer codex "Harden this change"
-absoloop inspect <run-id> · absoloop cancel <run-id> · absoloop apply <run-id>
-absoloop resume <run-id>
+absoloop inspect <run-id> · cancel <run-id> · apply <run-id>
 ```
 
-See `docs/multi-provider.md` (user guide) and
-`docs/architecture/multi-provider-harness.md` (design); configure with
-`absoloop.toml` (start from `absoloop.toml.example`).
+Guides: [`docs/multi-provider.md`](docs/multi-provider.md) ·
+architecture: [`docs/architecture/multi-provider-harness.md`](docs/architecture/multi-provider-harness.md) ·
+config: [`absoloop.toml.example`](absoloop.toml.example).
 
 ## Shortcuts & Codex Micro
 
-Same actions from the keyboard, CLI, or a [Work Louder Codex Micro](https://worklouder.cc/codex-micro)
-(HID keypad — map keys in Input, keymap stays on-device):
+Keyboard, CLI, or a [Work Louder Codex Micro](https://worklouder.cc/codex-micro)
+HID pad (defaults on F13–F24 so typing never collides):
 
-```
-absoloop shortcuts list
-absoloop shortcuts layout          # 13-key Micro mission layer
-absoloop do status                 # fire any action
-absoloop shortcuts listen          # F13–F24 / line protocol
+```bash
+absoloop shortcuts list · layout · listen
+absoloop do status
 absoloop shortcuts export --format input -o micro-input.md
 ```
 
-Defaults use F13–F24 so typing never collides. Full guide: `docs/shortcuts.md`.
+Full guide: [`docs/shortcuts.md`](docs/shortcuts.md).
+
+## How the loop closes
+
+Deep dive: [`docs/mission-loop.md`](docs/mission-loop.md).
+
+### `/goal` contract
+
+Every mission gets a generated `.absoloop/goal.md`: objective classification
+(tests / bugfix / feature / refactor / perf / docs), definition of done,
+strategy ladder, and a **thinking escalation ladder** shared by the contract
+and the runner.
+
+```bash
+absoloop goal · goal --regen · goal --check
+```
+
+### Skills — loopers-toolbox
+
+Scaffolded projects receive mission skills in each engine’s native path
+(`.claude/skills/`, `.codex/skills/`). Upstream sources include
+[anthropics/skills](https://github.com/anthropics/skills),
+[openai/skills](https://github.com/openai/skills),
+[addyosmani/agent-skills](https://github.com/addyosmani/agent-skills),
+[johnpapa/ai-ready](https://github.com/johnpapa/ai-ready), and
+[vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser).
+See `templates/skills/toolbox.json`.
+
+### Delivery
+
+| Mode | Result |
+|---|---|
+| `local` | Changes stay unstaged (default) |
+| `git` | Commit to `absoloop/<loop_id>` |
+| `out` | Export files + report to `~/absoloop/out/<loop_id>/` |
+
+### Observability
+
+```bash
+absoloop watch     # live dashboard (phase, budgets, activity feed)
+absoloop status    # snapshot + exact next command
+absoloop report    # regenerates report.md + opens lite infographic viewer
+                   #   --terminal · --no-open · --md-only
+```
+
+Telemetry lives under `.absoloop/tmp/` while running; the ledger and
+`report.md` are the durable story of the mission.
 
 ## Repo layout
 
-```
-bin/absoloop              startup CLI (pure Python, cross-platform)
-bin/absoloop.cmd          Windows shim
-absoloop_harness/         multi-provider harness (core, process, providers,
-                          workspace, orchestrator, cli, config)
-templates/absoloop-run    reference loop runner copied into each project
-templates/absoloop-init   POSIX bootstrap convenience copy
-templates/skills/         the loopers-toolbox: mission skills seeded into
-                          each project (+ toolbox.json engine manifest)
-tests/                    characterization + harness test suites
-docs/                     user guide and architecture docs
-out/                      (gitignored) deliveries from `-d out` missions
+```text
+bin/absoloop                 Public CLI
+bin/absoloop_logo.py         Terminal infinity mark
+absoloop_harness/            Multi-provider harness + report viewer
+templates/absoloop-run       Reference loop runner (copied into projects)
+templates/skills/            Loopers-toolbox
+tests/                       Characterization + harness suites
+docs/                        Guides, architecture, brand assets
+.github/                     CI, issue/PR templates
 ```
 
-This folder is the tooling home — mission projects are created wherever you
-run the command.
+## Contributing
 
-## Setup
+Absoloop is built for people who want **honest loops** — patches welcome.
 
-- **macOS / Linux**: symlink `bin/absoloop` into `~/.local/bin` (already done
-  on the primary machine).
-- **Windows**: copy this folder, add its `bin` to PATH; `absoloop` resolves to
-  the `.cmd` shim.
-- Requires Python 3, plus the `claude` and/or `codex` CLI for running loops.
+1. Read [`CONTRIBUTING.md`](CONTRIBUTING.md)  
+2. Keep `bin/` + `templates/absoloop-run` **stdlib-only**  
+3. Do not weaken integrity → critic → human gate  
+4. Run `python3 -m unittest discover -s tests` before you push  
 
-## Usage
-
-**Mission Briefing** — say what you want, review one card, hit Enter:
-
-```
-absoloop "Make all tests pass"     # objective-first; review; Enter launches
-absoloop                           # one prompt for the objective, then review
-absoloop . -o "Fix the crash"      # adopt cwd with the same briefing
-absoloop my-mission -o "…" -y      # skip review, lock in and launch
-absoloop "…" --no-start            # scaffold only
+```bash
+git clone https://github.com/BLERBZ/absoloop.git
+cd absoloop && export ABSOLOOP_HOME="$PWD"
+python3 -m unittest discover -s tests -v
 ```
 
-The briefing card shows objective, mission profile, engine, delivery, and
-budgets. Keys: `Enter` launch · `o` objective · `e` engine · `d` delivery ·
-`n` rename · `g` preview `/goal` · `q` abort. Defaults adopt the current
-directory, `local` delivery, and the first engine on PATH — so most missions
-are one sentence + Enter.
+Community standards: [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) ·
+security reports: [`SECURITY.md`](SECURITY.md).
 
-It scaffolds the project (scripts + `.absoloop/` config, git init) and
-writes the **/goal contract** at `.absoloop/goal.md`.
+### Good first issues
 
-To start (or resume) the loop later from inside the project:
+- Docs clarifications and examples  
+- Characterization tests for edge cases you’ve hit  
+- Provider adapter hardening (probe / resume / cancel)  
+- Report viewer and Mission Briefing UX polish  
+- Shortcut catalog / Micro layout improvements  
 
-```
-./scripts/absoloop-run --engine claude      # macOS/Linux
-python scripts/absoloop-run --engine claude # Windows
-```
+## GitHub profile setup
 
-Runner exit codes: `0` completed · `3` accepted, awaiting your approval ·
-`2` stopped safely.
+A ready-to-publish org/profile README lives in
+[`docs/github-profile/`](docs/github-profile/) — logos included, with
+install steps for a `BLERBZ/.github` profile repo (or a personal
+`username/username` profile).
 
-Mission lifecycle commands:
+## License
 
-```
-absoloop status                 # mission at a glance + exact next command
-absoloop watch                  # live dashboard while the loop runs
-absoloop report                 # iteration-by-iteration results timeline
-absoloop approve                # accept a mission stopped at the human gate
-absoloop reject "use v2 API"    # answer the agent; lands in the next prompt
-absoloop resume                 # re-enter the active mission's loop
-absoloop resume --extend        # follow-on run: fresh budgets, prior work as context
-```
+[MIT](LICENSE) © BLERBZ and Absoloop contributors.
 
-## The /goal contract
-
-Every mission gets a deterministic, programmatically generated goal definition
-(`.absoloop/goal.md`) built from the objective: the objective is classified
-(tests / bugfix / feature / refactor / perf / docs), which selects a tailored
-definition of done, strategy ladder, **and thinking escalation ladder**. The
-contract is embedded in every iteration prompt as ground truth for both
-engines, and the generation is validated — an empty objective or a
-malformed/de-escalating ladder is flagged (and a broken ladder is never
-rendered into the contract).
-
-Long-thinking loops are driven by the generated **thinking escalation ladder**
-(`thinking_ladder` in `.absoloop/runtime.json` — the single source of truth
-for both the contract and the runner), keyed to the repeated-failure count:
-
-- **Claude** escalates the keyword `think → think hard → think harder →
-  ultrathink` *and* the real extended-thinking budget — the runner exports the
-  rung's `claude_thinking_tokens` as `MAX_THINKING_TOKENS` for that run.
-- **Codex** escalates `model_reasoning_effort` (`minimal…xhigh` understood;
-  never below what `runtime.json` configures).
-- Each rung's `budget_scale` widens that iteration's per-run wall-clock and
-  cost caps, so an ultrathink run isn't killed by limits sized for shallow ones.
-- Mission types that reward deep analysis (bugfix, perf) start one rung up.
-
-Hand-tune the ladder by editing `thinking_ladder` in `runtime.json` — a valid
-edit survives re-adoption; changing the objective regenerates it. Inspect,
-rebuild, or validate the contract:
-
-```
-absoloop goal           # print the mission's /goal contract
-absoloop goal --regen   # regenerate it from .absoloop/runtime.json
-absoloop goal --check   # validate objective/delivery/ladder; exit 1 on problems
-```
-
-## Skills — the mission's capability pipeline
-
-Every scaffolded project gets the **loopers-toolbox**: a set of mission
-skills installed into each engine's native project-skill discovery path —
-`.claude/skills/` for claude, `.codex/skills/` for codex — where the CLI
-scans them at session startup with no extra flags. The same open SKILL.md
-format works in both engines unchanged; `templates/skills/toolbox.json`
-maps which skills each engine gets:
-
-| skill | engines | upstream source |
-|---|---|---|
-| `skill-creator` | both | loop-adapted from [anthropics/skills](https://github.com/anthropics/skills/blob/main/skills/skill-creator/SKILL.md) |
-| `ai-ready` | both | [johnpapa/ai-ready](https://github.com/johnpapa/ai-ready) |
-| `tdd` | both | [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills) (test-driven-development) |
-| `agent-browser` | both | [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser) |
-| `mcp-builder` | both | [anthropics/skills](https://github.com/anthropics/skills) |
-| `frontend-design` | both | [anthropics/skills](https://github.com/anthropics/skills) |
-| `claude-api` | claude | [anthropics/skills](https://github.com/anthropics/skills) |
-| `cli-creator` | codex | [openai/skills](https://github.com/openai/skills) (curated) |
-
-Skills are copied whole (SKILL.md plus scripts/references/assets, so
-progressive disclosure works offline), and skill usage is wired into the
-standard pipeline:
-
-- The **/goal contract** carries a Skills section: check available skills
-  before working, and when the builder hits recurring complexity (a
-  procedure done twice, a helper rewritten, a failure caused by a missing
-  capability) it uses skill-creator to create or enhance a mission skill,
-  then uses it. Skill files are declared authorized infrastructure so the
-  smallest-change constraint doesn't forbid them.
-- Every **iteration prompt** lists the running engine's skills (name +
-  description parsed from each SKILL.md frontmatter) with instructions to
-  apply what fits; once a failure repeats, the prompt escalates with the
-  thinking ladder — asking whether the failure traces to a missing
-  capability worth codifying before retrying. Both engines get the
-  identical skills contract, so claude and codex prepare, start, and use
-  skills the same way.
-- The **critic** audits skill files like any artifact (a skill must do
-  exactly what its description says) but treats them as in-scope.
-- Skills persist across iterations and `resume --extend` runs, so the
-  loop compounds learning instead of re-deriving it; they ride along in
-  `git`/`out` deliveries like any changed file. Re-adoption never
-  overwrites a skill the mission has enhanced.
-
-## Delivery — where accepted work lands
-
-Chosen at setup (`-d`, or the interactive prompt) and applied automatically
-after acceptance (on `absoloop approve`, or on completion when the human gate
-is disabled):
-
-| mode | result |
-|---|---|
-| `git` | commits everything to a dedicated branch `absoloop/<loop_id>` |
-| `local` | changes stay unstaged in the working tree (default) |
-| `out` | changed files + report/goal/state/ledger exported to `~/absoloop/out/<loop_id>/` |
-
-Re-run delivery any time with `python scripts/absoloop-run --deliver-only`.
-
-## Monitoring & results views
-
-While the loop runs, the runner **streams every agent action live** — each
-tool call, shell command, file edit, and agent message is narrated to the
-console with color (respects `NO_COLOR` / non-tty), and mirrored into
-telemetry files under `.absoloop/tmp/` (gitignored):
-
-- `monitor.json` — atomically-replaced snapshot: phase, iteration, spend,
-  thinking level, current agent, last activity, pid + heartbeat;
-- `live.jsonl` — append-only feed of individual agent actions.
-
-```
-absoloop watch    # refreshing live dashboard: LIVE/stopped badge, phase,
-                  # iteration/spend/wall-clock bars, thinking level, what the
-                  # agent is doing right now, activity feed, risks, next step
-                  #   --once (single frame) · -n 5 (interval) · --plain (logs)
-absoloop status   # budgets (with progress bars), live phase when running,
-                  # builder's latest report + risks, delivery, next command
-absoloop report   # agent runs with cost + token counts + summaries,
-                  # done claims, critic verdicts, gates, delivery
-```
-
-`watch` distinguishes a live loop from a crashed one (pid + heartbeat
-freshness) and exits on its own once the mission reaches a terminal state.
-Every agent run also persists its full event stream
-(`iteration-NNNN-agent-result.stream.jsonl` / `.events.jsonl`) for
-after-the-fact auditing, and the runner writes `.absoloop/report.md`
-(markdown mission report) at every stop, included in `out` deliveries.
-
-## Development notes
-
-- `bin/absoloop` and `templates/absoloop-run` are pure standard-library Python
-  (3.9+); no dependencies to install.
-- The thinking ladder and goal contract share one generator in
-  `bin/absoloop` (`build_thinking_ladder`, `generate_goal_markdown`,
-  `validate_goal_config`); the runner only ever *consumes*
-  `runtime.json.thinking_ladder`, falling back to its built-in default for
-  projects scaffolded before ladders were per-mission.
-- Existing projects pick up runner changes on re-adoption
-  (`absoloop <path>` refreshes missing scripts) or by re-copying
-  `templates/absoloop-run` over `scripts/absoloop-run`.
+Brand marks under [`docs/assets/`](docs/assets/) — see
+[`docs/assets/BRAND.md`](docs/assets/BRAND.md).

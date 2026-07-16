@@ -1149,32 +1149,69 @@ def git_changed_files() -> list[str]:
 
 
 def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
-    """Human-readable mission report, regenerated at every stop so it always
-    reflects the latest state. 'absoloop report' renders the same story live."""
+    """Human-readable mission report Markdown, regenerated at every stop.
+
+    Structure matches the infographic document that `absoloop report` regenerates
+    and opens in the lite HTML viewer. The runner stays stdlib-standalone, so
+    this writes Markdown only; the CLI adds the viewer on demand.
+    """
     report_path = ABS / "report.md"
     changed = [p for p in git_changed_files() if not p.startswith(".absoloop/")]
     delivery = runtime.get("delivery") or {"mode": "local"}
+    mode = delivery.get("mode", "local")
+    if mode == "git":
+        delivery_detail = delivery.get("branch") or "absoloop/<loop>"
+    elif mode == "out":
+        delivery_detail = str(delivery.get("out_dir") or "~/absoloop/out/<loop>")
+    else:
+        delivery_detail = "working tree (unstaged)"
+    tokens_note = fmt_tokens(state.tokens_total)
+    gen = time.strftime("%Y-%m-%d %H:%M", time.localtime())
+    max_iter = runtime.get("max_iterations", "?")
+    max_cost = float(runtime.get("max_cost_usd", 0))
     lines = [
-        f"# ABSOLOOP report — {state.mission_id} ({runtime.get('loop_id', 'no loop id')})",
+        "# Absoloop Report",
         "",
-        f"- objective: {runtime.get('objective', '')}",
-        f"- status: **{state.status}**"
-        + (f" (stop reason: {state.stop_reason})" if state.stop_reason else ""),
-        f"- iterations: {state.iteration} of {runtime.get('max_iterations', '?')}",
-        f"- total cost: ${state.cost_usd:.2f} of "
-        f"${float(runtime.get('max_cost_usd', 0)):.2f}"
-        + (f" ({fmt_tokens(state.tokens_total)})" if fmt_tokens(state.tokens_total) else ""),
-        f"- delivery mode: {delivery.get('mode', 'local')}",
+        f"**{state.status}** · `{state.mission_id}` · loop `{runtime.get('loop_id', '—')}`",
         "",
-        "## Changed files (uncommitted, excluding .absoloop/)",
+        f"> Generated {gen}",
+        "",
+        "---",
+        "",
+        "## Mission",
+        "",
+        (runtime.get("objective") or "_(no objective recorded)_").strip(),
+        "",
+        "| | |",
+        "|---|---|",
+        f"| **Engine** | `{runtime.get('engine') or runtime.get('builder') or '—'}` |",
+        f"| **Delivery** | `{mode}` → {delivery_detail} |",
+        f"| **Status** | **{state.status}**"
+        + (f" ({state.stop_reason})" if state.stop_reason else "")
+        + " |",
+        "",
+        "---",
+        "",
+        "## At a glance",
+        "",
+        "| Metric | Used | Budget |",
+        "|---|---:|---:|",
+        f"| Iterations | {state.iteration} | {max_iter} |",
+        f"| Spend | ${state.cost_usd:.2f}"
+        + (f" ({tokens_note})" if tokens_note else "")
+        + f" | ${max_cost:.2f} |",
+        "",
+        "---",
+        "",
+        "## Run arc",
         "",
     ]
-    lines += [f"- `{path}`" for path in changed] or ["- (none detected)"]
-    lines += ["", "## Iteration timeline", ""]
     try:
         ledger_lines = LEDGER_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         ledger_lines = []
+    if not ledger_lines:
+        lines.append("_No ledger events yet — the loop has not run._")
     for raw in ledger_lines:
         try:
             event = json.loads(raw)
@@ -1183,30 +1220,57 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
         ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(event.get("ts", 0)))
         kind = event.get("type")
         if kind == "iteration":
-            outcome = "builder reports DONE" if event.get("done") else "not done yet"
-            lines.append(f"- {ts} — iteration {event.get('iteration')}: {outcome}")
+            outcome = "Builder reports DONE" if event.get("done") else "Still in progress"
+            lines.append(f"- **{ts}** · **Iteration {event.get('iteration')}** — {outcome}")
         elif kind == "early_done_claim":
-            lines.append(f"- {ts} — done claim at iteration {event.get('iteration')} "
-                         f"not accepted (floor: {event.get('min_iterations')})")
+            lines.append(f"- **{ts}** · **Early done claim held** — iteration "
+                         f"{event.get('iteration')} below floor ({event.get('min_iterations')})")
         elif kind == "agent_run":
-            tokens_note = fmt_tokens(event.get("tokens"))
-            lines.append(f"- {ts} — {event.get('engine')} run: exit {event.get('exit_code')}, "
-                         f"${float(event.get('cost_usd', 0)):.2f}"
-                         + (f" ({tokens_note})" if tokens_note else "")
-                         + f", {float(event.get('wall_seconds', 0)):.0f}s")
+            tok = fmt_tokens(event.get("tokens"))
+            lines.append(
+                f"- **{ts}** · **{event.get('engine')} run** — exit {event.get('exit_code')}, "
+                f"${float(event.get('cost_usd', 0)):.2f}"
+                + (f" ({tok})" if tok else "")
+                + f", {float(event.get('wall_seconds', 0)):.0f}s"
+            )
+        elif kind == "integrity_check":
+            mark = "Passed" if event.get("exit_code") == 0 else "Violation"
+            lines.append(f"- **{ts}** · **Integrity check** — {mark}")
         elif kind == "human_gate":
-            lines.append(f"- {ts} — human gate: {event.get('decision')}")
+            note = event.get("feedback") or event.get("note") or ""
+            lines.append(f"- **{ts}** · **Human gate · {event.get('decision')}**"
+                         + (f" — {note}" if note else ""))
         elif kind == "delivery":
-            lines.append(f"- {ts} — delivered ({event.get('mode')}): {event.get('detail', '')}")
+            lines.append(f"- **{ts}** · **Delivered ({event.get('mode')})** — "
+                         f"{event.get('detail', '')}")
         elif kind == "mission_stop":
-            lines.append(f"- {ts} — stop: {event.get('status')} ({event.get('reason')})")
-    lines += ["", "## Pointers", ""]
-    for key, label in (("latest_agent_result", "latest agent result"),
-                       ("latest_critic_findings", "latest critic findings")):
+            lines.append(f"- **{ts}** · **Stop · {event.get('status')}** — "
+                         f"{event.get('reason')}")
+        elif kind == "extension":
+            note = event.get("note") or ""
+            lines.append(f"- **{ts}** · **Mission extended** — "
+                         f"{event.get('previous_loop_id')} → {event.get('loop_id')}"
+                         + (f" — {note}" if note else ""))
+    lines += ["", "---", "", "## Changed files", ""]
+    lines += [f"- `{path}`" for path in changed] or ["_None detected (or clean tree)._"]
+    lines += ["", "---", "", "## Pointers", ""]
+    pointers = False
+    for key, label in (("latest_agent_result", "Latest agent result"),
+                       ("latest_critic_findings", "Latest critic findings")):
         value = getattr(state, key)
         if value:
             lines.append(f"- {label}: `{value}`")
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            pointers = True
+    if not pointers:
+        lines.append("_No saved agent/critic artifacts yet._")
+    lines += [
+        "",
+        "---",
+        "",
+        f"_Absoloop · `{state.mission_id}` — open with `absoloop report` for the lite viewer_",
+        "",
+    ]
+    report_path.write_text("\n".join(lines), encoding="utf-8")
     return report_path
 
 

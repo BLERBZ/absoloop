@@ -37,7 +37,7 @@ default_profile = "edit"
 required = ["tests"]
 
 [gates.commands]
-tests = "python3 -m unittest discover -s tests"
+tests = "python -m unittest discover -s tests"   # rewritten to this Python at gate time
 lint = ""
 typecheck = ""
 format = ""

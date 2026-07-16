@@ -132,12 +132,28 @@ prints every resolved value with its source.
   harness only adds `.absoloop/runs/` and `.absoloop/worktrees/`
   (the latter is transient and cleaned after each run).
 
+## Platforms
+
+Absoloop targets **Linux, macOS, and Windows**:
+
+| Concern | Behavior |
+|---|---|
+| Install | `bin/absoloop` auto-detects `ABSOLOOP_HOME`; Windows `absoloop.cmd` sets it |
+| Providers | `shutil.which` + PATHEXT — argv always uses a resolved path |
+| Cancel | Unix process groups · Windows `taskkill /T` process trees |
+| Gates | `python` / `python3` rewritten to the Absoloop interpreter |
+| Codex Micro | `absoloop do <action>` on all OS; TTY listen is Unix (`termios`) |
+| Report viewer | `open` / `xdg-open` / `os.startfile` |
+
+Run `absoloop doctor` after install — it prints environment, auth hints for
+Grok / Claude / Codex, gate command, and Micro setup tips.
+
 ## Testing
 
 ```bash
-python3 -m unittest discover -s tests             # 88 tests, no credentials needed
+python -m unittest discover -s tests             # offline, no credentials
 ABSOLOOP_LIVE_SMOKE=1 ABSOLOOP_SMOKE_CLAUDE=1 \
-  python3 -m unittest tests.test_harness_workflows.LiveSmoke   # opt-in live smoke
+  python -m unittest tests.test_harness_workflows.LiveSmoke   # opt-in live smoke
 ```
 
 Fake-provider executables under `tests/fakes/` simulate all three stream

@@ -202,7 +202,18 @@ class SupervisedProcess:
                     time.sleep(0.1)
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             else:
-                proc.terminate()
+                # Provider CLIs spawn grandchildren; terminate the whole tree.
+                from .platform_util import kill_process_tree
+                if not kill_process_tree(proc.pid):
+                    proc.terminate()
+                for _ in range(20):
+                    if proc.poll() is not None:
+                        return
+                    time.sleep(0.1)
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()

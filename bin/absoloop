@@ -16,7 +16,21 @@ import subprocess
 import sys
 import time
 
-ABSOLOOP_HOME = pathlib.Path(os.environ.get("ABSOLOOP_HOME", pathlib.Path.home() / "absoloop"))
+def _detect_absoloop_home() -> pathlib.Path:
+    """Install root: env override, then the checkout that owns this CLI,
+    then the legacy ~/absoloop fallback. Makes harness/Micro work without
+    a manual export when bin/ is on PATH."""
+    env = os.environ.get("ABSOLOOP_HOME")
+    if env:
+        return pathlib.Path(env).expanduser().resolve()
+    here = pathlib.Path(__file__).resolve().parent.parent
+    if (here / "absoloop_harness").is_dir() and (here / "templates").is_dir():
+        return here
+    return (pathlib.Path.home() / "absoloop").resolve()
+
+
+ABSOLOOP_HOME = _detect_absoloop_home()
+os.environ.setdefault("ABSOLOOP_HOME", str(ABSOLOOP_HOME))
 TEMPLATES = ABSOLOOP_HOME / "templates"
 
 
@@ -53,6 +67,7 @@ examples:
   absoloop my-mission -o "…" -d local --start -y
                                           # one shot: skip review, launch now
   absoloop status · watch · report · goal
+                                          # report → Markdown + lite viewer
   absoloop resume · resume --extend
   absoloop approve · reject "guidance"
 
@@ -1033,92 +1048,56 @@ def agent_summary(target: pathlib.Path, result_rel: str) -> str:
 
 
 def report_command(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(
+    parser = BannerParser(
         prog="absoloop report",
-        description="Iteration-by-iteration results view for the mission.")
+        description="Regenerate the mission report (Markdown) and open the "
+                    "lite infographic viewer.")
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
+    parser.add_argument("--no-open", action="store_true",
+                        help="write report.md + report.html without opening the viewer")
+    parser.add_argument("--terminal", action="store_true",
+                        help="print a terminal summary instead of opening the browser")
+    parser.add_argument("--md-only", action="store_true",
+                        help="only write report.md (skip HTML viewer)")
     args = parser.parse_args(argv)
     target = pathlib.Path(args.project).expanduser().resolve()
-    state = read_state(target)
-    if state is None:
+    if not (target / ".absoloop").is_dir():
+        print(f"error: no .absoloop/ under {target} — not an ABSOLOOP project.",
+              file=sys.stderr)
         return 1
-    runtime = load_runtime(target)
+    # Prefer the checkout that owns this CLI, then ABSOLOOP_HOME.
+    for candidate in (pathlib.Path(__file__).resolve().parent.parent, ABSOLOOP_HOME):
+        if (candidate / "absoloop_harness").is_dir():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            break
+    from absoloop_harness import report_doc
 
-    width = 62
-    def rule(char="─"):
-        print(char * width)
+    written = report_doc.write_report_docs(target, write_html=not args.md_only)
+    if written is None:
+        print(f"error: no readable mission state under {target}/.absoloop/",
+              file=sys.stderr)
+        return 1
 
-    rule("═")
-    print(f" ABSOLOOP REPORT — {state.get('mission_id')} "
-          f"({runtime.get('loop_id', 'no loop id')})")
-    rule("═")
-    if runtime.get("objective"):
-        print(f" objective : {runtime['objective']}")
-    delivery = runtime.get("delivery") or {}
-    if delivery:
-        detail = delivery.get("branch") if delivery.get("mode") == "git" else \
-                 delivery.get("out_dir") if delivery.get("mode") == "out" else \
-                 "working tree (unstaged)"
-        print(f" delivery  : {delivery.get('mode', 'local')} → {detail}")
-    print(f" status    : {state.get('status')}"
-          + (f"  ({state.get('stop_reason')})" if state.get("stop_reason") else ""))
-    cap = float(runtime.get("max_cost_usd") or 0)
-    spent = float(state.get("cost_usd", 0))
-    print(f" spend     : {with_tokens(f'${spent:.2f}', state.get('tokens_total'))} "
-          f"of ${cap:.2f}  {budget_bar(spent, cap)}")
-    max_iter = int(runtime.get("max_iterations") or 0)
-    done_iter = int(state.get("iteration", 0))
-    print(f" iterations: {done_iter} of {max_iter}  {budget_bar(done_iter, max_iter)}")
-    rule()
+    md_rel = written.markdown_path.relative_to(target)
+    print(report_doc.render_terminal(written.report))
+    print(f" document : {md_rel}")
+    if written.html_path.is_file() and not args.md_only:
+        print(f" viewer   : {written.html_path.relative_to(target)}")
 
-    # Stitch the ledger into one line per loop event, oldest first.
-    events = list(iter_ledger(target))
-    if not events:
-        print(" (no ledger yet — the loop has not run)")
-        rule()
-        return 0
-    print(" timeline")
-    for event in events:
-        ts = time.strftime("%m-%d %H:%M", time.localtime(event.get("ts", 0)))
-        kind = event.get("type")
-        if kind == "agent_run":
-            cost = f"${float(event.get('cost_usd', 0)):.2f}"
-            exact = "" if event.get("cost_is_exact") else "~"
-            limit = f" [hit {event['limit_reached']}]" if event.get("limit_reached") else ""
-            print(f"  {ts}  {event.get('engine')} run — exit {event.get('exit_code')}, "
-                  f"{with_tokens(exact + cost, event.get('tokens'))}, "
-                  f"{float(event.get('wall_seconds', 0)):.0f}s{limit}")
-            summary = agent_summary(target, str(event.get("result", "")))
-            if summary:
-                print(f"           └ {summary[:110]}")
-        elif kind == "iteration":
-            mark = "✓ builder reports DONE" if event.get("done") else "… not done yet"
-            print(f"  {ts}  iteration {event.get('iteration')}: {mark}")
-        elif kind == "early_done_claim":
-            print(f"  {ts}  done claim at iteration {event.get('iteration')} not "
-                  f"accepted (floor: {event.get('min_iterations')} iterations)")
-        elif kind == "integrity_check":
-            mark = "✓" if event.get("exit_code") == 0 else "✗ VIOLATION"
-            print(f"  {ts}  integrity check {mark}")
-        elif kind == "human_gate":
-            note = event.get("feedback") or event.get("note") or ""
-            print(f"  {ts}  human gate: {event.get('decision')}"
-                  + (f" — {note}" if note else ""))
-        elif kind == "delivery":
-            print(f"  {ts}  delivered ({event.get('mode')}): {event.get('detail', '')}")
-        elif kind == "mission_stop":
-            print(f"  {ts}  ■ stop: {event.get('status')} ({event.get('reason')})")
-        elif kind == "extension":
-            note = event.get("note") or ""
-            print(f"  {ts}  ▶ extended: {event.get('previous_loop_id')} → "
-                  f"{event.get('loop_id')}" + (f" — {note}" if note else ""))
-    rule()
-    print(f" next: {next_step_hint(state)}")
-    report_md = target / ".absoloop" / "report.md"
-    if report_md.is_file():
-        print(f" full report: {report_md.relative_to(target)}")
-    rule()
+    should_open = (
+        not args.no_open
+        and not args.terminal
+        and not args.md_only
+        and written.html_path.is_file()
+    )
+    if should_open:
+        opened = report_doc.open_viewer(written.html_path)
+        if opened:
+            print(" opened   : lite viewer in your browser")
+        else:
+            print(f" open manually: {written.html_path}", file=sys.stderr)
     return 0
 
 
@@ -1444,18 +1423,28 @@ def start_loop(target: pathlib.Path, engine: str) -> int:
                           cwd=target).returncode
 
 
+def _ensure_harness_path() -> None:
+    """Put the install that owns this CLI (and ABSOLOOP_HOME) on sys.path."""
+    for candidate in (pathlib.Path(__file__).resolve().parent.parent, ABSOLOOP_HOME):
+        if (candidate / "absoloop_harness").is_dir():
+            if str(candidate) not in sys.path:
+                sys.path.insert(0, str(candidate))
+            os.environ.setdefault("ABSOLOOP_HOME", str(candidate))
+            return
+    if str(ABSOLOOP_HOME) not in sys.path:
+        sys.path.insert(0, str(ABSOLOOP_HOME))
+
+
 def _load_harness():
     """The multi-provider harness package lives in the tooling home; import
     it lazily so legacy mission commands never pay for (or break on) it."""
-    if str(ABSOLOOP_HOME) not in sys.path:
-        sys.path.insert(0, str(ABSOLOOP_HOME))
+    _ensure_harness_path()
     from absoloop_harness import cli as harness_cli
     return harness_cli
 
 
 def _load_briefing():
-    if str(ABSOLOOP_HOME) not in sys.path:
-        sys.path.insert(0, str(ABSOLOOP_HOME))
+    _ensure_harness_path()
     from absoloop_harness import briefing
     return briefing
 
@@ -1582,8 +1571,7 @@ def main(argv: list[str]) -> int:
                             "cancel", "inspect", "apply", "config"):
         return _load_harness().dispatch(argv[0], argv[1:])
     if argv and argv[0] in ("shortcuts", "shortcut", "do"):
-        if str(ABSOLOOP_HOME) not in sys.path:
-            sys.path.insert(0, str(ABSOLOOP_HOME))
+        _ensure_harness_path()
         from absoloop_harness import shortcuts as sc
         if argv[0] == "do":
             return sc.do_command(argv[1:])
