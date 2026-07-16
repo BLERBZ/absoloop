@@ -10,9 +10,11 @@ CLI:  absoloop --zcomb  → same briefing/launch as absoloop + Kanban UI
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +25,43 @@ from typing import Any, Optional
 
 DEFAULT_PORT = 3141
 HEARTBEAT_STALE_SECONDS = 90
+# A spawned teammate is shown "active" while the mission is live and its
+# spawn event is younger than this; afterwards it flips to "done".
+TEAMMATE_ACTIVE_SECONDS = 600
+TEAMMATE_SPAWN_PREFIX = "spawn teammate · "
+TEAMMATE_TOOL_NAMES = ("Task", "Agent", "SpawnAgent", "spawn_subagent")
+
+# Quirky teammate names, themed by what the teammate was spawned to do.
+TEAMMATE_NAME_THEMES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
+    (("critic", "review", "adversar", "audit", "skeptic", "challenge"),
+     ("Grumbles von Nitpick", "The Side-Eye Sommelier", "Redline Rhonda",
+      "Doubtfire the Unimpressed", "Squint Eastwood")),
+    (("test", "qa", "verif", "validat", "coverage"),
+     ("Sgt. Breaksalot", "Captain Edge-Case", "Wanda the Wrecker",
+      "Flake Detector Hector", "The Assertion Goblin")),
+    (("research", "search", "explore", "investigat", "find", "scan", "analy"),
+     ("Indiana Grep", "Ferret of Facts", "Rabbit-Hole Ranger",
+      "Snoop Docs", "Magnifying-Glass Gus")),
+    (("fix", "repair", "debug", "patch", "bug"),
+     ("Duct-Tape Da Vinci", "Patchwork Pete", "The Solder Goblin",
+      "Wrench Wench", "Kintsugi Kevin")),
+    (("build", "implement", "write", "code", "creat", "develop"),
+     ("Tinker Tantrum", "Keyboard Kraken", "The Commit Gremlin",
+      "Scaffold Salamander", "Bricklayer Byte")),
+    (("doc", "readme", "spec", "summar"),
+     ("Quill Quibbler", "The Footnote Fiend", "Sir Scribbles-a-Lot",
+      "Parchment Piranha")),
+    (("secur", "vuln", "threat", "pentest"),
+     ("Paranoia Petunia", "Lockpick Lenny", "Tinfoil Tarantula",
+      "The Zero-Trust Walrus")),
+    (("plan", "design", "architect", "strateg"),
+     ("Blueprint Banshee", "Doodle Oracle", "Whiteboard Wizard Wes",
+      "The Napkin-Sketch Sphinx")),
+)
+TEAMMATE_FALLBACK_NAMES = (
+    "Wildcard Wombat", "Gizmo Gremlin", "Free-Range Frankie",
+    "The Loose Cannonball", "Odd-Job Ozzy", "Miscellaneous Mabel",
+)
 
 
 def extract_zcomb_flag(argv: list[str]) -> tuple[list[str], bool]:
@@ -139,9 +178,174 @@ def _agent_status(live: bool, role: str, monitor: dict, state: dict) -> str:
     return "idle"
 
 
+def _read_live_events(path: pathlib.Path, limit: int = 200) -> list[dict]:
+    """Last `limit` parsed events from live.jsonl (oldest first)."""
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    events: list[dict] = []
+    for line in lines[-limit:]:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            events.append(event)
+    return events
+
+
+def _teammate_focus(detail: str) -> str:
+    """Extract the teammate's focus from a 'spawn teammate · …' detail line."""
+    if not detail.startswith(TEAMMATE_SPAWN_PREFIX):
+        return ""
+    rest = detail[len(TEAMMATE_SPAWN_PREFIX):].strip()
+    for tool in TEAMMATE_TOOL_NAMES:
+        if rest == tool:
+            return "general support"
+        prefix = f"{tool}: "
+        if rest.startswith(prefix):
+            return rest[len(prefix):].strip() or "general support"
+    return rest or "general support"
+
+
+def quirky_teammate_name(focus: str, used: Optional[set[str]] = None) -> str:
+    """Deterministic off-the-wall name themed to the teammate's focus."""
+    low = focus.lower()
+    pool: tuple[str, ...] = TEAMMATE_FALLBACK_NAMES
+    for keywords, names in TEAMMATE_NAME_THEMES:
+        if any(k in low for k in keywords):
+            pool = names
+            break
+    seed = int(hashlib.sha1(low.encode("utf-8")).hexdigest()[:8], 16)
+    for offset in range(len(pool)):
+        candidate = pool[(seed + offset) % len(pool)]
+        if used is None or candidate not in used:
+            if used is not None:
+                used.add(candidate)
+            return candidate
+    # Pool exhausted — number the overflow so every teammate stays distinct.
+    n = 2
+    base = pool[seed % len(pool)]
+    while f"{base} {n}" in (used or set()):
+        n += 1
+    name = f"{base} {n}"
+    if used is not None:
+        used.add(name)
+    return name
+
+
+def _collect_teammates(events: list[dict]) -> dict[str, dict]:
+    """Fold spawn events into a registry keyed by focus text."""
+    teammates: dict[str, dict] = {}
+    used_names: set[str] = set()
+    for event in events:
+        if str(event.get("kind") or "") != "tool":
+            continue
+        detail = str(event.get("detail") or "")
+        focus = _teammate_focus(detail)
+        if not focus:
+            continue
+        key = focus.lower()
+        ts = event.get("ts")
+        ts = float(ts) if isinstance(ts, (int, float)) else time.time()
+        if key in teammates:
+            record = teammates[key]
+            record["spawns"] += 1
+            record["last_ts"] = max(record["last_ts"], ts)
+        else:
+            teammates[key] = {
+                "id": f"teammate-{hashlib.sha1(key.encode('utf-8')).hexdigest()[:6]}",
+                "name": quirky_teammate_name(focus, used_names),
+                "focus": focus,
+                "spawns": 1,
+                "first_ts": ts,
+                "last_ts": ts,
+            }
+    return teammates
+
+
+_TOOL_VERBS = {
+    "bash": "Ran",
+    "read": "Read",
+    "write": "Wrote",
+    "edit": "Edited",
+    "multiedit": "Edited",
+    "strreplace": "Edited",
+    "notebookedit": "Edited notebook",
+    "grep": "Searched code for",
+    "glob": "Looked for files matching",
+    "ls": "Listed",
+    "webfetch": "Fetched",
+    "websearch": "Searched the web for",
+    "todowrite": "Updated the plan",
+}
+
+
+def _humanize_shell(command: str) -> str:
+    """Compress a raw shell command into a readable one-liner."""
+    cmd = " ".join(command.split())
+    # Drop redirection noise that dominates raw command dumps.
+    cmd = re.sub(r"\s*(?:2>&1|>\s*/dev/null|2>\s*/dev/null)\s*", " ", cmd).strip()
+    segments = [s.strip() for s in re.split(r"\s*(?:&&|\|\||;)\s*", cmd) if s.strip()]
+    first = segments[0] if segments else cmd
+    if len(first) > 100:
+        first = first[:97] + "…"
+    extra = len(segments) - 1
+    label = f"Ran `{first}`"
+    if extra > 0:
+        label += f" (+{extra} more step{'s' if extra != 1 else ''})"
+    return label
+
+
+def _humanize_structured_output(payload: str) -> str:
+    """Summarize a StructuredOutput JSON blob instead of dumping it raw."""
+    try:
+        data = json.loads(payload)
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    if isinstance(data, dict):
+        summary = str(data.get("summary") or data.get("status") or "").strip()
+        parts = []
+        if summary:
+            parts.append(summary[:140])
+        artifacts = data.get("changed_artifacts")
+        if isinstance(artifacts, list) and artifacts:
+            parts.append(f"{len(artifacts)} changed artifact"
+                         + ("s" if len(artifacts) != 1 else ""))
+        if parts:
+            return "Reported results · " + " · ".join(parts)
+        keys = ", ".join(list(data.keys())[:4])
+        return f"Reported structured results ({keys})"
+    return "Reported structured results"
+
+
+def _humanize_activity(kind: str, detail: str) -> str:
+    """Turn raw narration lines into readable activity-feed messages."""
+    detail = detail.strip()
+    if kind != "tool" or ": " not in detail:
+        return detail
+    tool, _, rest = detail.partition(": ")
+    rest = rest.strip()
+    low = tool.strip().lower()
+    if low == "bash":
+        return _humanize_shell(rest)
+    if low == "structuredoutput":
+        return _humanize_structured_output(rest)
+    verb = _TOOL_VERBS.get(low)
+    if verb:
+        if len(rest) > 140:
+            rest = rest[:137] + "…"
+        return f"{verb} {rest}"
+    return detail
+
+
 def _task(tid: str, title: str, status: str, assignee: Optional[str],
           priority: str, phase: int, created: str, updated: str,
-          deps: Optional[list[str]] = None) -> dict:
+          deps: Optional[list[str]] = None,
+          description: str = "") -> dict:
     return {
         "id": tid,
         "title": title,
@@ -152,6 +356,7 @@ def _task(tid: str, title: str, status: str, assignee: Optional[str],
         "phase": phase,
         "createdAt": created,
         "updatedAt": updated,
+        "description": description or "",
     }
 
 
@@ -228,6 +433,9 @@ def build_bridge_state(project: pathlib.Path) -> dict:
     if isinstance(last, dict):
         activity_detail = str(last.get("detail") or "").strip()
 
+    live_events = _read_live_events(tmp / "live.jsonl")
+    teammates = _collect_teammates(live_events)
+
     agents = [
         {
             "id": builder_id,
@@ -263,24 +471,43 @@ def build_bridge_state(project: pathlib.Path) -> dict:
     ]
 
     # Pipeline tasks + current iteration card
+    cost_usd = float(source.get("cost_usd") or 0)
+    iter_label = f"{iteration}/{max_iter}" if max_iter else f"iter {iteration}"
+    execute_desc = f"Engine {engine} · iteration {iter_label}"
+    if live and activity_detail:
+        execute_desc += f" · now: {activity_detail[:110]}"
+    critic_desc = f"Independent adversarial review of iteration {iteration} evidence"
+    if teammates:
+        critic_desc += (f" · {len(teammates)} teammate"
+                        + ("s" if len(teammates) != 1 else "") + " spawned")
+    gate_desc = ("Awaiting your decision — approve or reject from Mission Controls"
+                 if status == "AWAITING_APPROVAL"
+                 else "Human reviews the critic-passed result before delivery")
+    deliver_desc = f"Hand off accepted work for {mission_id}"
+    if cost_usd:
+        deliver_desc += f" · ${cost_usd:.2f} spent"
+
     pipe_defs = [
-        ("scaffold", "Scaffold mission + /goal contract", builder_id, "high", 0, []),
-        ("execute", f"Execute repair iterations"
-                    + (f" ({iteration}/{max_iter})" if max_iter else f" (iter {iteration})"),
-         builder_id, "high", 1, ["task-scaffold"]),
+        ("scaffold", "Scaffold mission + /goal contract", builder_id, "high", 0,
+         [], f"{mission_id} · {objective[:150]}"),
+        ("execute", f"Execute repair iterations ({iter_label})",
+         builder_id, "high", 1, ["task-scaffold"], execute_desc),
         ("integrity", "Integrity check before critic", builder_id, "medium", 2,
-         ["task-execute"]),
+         ["task-execute"],
+         "Builder self-audits acceptance evidence against the /goal contract"),
         ("critic", "Adversarial critic review", critic_id, "high", 3,
-         ["task-integrity"]),
-        ("gate", "Human approval gate", None, "high", 4, ["task-critic"]),
-        ("deliver", "Deliver accepted work", builder_id, "medium", 5, ["task-gate"]),
+         ["task-integrity"], critic_desc),
+        ("gate", "Human approval gate", None, "high", 4, ["task-critic"],
+         gate_desc),
+        ("deliver", "Deliver accepted work", builder_id, "medium", 5,
+         ["task-gate"], deliver_desc),
     ]
     tasks = []
-    for name, title, assignee, priority, phase_n, deps in pipe_defs:
+    for name, title, assignee, priority, phase_n, deps, desc in pipe_defs:
         col = _pipeline_status(name, live, status, phase, iteration, max_iter)
         tasks.append(_task(
             f"task-{name}", title, col, assignee, priority, phase_n,
-            created, updated, deps))
+            created, updated, deps, description=desc))
 
     # One card per completed/current iteration for kanban depth
     for i in range(1, max(iteration, 0) + 1):
@@ -296,17 +523,25 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             col = "done"
         else:
             col = "done"
+        if i == iteration and live and activity_detail:
+            iter_desc = f"Now: {activity_detail[:140]}"
+        else:
+            iter_desc = f"Repair pass {i}" \
+                        + (f" of {max_iter}" if max_iter else "") \
+                        + f" toward: {objective[:110]}"
         tasks.append(_task(
             f"iter-{i:04d}",
             f"Iteration {i}: advance toward objective",
             col, builder_id, "medium", 1, created, updated,
-            ["task-execute"] if i == 1 else [f"iter-{i - 1:04d}"]))
+            ["task-execute"] if i == 1 else [f"iter-{i - 1:04d}"],
+            description=iter_desc))
 
     if not (abs_dir / "runtime.json").is_file():
         # Empty project — idle placeholder so the UI isn't blank
         tasks = [
             _task("task-waiting", "Waiting for an Absoloop mission in this project",
-                  "inbox", None, "low", 0, now, now),
+                  "inbox", None, "low", 0, now, now,
+                  description="Run `absoloop` in this project to start a mission."),
         ]
         agents = [
             {**agents[0], "status": "idle", "currentTask": None,
@@ -315,30 +550,40 @@ def build_bridge_state(project: pathlib.Path) -> dict:
              "metrics": {"tasksCompleted": 0, "errors": 0}},
         ]
 
+    # Spawned teammates get first-class agent cards with quirky names.
+    for record in teammates.values():
+        recent = live and (time.time() - record["last_ts"]) < TEAMMATE_ACTIVE_SECONDS
+        agents.append({
+            "id": record["id"],
+            "name": record["name"],
+            "role": f"Spawned teammate — {record['focus'][:140]}",
+            "status": "active" if recent else "done",
+            "currentTask": record["focus"][:120] if recent else None,
+            "metrics": {"tasksCompleted": record["spawns"], "errors": 0},
+        })
+
     # Activity from live.jsonl
     activity: list[dict] = []
-    live_path = tmp / "live.jsonl"
-    if live_path.is_file():
-        try:
-            lines = live_path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            lines = []
-        for line in lines[-200:]:
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(event, dict):
-                continue
-            agent_name = str(event.get("agent") or "builder").lower()
-            agent_id = critic_id if "critic" in agent_name else builder_id
-            kind = str(event.get("kind") or "say")
-            activity.append({
-                "timestamp": _iso(event.get("ts")),
-                "agentId": agent_id,
-                "type": KIND_TO_ACTIVITY.get(kind, "status_change"),
-                "message": str(event.get("detail") or kind)[:240],
-            })
+    for event in live_events:
+        agent_name = str(event.get("agent") or "builder").lower()
+        agent_id = critic_id if "critic" in agent_name else builder_id
+        kind = str(event.get("kind") or "say")
+        detail = str(event.get("detail") or kind)
+        activity_type = KIND_TO_ACTIVITY.get(kind, "status_change")
+        focus = _teammate_focus(detail) if kind == "tool" else ""
+        record = teammates.get(focus.lower()) if focus else None
+        if record:
+            agent_id = record["id"]
+            activity_type = "spawned"
+            message = f"{record['name']} joins the team — {record['focus']}"
+        else:
+            message = _humanize_activity(kind, detail)
+        activity.append({
+            "timestamp": _iso(event.get("ts")),
+            "agentId": agent_id,
+            "type": activity_type,
+            "message": message[:240],
+        })
 
     if not activity:
         activity.append({
@@ -444,12 +689,16 @@ def _port_in_use(port: int) -> bool:
         return False
 
 
-def start_server(state_dir: pathlib.Path, port: int) -> subprocess.Popen:
+def start_server(state_dir: pathlib.Path, port: int,
+                 project: Optional[pathlib.Path] = None) -> subprocess.Popen:
     mon = monitor_dir()
     env = os.environ.copy()
     env["ZCOMB_PORT"] = str(port)
     env["ZCOMB_STATE_DIR"] = str(state_dir.resolve())
     env["PORT"] = str(port)
+    if project is not None:
+        env["ZCOMB_PROJECT"] = str(project.resolve())
+    env.setdefault("ABSOLOOP_HOME", str(zcomb_home().parent))
     log_path = state_dir.parent / "dashboard.log"
     state_dir.parent.mkdir(parents=True, exist_ok=True)
     log_f = open(log_path, "a", encoding="utf-8")
@@ -513,7 +762,7 @@ def spawn_background(project: pathlib.Path, *, port: int = DEFAULT_PORT,
         state_dir = sync_state(project)
         proc: Optional[subprocess.Popen]
         if not _port_in_use(port):
-            proc = start_server(state_dir, port)
+            proc = start_server(state_dir, port, project=project)
             if not wait_ready(port, timeout=20):
                 print(f"  warning: ZComb dashboard did not become ready on :{port}",
                       file=sys.stderr)
@@ -597,7 +846,7 @@ def zcomb_command(argv: list[str]) -> int:
         print(f"  Dashboard already running at {url}")
     else:
         print(f"  Starting ZComb dashboard on {url} …")
-        proc = start_server(state_dir, port)
+        proc = start_server(state_dir, port, project=project)
         if not wait_ready(port):
             print(f"error: dashboard failed to start (see "
                   f"{state_dir.parent / 'dashboard.log'})", file=sys.stderr)
