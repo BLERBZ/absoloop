@@ -67,11 +67,15 @@ the terminal is buried. Silence with `ABSOLOOP_CHIME=0`.
 | Layer | Owner | What spawns |
 |---|---|---|
 | Outer | Absoloop mission loop | Builder process, then critic process (same engine) |
-| Inner | Provider CLI | Claude Agent Teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`), Codex subagents, Grok `spawn_subagent` |
+| Inner | **Builder** (team lead) | Claude Agent Teams via Task tool (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, `--teammate-mode in-process`), Codex subagents, Grok `spawn_subagent` |
 
-Builder prompts include an engine-aware delegation posture. Critic runs stay
-evidence-first (no team fan-out required). Skills install into
-`.claude/skills/`, `.codex/skills/`, and `.grok/skills/`.
+The Builder is explicitly the team lead: multi-file / larger builds must spawn
+teammates first and coordinate; solo only true one-file fixes. Critic stays
+evidence-first (no team fan-out). Skills install into `.claude/skills/`,
+`.codex/skills/`, and `.grok/skills/`.
+
+After upgrading Absoloop, re-enter the project (or run the loop again) so
+`scripts/absoloop-run` syncs — stale runners keep the old soft prompt.
 
 ## Lifecycle commands
 

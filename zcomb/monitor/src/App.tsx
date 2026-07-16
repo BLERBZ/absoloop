@@ -67,11 +67,11 @@ export default function App() {
           <img
             src="/absoloop-logo-mark.png"
             alt=""
-            width={28}
-            height={28}
+            width={34}
+            height={34}
             style={{
-              width: 28,
-              height: 28,
+              width: 34,
+              height: 34,
               objectFit: 'contain',
               display: 'block',
               flexShrink: 0,

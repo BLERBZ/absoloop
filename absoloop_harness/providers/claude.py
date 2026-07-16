@@ -73,7 +73,9 @@ class ClaudeAdapter(ProviderAdapter):
     def build_argv(self, request: AgentRequest, resume: Optional[SessionRef],
                    workdir: pathlib.Path):
         argv = [self.argv_program(),
-                "-p", "--output-format", "stream-json", "--verbose"]
+                "-p", "--output-format", "stream-json", "--verbose",
+                # Headless: Agent Teams stay in-process (no tmux/iTerm panes).
+                "--teammate-mode", "in-process"]
         model = request.model or self.config.get("model") or ""
         if model:
             argv += ["--model", model]
