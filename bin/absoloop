@@ -70,6 +70,7 @@ examples:
   absoloop status · watch · report · goal
   absoloop resume · resume --extend
   absoloop approve · reject "guidance"
+  absoloop schedule add|list|tick|daemon   # cron / interval mission triggers
 
 Mission Briefing keys: Enter launch · o objective · e engine · d delivery
                        n rename · g preview /goal · q abort
@@ -79,6 +80,11 @@ Harness: doctor · providers · run · build · review · cancel · inspect · a
 Shortcuts (keyboard + Codex Micro):
   absoloop shortcuts list|layout|export|listen|bind
   absoloop do status          # same actions the Micro keys fire
+
+Schedule (never auto-approves the human gate):
+  absoloop schedule add --cron "0 0 * * 5" --tz America/New_York --action extend
+  absoloop schedule tick --once
+  absoloop schedule daemon start|stop|status
 
 Runner exit codes: 0 completed · 3 awaiting approval · 2 stopped safely.
 """
@@ -1610,6 +1616,10 @@ def main(argv: list[str]) -> int:
         if argv[0] == "do":
             return sc.do_command(argv[1:])
         return sc.shortcuts_command(argv[1:])
+    if argv and argv[0] in ("schedule", "schedules"):
+        _ensure_harness_path()
+        from absoloop_harness import schedule as sched
+        return sched.schedule_command(argv[1:])
 
     parser = BannerParser(
         prog="absoloop",

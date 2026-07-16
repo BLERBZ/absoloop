@@ -91,6 +91,7 @@ absoloop status · watch · report   # see, stream, then open the report viewer
 absoloop approve                   # accept at the human gate
 absoloop reject "use the v2 API"   # steer the next iteration
 absoloop resume · resume --extend
+absoloop schedule add|tick|daemon   # cron / interval triggers (never auto-approves)
 ```
 
 Runner exit codes: `0` completed · `3` awaiting your approval · `2` stopped safely.

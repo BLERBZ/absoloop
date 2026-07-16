@@ -95,6 +95,12 @@ ACTIONS: Dict[str, Action] = {
     "extend": Action(
         "extend", "Follow-on run for a COMPLETED mission",
         ("resume", "--extend"), group="mission", micro_slot="extend"),
+    "schedule-tick": Action(
+        "schedule-tick", "Fire due Absoloop schedules once",
+        ("schedule", "tick", "--once"), group="system", micro_slot=""),
+    "schedule-list": Action(
+        "schedule-list", "List project schedules",
+        ("schedule", "list"), group="system", micro_slot=""),
     "brief": Action(
         "brief", "Open Mission Briefing in the current directory",
         (".",), group="mission", micro_slot="new",

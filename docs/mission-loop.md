@@ -58,6 +58,7 @@ absoloop approve
 absoloop reject "guidance"
 absoloop resume
 absoloop resume --extend
+absoloop schedule …          # cron / interval triggers (see docs/schedule.md)
 ```
 
 ## The `/goal` contract

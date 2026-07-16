@@ -1,0 +1,17 @@
+# Example Absoloop schedule — copy into .absoloop/schedules/<id>.toml
+# or create with: absoloop schedule add ...
+#
+# Schedules never auto-approve the human gate.
+
+id = "friday-rotate"
+enabled = true
+kind = "cron"
+expr = "0 0 * * 5"
+timezone = "America/New_York"
+action = "extend"
+note = "Plan, design, and ship the next unique weekly deliverable"
+hours = 24
+iterations = 50
+budget = 150.0
+if_busy = "skip"
+require_status = ["COMPLETED", "BUDGET_EXHAUSTED"]
