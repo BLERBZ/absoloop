@@ -79,6 +79,24 @@ Selection is deterministic: gate survivors first, then fewest gate failures,
 then completed runs, then smallest diff. LLM judgment is never applied
 before deterministic gates.
 
+## Two-layer agent teams
+
+Absoloop orchestrates **outer** multi-agent work (`race` / `council` /
+`review`). Each spawned provider CLI can also run **inner** native teams:
+
+| Provider | Inner enablement |
+|---|---|
+| Claude | Adapter injects `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`; allowlisted so parent env passes through |
+| Codex | Subagents on by default; implementer prompts ask for parallel spawn when work fans out |
+| Grok | Implementer prompts ask for `spawn_subagent` (+ worktree isolation when racing files) |
+
+Default `env_allowlist` entries pass `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` /
+`XAI_API_KEY` (and Claude’s teams flag / `GROK_HOME`) into the child. The
+harness otherwise strips the environment.
+
+Write profiles (`edit` / `full`) get a delegation posture appended to the
+prompt; `read` (planner/critic) stays lean.
+
 ## Configuration
 
 Copy `absoloop.toml.example` to your project as `absoloop.toml` (or to

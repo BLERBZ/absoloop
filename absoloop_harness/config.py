@@ -12,14 +12,20 @@ from . import toml_lite
 
 PROVIDERS = ("grok", "claude", "codex")
 
+# Native team/subagent enablement: API keys + Claude Agent Teams flag must be
+# allowlisted or harness build_child_env strips them from the provider process.
+_GROK_ENV = ["XAI_API_KEY", "GROK_HOME"]
+_CLAUDE_ENV = ["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "ANTHROPIC_API_KEY"]
+_CODEX_ENV = ["OPENAI_API_KEY"]
+
 DEFAULTS: Dict[str, Any] = {
     "providers": {
         "grok": {"command": "grok", "model": "", "timeout_seconds": 1800,
-                 "env_allowlist": []},
+                 "env_allowlist": list(_GROK_ENV)},
         "claude": {"command": "claude", "model": "", "timeout_seconds": 1800,
-                   "env_allowlist": []},
+                   "env_allowlist": list(_CLAUDE_ENV)},
         "codex": {"command": "codex", "model": "", "timeout_seconds": 1800,
-                  "env_allowlist": [],
+                  "env_allowlist": list(_CODEX_ENV),
                   # exec-resume | exec-flags-then-resume — see docs/multi-provider.md
                   "resume_style": "exec-resume"},
     },

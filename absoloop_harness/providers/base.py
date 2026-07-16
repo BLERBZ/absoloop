@@ -151,6 +151,11 @@ class ProviderAdapter:
                 f"unknown permission profile {profile!r} for provider {self.name}; "
                 f"expected one of {PERMISSION_PROFILES} — failing closed")
 
+    def provider_extra_env(self, request: AgentRequest) -> Dict[str, str]:
+        """Provider-forced env merged into the child after allowlist pass-through.
+        Values here always reach the process (unlike allowlisted parent keys)."""
+        return {}
+
     def start(self, request: AgentRequest, run_id: str = "adhoc") -> Iterator[AgentEvent]:
         return self._run(request, None, run_id)
 
@@ -176,8 +181,10 @@ class ProviderAdapter:
         resolved = self.executable()
         if resolved and argv:
             argv = [resolved, *argv[1:]]
+        merged_extra = dict(request.extra_env or {})
+        merged_extra.update(self.provider_extra_env(request))
         env = build_child_env(self.config.get("env_allowlist") or [],
-                              request.extra_env)
+                              merged_extra)
         secrets_to_hide = secret_values(env)
         cancel_flag = (run_ctrl.cancel_flag_path(self._run_dir)
                        if self._run_dir is not None else None)

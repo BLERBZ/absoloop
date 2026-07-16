@@ -759,7 +759,7 @@ def schedule_command(argv: Sequence[str], *, cwd: Optional[pathlib.Path] = None
     p_add.add_argument("--action", choices=ACTIONS, default="resume")
     p_add.add_argument("-m", "--note", default="",
                        help="extend/start focus note")
-    p_add.add_argument("--engine", choices=["claude", "codex"], default="")
+    p_add.add_argument("--engine", choices=["claude", "codex", "grok"], default="")
     p_add.add_argument("--iterations", type=int)
     p_add.add_argument("--budget", type=float)
     p_add.add_argument("--hours", type=float)

@@ -81,8 +81,10 @@ class GoalContract(unittest.TestCase):
         config = self._config()
         for key in ("mission_id", "loop_id", "objective", "thinking_ladder",
                     "delivery", "max_iterations", "max_cost_usd",
-                    "claude", "codex"):
+                    "claude", "codex", "grok"):
             self.assertIn(key, config)
+        self.assertEqual(config["grok"]["builder"]["permission_profile"], "edit")
+        self.assertEqual(config["grok"]["critic"]["permission_profile"], "read")
 
 
 class DeliveryModes(unittest.TestCase):

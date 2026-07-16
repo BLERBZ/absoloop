@@ -20,8 +20,11 @@ objective ──► /goal contract ──► iterate: builder works, reports don
   weakened tests are an automatic rejection.
 - **Bounded** — hard caps on iterations, wall clock, and dollars, with
   checkpointed state you can resume or extend.
-- **Engine-agnostic** — the same mission runs under `claude` or `codex`
-  (and harness providers for one-shot / race / council flows).
+- **Engine-agnostic** — the same mission runs under `claude`, `codex`, or
+  `grok` (and harness providers for one-shot / race / council flows).
+- **Two-layer teams** — Absoloop spawns the builder/critic CLI; that
+  process is prompted (and for Claude, env-enabled) to fan out with native
+  Agent Teams / subagents when workstreams are independent.
 - **Observable** — console stream + `.absoloop/tmp/monitor.json` +
   `live.jsonl`, rendered by `absoloop watch`.
 
@@ -43,10 +46,23 @@ and generates the `/goal` contract at `.absoloop/goal.md`.
 
 ```bash
 ./scripts/absoloop-run --engine claude      # macOS/Linux
+./scripts/absoloop-run --engine codex
+./scripts/absoloop-run --engine grok
 python scripts/absoloop-run --engine claude # Windows
 ```
 
 Exit codes: `0` completed · `3` awaiting approval · `2` stopped safely.
+
+### Two-layer agent teams (mission)
+
+| Layer | Owner | What spawns |
+|---|---|---|
+| Outer | Absoloop mission loop | Builder process, then critic process (same engine) |
+| Inner | Provider CLI | Claude Agent Teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`), Codex subagents, Grok `spawn_subagent` |
+
+Builder prompts include an engine-aware delegation posture. Critic runs stay
+evidence-first (no team fan-out required). Skills install into
+`.claude/skills/`, `.codex/skills/`, and `.grok/skills/`.
 
 ## Lifecycle commands
 

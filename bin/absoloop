@@ -94,7 +94,7 @@ You are an independent adversarial reviewer. Attempt to disprove that the
 current working tree satisfies the mission contract. Inspect the relevant
 files yourself with read-only tools; do not trust any builder narrative.
 Look for weakened tests, unverifiable claims, regressions, and scope drift.
-Mission skills under .claude/skills/ or .codex/skills/ are authorized loop
+Mission skills under .claude/skills/, .codex/skills/, or .grok/skills/ are authorized loop
 infrastructure, not scope drift — but audit them like any artifact: a skill
 must do exactly what its description says and must not weaken the mission's
 acceptance bar.
@@ -163,7 +163,11 @@ def sync_runner(target: pathlib.Path) -> None:
 # Each engine's native project-skill discovery path: both CLIs scan their
 # directory at session startup, so a skill installed here is available with
 # no extra flags — the standardized SKILL.md format works in both unchanged.
-ENGINE_SKILL_DIRS = {"claude": ".claude/skills", "codex": ".codex/skills"}
+ENGINE_SKILL_DIRS = {
+    "claude": ".claude/skills",
+    "codex": ".codex/skills",
+    "grok": ".grok/skills",
+}
 
 
 def toolbox_manifest() -> dict:
@@ -472,7 +476,7 @@ def generate_goal_markdown(config: dict) -> str:
         "## Skills — the mission's capability pipeline",
         "",
         "Reusable skills live in your engine's skills directory in this project",
-        "(`.claude/skills/` for claude, `.codex/skills/` for codex — the",
+        "(`.claude/skills/` / `.codex/skills/` / `.grok/skills/` — the",
         "iteration prompt lists what is installed). A standard toolbox is",
         "seeded at setup (skill-creator, ai-ready, tdd, agent-browser,",
         "mcp-builder, frontend-design, plus engine-specific references); skills",
@@ -647,6 +651,12 @@ def runtime_config(objective: str, loop_id: str, delivery_mode: str) -> dict:
             "critic": {"sandbox": "read-only", "max_budget_usd": 2.0,
                        "max_wall_seconds": 600, "model_reasoning_effort": "high"},
         },
+        "grok": {
+            "builder": {"permission_profile": "edit", "max_turns": 30,
+                        "max_budget_usd": 5.0, "max_wall_seconds": 1200},
+            "critic": {"permission_profile": "read", "max_turns": 12,
+                       "max_budget_usd": 2.0, "max_wall_seconds": 600},
+        },
     }
 
 
@@ -658,7 +668,7 @@ def ask(prompt: str) -> str:
         sys.exit(1)
 
 
-ENGINES = ("claude", "codex")
+ENGINES = ("claude", "codex", "grok")
 
 
 def default_engine() -> str | None:
@@ -1332,7 +1342,7 @@ def resume_command(argv: list[str]) -> int:
                     "follow-on run that completes a finished mission's work.")
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
-    parser.add_argument("--engine", choices=["claude", "codex"],
+    parser.add_argument("--engine", choices=["claude", "codex", "grok"],
                         help="engine for the loop (default: first one found on PATH)")
     parser.add_argument("--extend", action="store_true",
                         help="start a follow-on run of a finished mission: fresh "
@@ -1360,7 +1370,8 @@ def resume_command(argv: list[str]) -> int:
         return 1
     engine = args.engine or default_engine()
     if engine is None:
-        print("error: no engine available — install 'claude' or 'codex'.", file=sys.stderr)
+        print("error: no engine available — install 'claude', 'codex', or 'grok'.",
+              file=sys.stderr)
         return 1
     status = state.get("status")
     if args.extend:

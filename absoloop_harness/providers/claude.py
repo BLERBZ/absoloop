@@ -65,6 +65,11 @@ class ClaudeAdapter(ProviderAdapter):
             raise PermissionMappingError(f"no claude mapping for profile {profile!r}")
         return mapping[profile]
 
+    def provider_extra_env(self, request: AgentRequest) -> Dict[str, str]:
+        # Experimental Agent Teams: enable native teammate spawning inside the
+        # Claude Code process Absoloop already spawned (two-layer teams).
+        return {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}
+
     def build_argv(self, request: AgentRequest, resume: Optional[SessionRef],
                    workdir: pathlib.Path):
         argv = [self.argv_program(),

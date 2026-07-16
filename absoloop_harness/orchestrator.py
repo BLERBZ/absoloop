@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from .config import Config
 from .core import (AgentEvent, AgentRequest, EventType, RunResult,
                    SessionRef, new_run_id)
+from .delegation import with_delegation
 from .providers import make_adapter
 from .providers.base import ProviderAdapter
 from . import runtime as run_ctrl
@@ -506,7 +507,9 @@ class Orchestrator:
         timeout = float(self.cfg.get("providers", provider, "timeout_seconds",
                                      default=1800))
         model = str(self.cfg.get("providers", provider, "model", default="") or "")
-        return AgentRequest(prompt=prompt, cwd=str(workdir),
+        # Outer Absoloop orchestration + inner native teams/subagents.
+        tasked = with_delegation(prompt, provider, profile)
+        return AgentRequest(prompt=tasked, cwd=str(workdir),
                             permission_profile=profile, model=model,
                             timeout_seconds=timeout)
 

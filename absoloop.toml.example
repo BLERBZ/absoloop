@@ -7,19 +7,23 @@
 command = "grok"            # executable name or absolute path
 model = ""                  # optional default model (e.g. "grok-build")
 timeout_seconds = 1800
-env_allowlist = []          # extra env vars passed through (e.g. ["XAI_API_KEY"])
+# Passed through to the child so native auth / subagents work under the
+# harness env allowlist (everything else is stripped).
+env_allowlist = ["XAI_API_KEY", "GROK_HOME"]
 
 [providers.claude]
 command = "claude"
 model = ""
 timeout_seconds = 1800
-env_allowlist = []
+# CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS enables native Agent Teams; the
+# Claude adapter also injects =1 even if the parent shell never set it.
+env_allowlist = ["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "ANTHROPIC_API_KEY"]
 
 [providers.codex]
 command = "codex"
 model = ""
 timeout_seconds = 1800
-env_allowlist = []
+env_allowlist = ["OPENAI_API_KEY"]
 # Resume argv shape when Codex builds differ:
 #   exec-resume            — codex exec resume <id> --json --cd … -  (default)
 #   exec-flags-then-resume — codex exec --json --cd … resume <id> -

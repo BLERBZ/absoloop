@@ -1,11 +1,17 @@
 # Absoloop Multi-Provider Harness
 
-Absoloop's original loop drove two engines (`claude`, `codex`) through
-engine-specific code baked into `templates/absoloop-run`. The multi-provider
-harness generalizes this into a provider-neutral local agent OS that runs
+Absoloop's mission loop and multi-provider harness both run
 **Grok Build, Claude Code, and Codex** as first-class backends — preserving
 each agent's native authentication, tools, sessions, permissions, sandboxing,
-and streaming.
+and streaming. The mission runner lives in `templates/absoloop-run`; the
+harness generalizes one-shot / race / council flows into a provider-neutral
+local agent OS.
+
+**Two-layer teams:** Absoloop owns outer orchestration (builder/critic, or
+race/council lanes). Each provider process is configured and prompted to use
+its own inner Agent Teams / subagents (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`
+injected for Claude; Codex and Grok via prompt posture). Process-group kill
+on cancel still reaps provider-spawned grandchildren.
 
 This is **agent-runtime integration, not model-provider switching**: each
 provider is its own CLI subprocess with its own auth, tools, and session
