@@ -134,7 +134,10 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
   const uniquePhases = Array.from(new Set(tasks.map(t => t.phase))).sort((a, b) => a - b);
 
   const filteredTasks = tasks.filter(t => {
-    const matchesSearch = searchQuery === '' || t.title.toLowerCase().includes(searchQuery.toLowerCase());
+    const q = searchQuery.toLowerCase();
+    const matchesSearch = q === ''
+      || t.title.toLowerCase().includes(q)
+      || (t.description || '').toLowerCase().includes(q);
     const matchesPhase = phaseFilter === 'all' || t.phase === Number(phaseFilter);
     return matchesSearch && matchesPhase;
   });
@@ -361,6 +364,28 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                             color="#58a6ff"
                           />
                         </div>
+
+                        {/* Contextual description */}
+                        {task.description && (
+                          <div style={{
+                            fontSize: px(8.5, 6),
+                            color: subText,
+                            lineHeight: 1.4,
+                            marginTop: -px(2),
+                            marginBottom: px(5),
+                            wordBreak: 'break-word',
+                            display: '-webkit-box',
+                            WebkitLineClamp: 3,
+                            WebkitBoxOrient: 'vertical',
+                            overflow: 'hidden',
+                          }}>
+                            <HighlightText
+                              text={task.description}
+                              query={searchQuery}
+                              color="#58a6ff"
+                            />
+                          </div>
+                        )}
 
                         {/* Meta row */}
                         <div style={{

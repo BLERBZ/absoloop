@@ -82,6 +82,79 @@ class BridgeStateTests(unittest.TestCase):
                                 for a in bridged["activity"]))
             self.assertTrue(bridged["metrics"]["live"])
 
+    def test_teammate_spawns_become_agents_with_quirky_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json",
+                   {"objective": "x", "max_iterations": 5, "engine": "claude"})
+            _write(abs_dir / "state.json",
+                   {"status": "EXECUTING", "iteration": 1, "started_at": now - 30})
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "EXECUTING", "phase": "builder", "iteration": 1,
+                "pid": os.getpid(), "heartbeat_ts": now, "agent": "builder",
+                "started_at": now - 30,
+            })
+            lines = [
+                json.dumps({"ts": now - 5, "agent": "builder", "kind": "tool",
+                            "detail": "spawn teammate · Agent: Independent critic of mission"}),
+                json.dumps({"ts": now - 4, "agent": "builder", "kind": "tool",
+                            "detail": "spawn teammate · Task: Write unit tests for parser"}),
+                json.dumps({"ts": now - 3, "agent": "builder", "kind": "tool",
+                            "detail": "Bash: pytest -q 2>&1 && echo OK | tail -5"}),
+            ]
+            _write(abs_dir / "tmp" / "live.jsonl", "\n".join(lines) + "\n")
+
+            bridged = zcomb.build_bridge_state(project)
+            agents = bridged["agents"]["agents"]
+            self.assertEqual(len(agents), 4)  # builder + critic + 2 teammates
+            teammates = [a for a in agents if a["id"].startswith("teammate-")]
+            self.assertEqual(len(teammates), 2)
+            for mate in teammates:
+                self.assertEqual(mate["status"], "active")
+                self.assertIn("Spawned teammate", mate["role"])
+            names = {m["name"] for m in teammates}
+            self.assertEqual(len(names), 2)  # distinct quirky names
+
+            spawned = [a for a in bridged["activity"] if a["type"] == "spawned"]
+            self.assertEqual(len(spawned), 2)
+            self.assertTrue(all(a["agentId"].startswith("teammate-")
+                                for a in spawned))
+            self.assertIn("joins the team", spawned[0]["message"])
+
+            # Raw shell noise is humanized
+            shell = [a for a in bridged["activity"]
+                     if a["message"].startswith("Ran `")]
+            self.assertEqual(len(shell), 1)
+            self.assertNotIn("2>&1", shell[0]["message"])
+
+    def test_quirky_names_are_deterministic_and_themed(self):
+        name1 = zcomb.quirky_teammate_name("Independent critic of mission")
+        name2 = zcomb.quirky_teammate_name("Independent critic of mission")
+        self.assertEqual(name1, name2)
+        used = set()
+        a = zcomb.quirky_teammate_name("review the diff", used)
+        b = zcomb.quirky_teammate_name("review the diff again", used)
+        self.assertNotEqual(a, b)
+
+    def test_tasks_carry_contextual_descriptions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            _write(abs_dir / "runtime.json",
+                   {"objective": "Ship the widget", "max_iterations": 4})
+            _write(abs_dir / "state.json",
+                   {"status": "EXECUTING", "iteration": 2, "mission_id": "ABS-7",
+                    "started_at": time.time() - 60})
+            bridged = zcomb.build_bridge_state(project)
+            by_id = {t["id"]: t for t in bridged["tasks"]["tasks"]}
+            self.assertIn("Ship the widget", by_id["task-scaffold"]["description"])
+            self.assertIn("2/4", by_id["task-execute"]["description"])
+            self.assertIn("ABS-7", by_id["task-deliver"]["description"])
+            self.assertTrue(all("description" in t
+                                for t in bridged["tasks"]["tasks"]))
+
     def test_awaiting_approval_puts_gate_in_review(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = pathlib.Path(tmp)

@@ -19,6 +19,7 @@ export interface Task {
   phase: number;
   createdAt: string;
   updatedAt: string;
+  description?: string;
 }
 
 export interface Activity {
@@ -33,6 +34,10 @@ export interface Metrics {
   errorRate: number;
   tasksPerHour: number;
   phases: { phase: number; name: string; progress: number }[];
+  missionId?: string;
+  objective?: string;
+  status?: string;
+  live?: boolean;
 }
 
 export interface AppState {

@@ -5,6 +5,7 @@ import { KanbanBoard } from './components/KanbanBoard';
 import { ActivityFeed } from './components/ActivityFeed';
 import { MetricsPanel } from './components/MetricsPanel';
 import { GanttChart } from './components/GanttChart';
+import { MissionControls } from './components/MissionControls';
 
 function formatElapsed(startTime: number): string {
   const s = Math.floor((Date.now() - startTime) / 1000);
@@ -62,8 +63,8 @@ export default function App() {
         flexWrap: 'wrap',
         minHeight: 44,
       }}>
-        {/* Left: Brand */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        {/* Left: Brand + mission controls */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <img
             src="/absoloop-logo-mark.png"
             alt="AbsoLoop"
@@ -104,6 +105,13 @@ export default function App() {
               Monitor
             </span>
           </div>
+          <MissionControls
+            metrics={state?.metrics}
+            darkMode={darkMode}
+            borderColor={borderColor}
+            textColor={textColor}
+            mutedColor={mutedColor}
+          />
         </div>
 
         {/* Right: Progress + Timer + Connection + Theme */}
