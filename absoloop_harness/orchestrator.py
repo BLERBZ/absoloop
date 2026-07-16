@@ -146,6 +146,14 @@ class Orchestrator:
 
     def _finish(self, store: RunStore, status: str) -> None:
         run_ctrl.finish_run(store.run_dir, status)
+        # Out-of-CLI chime when a harness run settles (never blocks).
+        try:
+            from .notify import notify
+            kind = "done" if status == "completed" else (
+                "fail" if status in ("failed", "cancelled", "timeout") else "attention")
+            notify("AbsoLoop", f"harness {store.run_id}: {status}", kind=kind)
+        except Exception:
+            pass
 
     # -- deterministic gates ---------------------------------------------------
 

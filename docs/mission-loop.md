@@ -53,6 +53,10 @@ python scripts/absoloop-run --engine claude # Windows
 
 Exit codes: `0` completed · `3` awaiting approval · `2` stopped safely.
 
+When a mission stops (especially **awaiting approval**), Absoloop plays a short
+**chime** and a desktop banner when the OS supports it — so you notice even if
+the terminal is buried. Silence with `ABSOLOOP_CHIME=0`.
+
 ### Two-layer agent teams (mission)
 
 | Layer | Owner | What spawns |

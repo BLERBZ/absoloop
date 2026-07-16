@@ -13,6 +13,9 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+# Harness finishes fire a desktop chime; keep unit tests silent.
+os.environ.setdefault("ABSOLOOP_CHIME", "0")
+
 from absoloop_harness.config import Config, DEFAULTS
 from absoloop_harness.orchestrator import Candidate, GateResult, Orchestrator
 from absoloop_harness.workspace import RunStore

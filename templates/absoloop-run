@@ -1590,6 +1590,24 @@ def deliver_results(runtime: dict[str, Any], state: State) -> bool:
     return False
 
 
+def chime_mission(status: str, mission_id: str = "", detail: str = "") -> None:
+    """Out-of-CLI chime + banner when the loop needs attention. Never raises."""
+    home = os.environ.get("ABSOLOOP_HOME", "")
+    if home and home not in sys.path:
+        sys.path.insert(0, home)
+    try:
+        from absoloop_harness.notify import notify_mission
+        notify_mission(status, mission_id=mission_id, detail=detail or None)
+    except Exception:
+        if status in ("AWAITING_APPROVAL", "COMPLETED", "BLOCKED", "REJECTED",
+                      "BUDGET_EXHAUSTED"):
+            try:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            except Exception:
+                pass
+
+
 def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int:
     state.stop_reason = reason
     state.status = status
@@ -1606,6 +1624,8 @@ def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int
         deliver_results(runtime, state)
     report_path = write_report(runtime, state)
     say(f"report: {report_path.relative_to(ROOT)} (or run 'absoloop report')")
+    chime_mission(status, mission_id=state.mission_id,
+                  detail=f"{reason} · {state.iteration} iteration(s)")
     if status == "COMPLETED":
         checkpoint(state, "terminal")  # persist any delivery bookkeeping
         return 0

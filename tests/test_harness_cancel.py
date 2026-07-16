@@ -1,6 +1,7 @@
 """Cross-process cancel: live PID tracking, cancel flag, and CLI cancel."""
 from __future__ import annotations
 
+import os
 import pathlib
 import stat
 import subprocess
@@ -11,6 +12,8 @@ import time
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
+
+os.environ.setdefault("ABSOLOOP_CHIME", "0")
 
 from absoloop_harness import runtime as run_ctrl
 from absoloop_harness.config import Config, DEFAULTS
