@@ -39,6 +39,8 @@ bin/absoloop              startup CLI (pure Python, cross-platform)
 bin/absoloop.cmd          Windows shim
 templates/absoloop-run    reference loop runner copied into each project
 templates/absoloop-init   POSIX bootstrap convenience copy
+templates/skills/         the loopers-toolbox: mission skills seeded into
+                          each project (+ toolbox.json engine manifest)
 out/                      (gitignored) deliveries from `-d out` missions
 ```
 
@@ -133,6 +135,50 @@ absoloop goal           # print the mission's /goal contract
 absoloop goal --regen   # regenerate it from .absoloop/runtime.json
 absoloop goal --check   # validate objective/delivery/ladder; exit 1 on problems
 ```
+
+## Skills — the mission's capability pipeline
+
+Every scaffolded project gets the **loopers-toolbox**: a set of mission
+skills installed into each engine's native project-skill discovery path —
+`.claude/skills/` for claude, `.codex/skills/` for codex — where the CLI
+scans them at session startup with no extra flags. The same open SKILL.md
+format works in both engines unchanged; `templates/skills/toolbox.json`
+maps which skills each engine gets:
+
+| skill | engines | upstream source |
+|---|---|---|
+| `skill-creator` | both | loop-adapted from [anthropics/skills](https://github.com/anthropics/skills/blob/main/skills/skill-creator/SKILL.md) |
+| `ai-ready` | both | [johnpapa/ai-ready](https://github.com/johnpapa/ai-ready) |
+| `tdd` | both | [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills) (test-driven-development) |
+| `agent-browser` | both | [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser) |
+| `mcp-builder` | both | [anthropics/skills](https://github.com/anthropics/skills) |
+| `frontend-design` | both | [anthropics/skills](https://github.com/anthropics/skills) |
+| `claude-api` | claude | [anthropics/skills](https://github.com/anthropics/skills) |
+| `cli-creator` | codex | [openai/skills](https://github.com/openai/skills) (curated) |
+
+Skills are copied whole (SKILL.md plus scripts/references/assets, so
+progressive disclosure works offline), and skill usage is wired into the
+standard pipeline:
+
+- The **/goal contract** carries a Skills section: check available skills
+  before working, and when the builder hits recurring complexity (a
+  procedure done twice, a helper rewritten, a failure caused by a missing
+  capability) it uses skill-creator to create or enhance a mission skill,
+  then uses it. Skill files are declared authorized infrastructure so the
+  smallest-change constraint doesn't forbid them.
+- Every **iteration prompt** lists the running engine's skills (name +
+  description parsed from each SKILL.md frontmatter) with instructions to
+  apply what fits; once a failure repeats, the prompt escalates with the
+  thinking ladder — asking whether the failure traces to a missing
+  capability worth codifying before retrying. Both engines get the
+  identical skills contract, so claude and codex prepare, start, and use
+  skills the same way.
+- The **critic** audits skill files like any artifact (a skill must do
+  exactly what its description says) but treats them as in-scope.
+- Skills persist across iterations and `resume --extend` runs, so the
+  loop compounds learning instead of re-deriving it; they ride along in
+  `git`/`out` deliveries like any changed file. Re-adoption never
+  overwrites a skill the mission has enhanced.
 
 ## Delivery — where accepted work lands
 

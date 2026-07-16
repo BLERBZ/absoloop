@@ -28,6 +28,15 @@ RESULT_SCHEMA = ABS / "schemas" / "agent-result.schema.json"
 # (gitignored) so monitoring artifacts never leak into delivered commits.
 MONITOR_PATH = TMP / "monitor.json"
 LIVE_PATH = TMP / "live.jsonl"
+# Mission skills: reusable capabilities the loop compounds across iterations.
+# 'absoloop' seeds the loopers-toolbox into each engine's native project-skill
+# discovery path (both CLIs scan theirs at session startup); the builder
+# creates/enhances further skills there via skill-creator.
+ENGINE_SKILL_DIRS = {"claude": ".claude/skills", "codex": ".codex/skills"}
+
+
+def skills_root(engine: str) -> pathlib.Path:
+    return ROOT / ENGINE_SKILL_DIRS.get(engine, ".claude/skills")
 
 # Thinking escalation: as the same failure repeats, both engines are pushed to
 # spend more reasoning depth instead of re-trying the same shallow fix.
@@ -598,6 +607,81 @@ def load_goal(runtime: dict[str, Any]) -> str:
     )
 
 
+def list_skills(engine: str) -> list[tuple[str, str]]:
+    """(name, description) for each mission skill in the engine's skills dir.
+
+    Frontmatter is parsed with plain line scanning (stdlib only); a skill
+    whose frontmatter is unreadable still shows up by directory name so the
+    builder knows it exists."""
+    skills: list[tuple[str, str]] = []
+    for skill_md in sorted(skills_root(engine).glob("*/SKILL.md")):
+        name, description = skill_md.parent.name, ""
+        try:
+            text = skill_md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        lines = text.splitlines()
+        if lines and lines[0].strip() == "---":
+            for index, line in enumerate(lines[1:], start=1):
+                if line.strip() == "---":
+                    break
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip().strip("'\"") or name
+                elif line.startswith("description:"):
+                    value = line.split(":", 1)[1].strip()
+                    if value in ("|", "|-", ">", ">-"):
+                        # YAML block scalar: the first indented line carries
+                        # the summary sentence — enough for the prompt listing.
+                        for follow in lines[index + 1:]:
+                            if follow.strip():
+                                value = follow.strip()
+                                break
+                    description = value.strip("'\"").replace('\\"', '"')
+        if len(description) > 400:
+            description = description[:400].rstrip() + " …"
+        skills.append((name, description))
+    return skills
+
+
+def build_skills_block(state: State, engine: str) -> str:
+    """The iteration prompt's skills section: what exists, and — pushier as
+    failures repeat — when to grow the toolbox with skill-creator. Repeated
+    failure is the loop's clearest signal that a capability is missing rather
+    than a strategy being wrong, so the nudge escalates with the ladder."""
+    rel = ENGINE_SKILL_DIRS.get(engine, ".claude/skills")
+    skills = list_skills(engine)
+    if skills:
+        listing = "\n".join(
+            f"- `{name}` — {description}" if description else f"- `{name}`"
+            for name, description in skills)
+        block = (
+            f"\n## Mission skills (reusable capabilities in {rel}/)\n\n"
+            f"{listing}\n\n"
+            "Apply any skill that fits before working from scratch — read its "
+            f"SKILL.md at {rel}/<name>/SKILL.md first (skills bundle scripts "
+            "and reference files there too; load only what the task needs). "
+            "When you notice recurring complexity (a procedure done twice, a "
+            "helper rewritten, knowledge worth keeping), use `skill-creator` "
+            "to create or enhance a skill, then use it. Skills persist across "
+            "iterations; they are how this loop compounds learning.\n"
+        )
+    else:
+        block = (
+            f"\n## Mission skills (reusable capabilities in {rel}/)\n\n"
+            "None yet. When you notice recurring complexity worth codifying, "
+            f"create a skill at {rel}/<name>/SKILL.md so later "
+            "iterations inherit the capability instead of re-deriving it.\n"
+        )
+    if state.repeated_failure_count >= 1:
+        block += (
+            "\nThe same failure has repeated — before retrying, ask whether it "
+            "traces to a missing or under-specified capability. If so, spend "
+            "part of this iteration codifying the fix as a skill (or repairing "
+            "the skill that misled you) so the failure cannot recur.\n"
+        )
+    return block
+
+
 def build_iteration_prompt(
     runtime: dict[str, Any],
     state: State,
@@ -636,6 +720,8 @@ def build_iteration_prompt(
             "spend it re-confirming that existing work is fine.\n"
         )
 
+    skills_block = build_skills_block(state, engine)
+
     rung = thinking_rung(runtime, state)
     posture = str(rung.get("posture", "")).strip()
     if engine == "claude":
@@ -673,18 +759,22 @@ Repeated failure count: {state.repeated_failure_count}
 ## Where the mission stands
 
 {previous_work}
-{critic_block}{feedback_block}
+{critic_block}{feedback_block}{skills_block}
 ## Required procedure
 
 1. Read the project instructions and the goal contract above.
 2. Inspect the current state of the working tree before editing.
-3. Choose one bounded strategy from the goal contract's strategy ladder that
+3. Check the mission skills listed above; apply any that fit this
+   iteration's work before solving from scratch.
+4. Choose one bounded strategy from the goal contract's strategy ladder that
    differs from any failed repeated strategy.
-4. Make only the smallest authorized changes needed for this iteration.
-5. Run a focused check when available (tests, a build, the program itself)
+5. Make only the smallest authorized changes needed for this iteration.
+   When the work reveals recurring complexity, codify it with the
+   `skill-creator` skill so later iterations inherit the capability.
+6. Run a focused check when available (tests, a build, the program itself)
    and record what you ran and what it showed.
-6. Never weaken tests or acceptance criteria.
-7. Return schema-valid JSON with changed artifacts, commands, evidence, risks,
+7. Never weaken tests or acceptance criteria.
+8. Return schema-valid JSON with changed artifacts, commands, evidence, risks,
    and a concise decision summary. Set "done": true ONLY when every item in
    the definition of done is genuinely met — an independent critic will
    inspect the working tree and reject unearned claims. Otherwise set

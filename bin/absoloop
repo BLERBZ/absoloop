@@ -90,6 +90,10 @@ You are an independent adversarial reviewer. Attempt to disprove that the
 current working tree satisfies the mission contract. Inspect the relevant
 files yourself with read-only tools; do not trust any builder narrative.
 Look for weakened tests, unverifiable claims, regressions, and scope drift.
+Mission skills under .claude/skills/ or .codex/skills/ are authorized loop
+infrastructure, not scope drift — but audit them like any artifact: a skill
+must do exactly what its description says and must not weaken the mission's
+acceptance bar.
 Do not edit files.
 """
 
@@ -150,6 +154,67 @@ def sync_runner(target: pathlib.Path) -> None:
         print("updated scripts/absoloop-run to the installed ABSOLOOP version")
     except OSError as exc:
         print(f"warning: could not update scripts/absoloop-run: {exc}", file=sys.stderr)
+
+
+# Each engine's native project-skill discovery path: both CLIs scan their
+# directory at session startup, so a skill installed here is available with
+# no extra flags — the standardized SKILL.md format works in both unchanged.
+ENGINE_SKILL_DIRS = {"claude": ".claude/skills", "codex": ".codex/skills"}
+
+
+def toolbox_manifest() -> dict:
+    """The loopers-toolbox manifest (templates/skills/toolbox.json):
+    'shared' skills install for every engine, engine keys add
+    engine-specific ones. Falls back to every bundled skill as shared so a
+    missing/broken manifest degrades to 'install everything everywhere'
+    rather than silently installing nothing."""
+    manifest_path = TEMPLATES / "skills" / "toolbox.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if isinstance(manifest, dict) and isinstance(manifest.get("shared"), list):
+            return manifest
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"warning: unreadable skills toolbox manifest: {exc}", file=sys.stderr)
+    return {"shared": sorted(p.parent.name for p
+                             in (TEMPLATES / "skills").glob("*/SKILL.md"))}
+
+
+def sync_skills(target: pathlib.Path, engines=None) -> None:
+    """Install the loopers-toolbox (templates/skills/*) into each engine's
+    skills directory in the project. Skills are what let the builder apply
+    proven capabilities (tdd, mcp-builder, ...) and codify new ones
+    mid-loop via skill-creator. The whole skill tree is copied (SKILL.md
+    plus scripts/references/assets — progressive disclosure needs the
+    bundled files present). Never overwrites a skill the mission has
+    enhanced — a hand-tuned or loop-improved skill beats the stock one."""
+    src_root = TEMPLATES / "skills"
+    if not src_root.is_dir():
+        return
+    manifest = toolbox_manifest()
+    shared = [str(name) for name in manifest.get("shared", [])]
+    for engine in (engines or sorted(ENGINE_SKILL_DIRS)):
+        skills_dir = target / ENGINE_SKILL_DIRS.get(engine, ".claude/skills")
+        names = shared + [str(name) for name in manifest.get(engine, [])]
+        installed = []
+        for name in names:
+            src = src_root / name
+            dest = skills_dir / name
+            try:
+                if not (src / "SKILL.md").is_file():
+                    print(f"warning: bundled skill {name!r} is missing from "
+                          f"{src_root} — skipped", file=sys.stderr)
+                    continue
+                if (dest / "SKILL.md").is_file():
+                    continue
+                shutil.copytree(src, dest, dirs_exist_ok=True)
+                installed.append(name)
+            except OSError as exc:
+                print(f"warning: could not install skill {name!r}: {exc}",
+                      file=sys.stderr)
+        if installed:
+            print(f"installed mission skills for {engine} "
+                  f"({ENGINE_SKILL_DIRS.get(engine, '.claude/skills')}): "
+                  + ", ".join(installed))
 
 
 # ---------------------------------------------------------------------------
@@ -398,6 +463,28 @@ def generate_goal_markdown(config: dict) -> str:
     lines += [f"{i}. {s}" for i, s in enumerate(strategies, 1)]
     lines += ["", "## Constraints", ""]
     lines += [f"- {c}" for c in GOAL_CONSTRAINTS]
+    lines += [
+        "",
+        "## Skills — the mission's capability pipeline",
+        "",
+        "Reusable skills live in your engine's skills directory in this project",
+        "(`.claude/skills/` for claude, `.codex/skills/` for codex — the",
+        "iteration prompt lists what is installed). A standard toolbox is",
+        "seeded at setup (skill-creator, ai-ready, tdd, agent-browser,",
+        "mcp-builder, frontend-design, plus engine-specific references); skills",
+        "persist across iterations and are how the loop compounds learning",
+        "instead of re-deriving it. Standard procedure every iteration:",
+        "",
+        "- Before working, check the available skills and apply any that fit",
+        "  the task at hand — read a skill's SKILL.md before relying on it.",
+        "- When you hit recurring complexity — a multi-step procedure done",
+        "  twice, a helper script rewritten, a failure caused by a missing",
+        "  capability, non-obvious domain knowledge worth keeping — use the",
+        "  `skill-creator` skill to create or enhance a skill, then use it.",
+        "- Skill files are authorized mission infrastructure: creating or",
+        "  improving them is inside scope, but only ever in service of this",
+        "  contract. Report them in changed_artifacts like any other change.",
+    ]
     ladder = config.get("thinking_ladder")
     if not (isinstance(ladder, list) and ladder):
         ladder = build_thinking_ladder(kinds)
@@ -1367,6 +1454,7 @@ def gate_command(action: str, argv: list[str]) -> int:
 
 def start_loop(target: pathlib.Path, engine: str) -> int:
     sync_runner(target)
+    sync_skills(target, engines=(engine,))
     runner = target / "scripts" / "absoloop-run"
     print(f"\nStarting loop with engine '{engine}'...\n")
     return subprocess.run([sys.executable, str(runner), "--engine", engine],
@@ -1448,6 +1536,7 @@ def main(argv: list[str]) -> int:
     # The runner is a managed file: always kept in step with the installed
     # template so scaffolded projects pick up loop fixes on re-adoption.
     sync_runner(target)
+    sync_skills(target)
     for tmpl in ("absoloop-init",):
         src = TEMPLATES / tmpl
         dest = scripts / tmpl

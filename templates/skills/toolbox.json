@@ -1,0 +1,6 @@
+{
+  "comment": "Loopers-toolbox manifest: which bundled skills each engine gets. 'shared' installs for every engine; engine keys add engine-specific skills. Installed into .claude/skills/ (claude) and .codex/skills/ (codex) — each engine's native project-skill discovery path.",
+  "shared": ["skill-creator", "ai-ready", "tdd", "agent-browser", "mcp-builder", "frontend-design"],
+  "claude": ["claude-api"],
+  "codex": ["cli-creator"]
+}
