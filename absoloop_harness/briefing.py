@@ -95,6 +95,7 @@ class Briefing:
     delivery: str
     engine: str
     kinds: List[str]
+    model: str = ""                      # engine model id / alias
     max_iterations: int = 20
     max_cost_usd: float = 25.0
     max_wall_hours: float = 2.0
@@ -136,15 +137,17 @@ def ask(prompt: str, default: str = "") -> str:
 
 
 def pick(prompt: str, options: Sequence[str], default: str,
-         labels: Optional[Dict[str, str]] = None) -> str:
+         labels: Optional[Dict[str, str]] = None,
+         name_width: int = 8) -> str:
     """Single-key / number / name picker. Enter keeps the default."""
     labels = labels or {}
+    width = max(name_width, max((len(name) for name in options), default=8))
     print(tint("bold", prompt))
     for index, name in enumerate(options, 1):
         mark = tint("ok", "●") if name == default else tint("dim", "○")
         extra = labels.get(name, "")
         tag = tint("gold", "  ← default") if name == default else ""
-        print(f"  {mark} {index}. {name:<8} {tint('dim', extra)}{tag}")
+        print(f"  {mark} {index}. {name:<{width}} {tint('dim', extra)}{tag}")
     while True:
         answer = ask("Your pick", default)
         if answer.isdigit() and 1 <= int(answer) <= len(options):
@@ -154,8 +157,34 @@ def pick(prompt: str, options: Sequence[str], default: str,
         print(tint("warn", f"  pick 1–{len(options)} or one of: {', '.join(options)}"))
 
 
+def pick_model(engine: str, current: str = "") -> str:
+    """Curated model picker for an engine, with a free-text custom escape."""
+    from .models import default_model, model_labels, models_for, resolve_model
+
+    catalog = list(models_for(engine))
+    if not catalog:
+        typed = ask("  Model id", current or "")
+        return typed or current or ""
+    current = resolve_model(engine, current)
+    options = list(catalog)
+    if current not in options:
+        options.insert(0, current)
+    options.append("custom")
+    labels = model_labels(engine)
+    labels.setdefault("custom", "type a model id / alias")
+    if current == default_model(engine):
+        labels[current] = (labels.get(current, "") + " · Absoloop default").strip(" ·")
+    choice = pick("  Model", options, current, labels, name_width=14)
+    if choice == "custom":
+        typed = ask("  Model id", current)
+        return typed or current
+    return choice
+
+
 def render_card(brief: Briefing) -> str:
     """The one-screen Mission Briefing — review this, then launch."""
+    from .models import default_model, resolve_model
+
     primary = brief.kinds[0] if brief.kinds else "general"
     title, tagline = FLAVOR.get(primary, FLAVOR["general"])
     kinds_label = " · ".join(brief.kinds) if brief.kinds else "general"
@@ -163,6 +192,10 @@ def render_card(brief: Briefing) -> str:
     engine_ok = brief.engine in brief.engines_available
     engine_mark = tint("ok", "ready") if engine_ok else tint("err", "not on PATH")
     delivery = DELIVERY_BLURBS.get(brief.delivery, brief.delivery)
+    model = resolve_model(brief.engine, brief.model)
+    model_note = ""
+    if model == default_model(brief.engine):
+        model_note = tint("dim", "  (best available)")
 
     width = 58
     rule = "─" * width
@@ -182,6 +215,7 @@ def render_card(brief: Briefing) -> str:
         f"{tint('dim', f'({where})')}",
         f"  {tint('cyan', 'profile')}   {kinds_label}",
         f"  {tint('cyan', 'engine')}    {brief.engine}  {engine_mark}",
+        f"  {tint('cyan', 'model')}     {model}{model_note}",
         f"  {tint('cyan', 'delivery')}  {brief.delivery}  "
         f"{tint('dim', delivery)}",
         f"  {tint('cyan', 'budgets')}   {brief.max_iterations} iterations · "
@@ -190,8 +224,9 @@ def render_card(brief: Briefing) -> str:
         "  " + tint("bold", "Enter") + " launch   "
         + tint("dim", "o") + " objective   "
         + tint("dim", "e") + " engine   "
-        + tint("dim", "d") + " delivery",
-        "  " + tint("dim", "n") + " rename     "
+        + tint("dim", "m") + " model",
+        "  " + tint("dim", "d") + " delivery   "
+        + tint("dim", "n") + " rename   "
         + tint("dim", "g") + " preview /goal   "
         + tint("dim", "q") + " abort",
         "",
@@ -246,9 +281,18 @@ def review_loop(
                 current = replace(current, objective=new_obj)
             continue
         if key in ("e", "engine"):
+            from .models import default_model
+
+            new_engine = pick("  Engine", engines, current.engine, engine_labels)
+            # Switching engines resets to that engine's best model unless the
+            # operator already pinned a custom id for the same engine.
+            new_model = (current.model if new_engine == current.engine
+                         else default_model(new_engine))
+            current = replace(current, engine=new_engine, model=new_model)
+            continue
+        if key in ("m", "model"):
             current = replace(
-                current,
-                engine=pick("  Engine", engines, current.engine, engine_labels))
+                current, model=pick_model(current.engine, current.model))
             continue
         if key in ("d", "delivery", "deliver"):
             current = replace(
@@ -276,7 +320,7 @@ def review_loop(
             else:
                 print(tint("dim", "  (goal preview unavailable yet)"))
             continue
-        print(tint("warn", "  keys: Enter launch · o · e · d · n · g · q"))
+        print(tint("warn", "  keys: Enter launch · o · e · m · d · n · g · q"))
 
 
 def opening_line(engines_available: Sequence[str]) -> str:

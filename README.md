@@ -145,12 +145,13 @@ absoloop goal · goal --regen · goal --check
 ### Skills — loopers-toolbox
 
 Scaffolded projects receive mission skills in each engine’s native path
-(`.claude/skills/`, `.codex/skills/`). Upstream sources include
+(`.claude/skills/`, `.codex/skills/`, `.grok/skills/`). Upstream sources include
 [anthropics/skills](https://github.com/anthropics/skills),
 [openai/skills](https://github.com/openai/skills),
 [addyosmani/agent-skills](https://github.com/addyosmani/agent-skills),
-[johnpapa/ai-ready](https://github.com/johnpapa/ai-ready), and
-[vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser).
+[johnpapa/ai-ready](https://github.com/johnpapa/ai-ready),
+[vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser), and
+[LobeHub game-development](https://lobehub.com/skills/haniakrim21-everything-claude-code-game-development).
 See `templates/skills/toolbox.json`.
 
 ### Delivery

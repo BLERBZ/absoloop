@@ -34,20 +34,20 @@ os.environ.setdefault("ABSOLOOP_HOME", str(ABSOLOOP_HOME))
 TEMPLATES = ABSOLOOP_HOME / "templates"
 
 
-def render_logo(*, compact: bool = False) -> str:
+def render_logo(*, compact: bool = False, height: int | None = None) -> str:
     """Render the Absoloop logo from the sibling bin/absoloop_logo.py, in full
     color ('color always'). Best-effort: a logo problem must never block the
     CLI, so any failure yields an empty string and the command runs as before."""
     try:
         sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
         from absoloop_logo import build_logo
-        return build_logo(compact=compact, color_mode="always")
+        return build_logo(compact=compact, color_mode="always", height=height)
     except Exception:
         return ""
 
 
-def print_banner(*, compact: bool = False) -> None:
-    logo = render_logo(compact=compact)
+def print_banner(*, compact: bool = False, height: int | None = None) -> None:
+    logo = render_logo(compact=compact, height=height)
     if logo:
         print(logo + "\n")
 
@@ -626,11 +626,13 @@ def write_goal(target: pathlib.Path, config: dict) -> pathlib.Path:
     return goal_path
 
 
-def runtime_config(objective: str, loop_id: str, delivery_mode: str) -> dict:
+def runtime_config(objective: str, loop_id: str, delivery_mode: str,
+                   model: str = "") -> dict:
     return {
         "mission_id": "ABS-MINIMAL-001",
         "loop_id": loop_id,
         "objective": objective,
+        "model": model,
         "definition_of_done": [
             "The objective is achieved and demonstrated in the working tree.",
             "An independent critic finds no blocking issue.",
@@ -1495,13 +1497,16 @@ def gate_command(action: str, argv: list[str]) -> int:
     return 0
 
 
-def start_loop(target: pathlib.Path, engine: str) -> int:
+def start_loop(target: pathlib.Path, engine: str, model: str = "") -> int:
     sync_runner(target)
     sync_skills(target, engines=(engine,))
     runner = target / "scripts" / "absoloop-run"
-    print(f"  engine {engine} · working tree {target}\n")
-    return subprocess.run([sys.executable, str(runner), "--engine", engine],
-                          cwd=target).returncode
+    cmd = [sys.executable, str(runner), "--engine", engine]
+    if model:
+        cmd += ["--model", model]
+    print(f"  engine {engine} · model {model or 'CLI default'} · "
+          f"working tree {target}\n")
+    return subprocess.run(cmd, cwd=target).returncode
 
 
 def _ensure_harness_path() -> None:
@@ -1552,7 +1557,8 @@ def _run_setup(argv: list[str]):
 
 
 def scaffold_mission(target: pathlib.Path, objective: str,
-                     delivery_mode: str) -> tuple[dict, pathlib.Path]:
+                     delivery_mode: str,
+                     model: str = "") -> tuple[dict, pathlib.Path]:
     """Create/adopt project files and write runtime + /goal. Returns
     (config, goal_path)."""
     scripts = target / "scripts"
@@ -1622,9 +1628,12 @@ def scaffold_mission(target: pathlib.Path, objective: str,
         existing_config.setdefault("goal_path", ".absoloop/goal.md")
         existing_config["delivery"] = default_delivery(
             delivery_mode, existing_config["loop_id"])
+        if model:
+            existing_config["model"] = model
         config = existing_config
     else:
-        config = runtime_config(objective, new_loop_id(), delivery_mode)
+        config = runtime_config(objective, new_loop_id(), delivery_mode,
+                                model=model)
 
     runtime_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     goal_path = write_goal(target, config)
@@ -1734,6 +1743,9 @@ def main(argv: list[str]) -> int:
                         help="where accepted work lands (default: local)")
     parser.add_argument("--engine", choices=list(ENGINES),
                         help="engine for the loop")
+    parser.add_argument("--model", default=None,
+                        help="model id/alias for the engine "
+                             "(default: best available for that engine)")
     parser.add_argument("--start", action="store_true",
                         help="launch after scaffolding (default on TTY after review)")
     parser.add_argument("-y", "--yes", action="store_true",
@@ -1749,7 +1761,9 @@ def main(argv: list[str]) -> int:
     # again; prefer the early extract.
     want_zcomb = want_zcomb or bool(getattr(args, "zcomb", False))
 
-    print_banner(compact=True)
+    # Full infinity + wordmark — compact one-liner is too small on briefing /
+    # --zcomb entry. Setup wizard keeps the compact mark.
+    print_banner(compact=False)
     ux = _load_briefing()
 
     # First-time TTY users with no objective → offer the setup wizard.
@@ -1810,6 +1824,10 @@ def main(argv: list[str]) -> int:
         delivery = "local"
     engine = args.engine or (available[0] if available else ENGINES[0])
 
+    _ensure_harness_path()
+    from absoloop_harness.models import resolve_model
+    model = resolve_model(engine, args.model or "")
+
     # Default project: adopt cwd (fewest steps). Rename from the briefing card.
     if not name:
         name = "." if not objective else (
@@ -1849,13 +1867,14 @@ def main(argv: list[str]) -> int:
         objective=objective,
         delivery=delivery,
         engine=engine,
+        model=model,
         kinds=classify_mission(objective) or ["general"],
         engines_available=available,
     )
 
     def preview_goal(b) -> None:
         from_text = generate_goal_markdown(
-            runtime_config(b.objective, "preview", b.delivery))
+            runtime_config(b.objective, "preview", b.delivery, model=b.model))
         print()
         print(ux.tint("dim", "  ── /goal preview ──"))
         for line in from_text.splitlines()[:40]:
@@ -1891,7 +1910,10 @@ def main(argv: list[str]) -> int:
         print(f"error: {target} exists and is not a directory.", file=sys.stderr)
         return 1
 
-    _config, goal_path = scaffold_mission(target, brief.objective, brief.delivery)
+    model = resolve_model(brief.engine, brief.model)
+    brief = __import__("dataclasses").replace(brief, model=model)
+    _config, goal_path = scaffold_mission(
+        target, brief.objective, brief.delivery, model=brief.model)
     ux.celebrate_scaffold(brief, str(goal_path.relative_to(target)))
 
     launch = not args.no_start
@@ -1900,7 +1922,8 @@ def main(argv: list[str]) -> int:
                    else "./scripts/absoloop-run")
         steps = ([] if target == pathlib.Path.cwd().resolve()
                  else [f"cd {os.path.relpath(target)}"])
-        steps.append(f"{run_cmd} --engine {brief.engine}")
+        model_flag = f" --model {brief.model}" if brief.model else ""
+        steps.append(f"{run_cmd} --engine {brief.engine}{model_flag}")
         print("\n" + ux.tint("dim", "  Scaffold ready. Launch when you are:"))
         print("  " + "\n  ".join(steps))
         return 0
@@ -1914,7 +1937,7 @@ def main(argv: list[str]) -> int:
             _ensure_harness_path()
             from absoloop_harness import zcomb as zcomb_mod
         zcomb_mod.spawn_background(target)
-    return start_loop(target, brief.engine)
+    return start_loop(target, brief.engine, brief.model)
 
 
 if __name__ == "__main__":

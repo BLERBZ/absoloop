@@ -238,16 +238,18 @@ TOML-subset reader (tables, strings, numbers, booleans, arrays) —
 ```toml
 [providers.grok]
 command = "grok"          # or absolute path
-model = ""                # optional default model
+model = "grok-build-0.1"  # Absoloop default = best available
 timeout_seconds = 1800
 env_allowlist = []        # extra env vars to pass through
 
 [providers.claude]
 command = "claude"
+model = "best"            # Fable 5 when available, else Opus
 timeout_seconds = 1800
 
 [providers.codex]
 command = "codex"
+model = "gpt-5.6-sol"
 timeout_seconds = 1800
 
 [permissions]

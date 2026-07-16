@@ -184,6 +184,8 @@ def run_command(argv: List[str]) -> int:
     parser.add_argument("prompt", nargs="?",
                         help="task prompt (asked in the briefing if omitted)")
     parser.add_argument("--provider", default=None, choices=list(PROVIDERS))
+    parser.add_argument("--model", default=None,
+                        help="model id/alias (default: best available for provider)")
     parser.add_argument("--profile", default=None, choices=["read", "edit", "full"])
     parser.add_argument("--no-isolate", action="store_true",
                         help="run in the repo root instead of an isolated worktree")
@@ -196,9 +198,12 @@ def run_command(argv: List[str]) -> int:
     profile = args.profile or str(cfg.get("permissions", "default_profile",
                                           default="edit"))
     from . import briefing as ux
+    from .models import default_model, resolve_model
     available = [p for p in PROVIDERS
                  if make_adapter(p, cfg.get("providers", p, default={})).probe().available]
     provider = args.provider or (available[0] if available else PROVIDERS[0])
+    configured = str(cfg.get("providers", provider, "model", default="") or "")
+    model = resolve_model(provider, args.model if args.model is not None else configured)
     prompt = (args.prompt or "").strip()
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.yes
     if not prompt:
@@ -212,19 +217,24 @@ def run_command(argv: List[str]) -> int:
             prompt = ux.ask("  prompt (required)")
     if interactive:
         labels = {p: ("✓ ready" if p in available else "✗ missing") for p in PROVIDERS}
-        print()
-        print(ux.tint("accent", "∞") + " " + ux.tint("bold", "RUN BRIEFING"))
-        print(ux.tint("dim", "─" * 50))
-        print(f"  {ux.tint('gold', 'task')}      {prompt}")
-        print(f"  {ux.tint('cyan', 'provider')}  {provider}  "
-              f"{ux.tint('ok', 'ready') if provider in available else ux.tint('err', 'missing')}")
-        print(f"  {ux.tint('cyan', 'profile')}   {profile}")
-        print(f"  {ux.tint('cyan', 'isolate')}   {'no (repo root)' if args.no_isolate else 'yes (worktree)'}")
-        print(ux.tint("dim", "─" * 50))
-        print("  " + ux.tint("bold", "Enter") + " launch   "
-              + ux.tint("dim", "p") + " provider   "
-              + ux.tint("dim", "q") + " abort")
         while True:
+            model_note = ("  (best available)"
+                          if model == default_model(provider) else "")
+            print()
+            print(ux.tint("accent", "∞") + " " + ux.tint("bold", "RUN BRIEFING"))
+            print(ux.tint("dim", "─" * 50))
+            print(f"  {ux.tint('gold', 'task')}      {prompt}")
+            print(f"  {ux.tint('cyan', 'provider')}  {provider}  "
+                  f"{ux.tint('ok', 'ready') if provider in available else ux.tint('err', 'missing')}")
+            print(f"  {ux.tint('cyan', 'model')}     {model}"
+                  f"{ux.tint('dim', model_note)}")
+            print(f"  {ux.tint('cyan', 'profile')}   {profile}")
+            print(f"  {ux.tint('cyan', 'isolate')}   {'no (repo root)' if args.no_isolate else 'yes (worktree)'}")
+            print(ux.tint("dim", "─" * 50))
+            print("  " + ux.tint("bold", "Enter") + " launch   "
+                  + ux.tint("dim", "p") + " provider   "
+                  + ux.tint("dim", "m") + " model   "
+                  + ux.tint("dim", "q") + " abort")
             try:
                 key = input(ux.tint("bold", "  ▶ ") + ux.tint("dim", "ready? ")).strip().lower()
             except (EOFError, KeyboardInterrupt):
@@ -237,14 +247,21 @@ def run_command(argv: List[str]) -> int:
                 return 1
             if key in ("p", "provider"):
                 provider = ux.pick("  Provider", PROVIDERS, provider, labels)
+                model = default_model(provider)
                 continue
-            print(ux.tint("warn", "  keys: Enter launch · p provider · q abort"))
+            if key in ("m", "model"):
+                model = ux.pick_model(provider, model)
+                continue
+            print(ux.tint("warn", "  keys: Enter launch · p provider · m model · q abort"))
     if provider not in available:
         print(f"error: provider {provider!r} is not available", file=sys.stderr)
         return 2
+    cfg = load_config(_root(), cli_overrides={
+        "providers": {provider: {"model": model}},
+    })
     orch = Orchestrator(_root(), cfg, on_event=_event_printer(args.verbose),
                         keep_worktrees=args.keep_worktrees or None)
-    print(ux.tint("ok", f"  ∞  Running {provider}…"))
+    print(ux.tint("ok", f"  ∞  Running {provider} · {model}…"))
     print()
     manifest = orch.single(provider, prompt, profile,
                            isolate=not args.no_isolate)

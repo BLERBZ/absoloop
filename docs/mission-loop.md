@@ -39,15 +39,19 @@ absoloop my-mission -o "…" -y      # skip review, lock in and launch
 absoloop "…" --no-start            # scaffold only
 ```
 
-Keys: `Enter` launch · `o` objective · `e` engine · `d` delivery ·
-`n` rename · `g` preview `/goal` · `q` abort.
+Keys: `Enter` launch · `o` objective · `e` engine · `m` model ·
+`d` delivery · `n` rename · `g` preview `/goal` · `q` abort.
+
+The briefing defaults each engine to its best available model (`best` for
+Claude, `gpt-5.6-sol` for Codex, `grok-build-0.1` for Grok). Change it with
+`m` before launch, or pass `--model`.
 
 Scaffold writes scripts + `.absoloop/` config, initializes git when needed,
 and generates the `/goal` contract at `.absoloop/goal.md`.
 
 ```bash
-./scripts/absoloop-run --engine claude      # macOS/Linux
-./scripts/absoloop-run --engine codex
+./scripts/absoloop-run --engine claude --model best
+./scripts/absoloop-run --engine codex --model gpt-5.6-sol
 ./scripts/absoloop-run --engine grok
 python scripts/absoloop-run --engine claude # Windows
 ```
@@ -114,6 +118,8 @@ Installed into `.claude/skills/` and `.codex/skills/` from
 | `agent-browser` | both | [vercel-labs/agent-browser](https://github.com/vercel-labs/agent-browser) |
 | `mcp-builder` | both | [anthropics/skills](https://github.com/anthropics/skills) |
 | `frontend-design` | both | [anthropics/skills](https://github.com/anthropics/skills) |
+| `game-development` | both | [LobeHub game-development](https://lobehub.com/skills/haniakrim21-everything-claude-code-game-development) |
+| `ai-game-art-pipeline` | both | runtime game-art pipeline (provider-neutral) |
 | `claude-api` | claude | [anthropics/skills](https://github.com/anthropics/skills) |
 | `cli-creator` | codex | [openai/skills](https://github.com/openai/skills) |
 

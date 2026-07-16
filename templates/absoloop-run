@@ -859,7 +859,8 @@ delivery is handled by the loop after acceptance, per the goal contract.
 def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
                json_schema: dict[str, Any] | None = None,
                label: str = "claude agent",
-               extra_env: dict[str, str] | None = None) -> AgentRun:
+               extra_env: dict[str, str] | None = None,
+               model: str = "") -> AgentRun:
     schema = json.dumps(json_schema) if json_schema else RESULT_SCHEMA.read_text(encoding="utf-8")
     command = [
         # shutil.which resolves claude.cmd/.exe on Windows (PATHEXT), where a
@@ -874,10 +875,13 @@ def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
         # still delivering the same final result payload as a terminal event.
         "--output-format", "stream-json",
         "--verbose",
-        prompt,
     ]
+    if model:
+        command += ["--model", model]
+    command.append(prompt)
     say(f"{label}: starting (limits: {cfg['max_turns']} turns, "
-        f"${cfg['max_budget_usd']}, {cfg.get('max_wall_seconds', 600)}s wall)")
+        f"${cfg['max_budget_usd']}, {cfg.get('max_wall_seconds', 600)}s wall"
+        + (f", model={model}" if model else "") + ")")
     started = time.time()
     result_event: dict[str, Any] = {}
 
@@ -1010,7 +1014,8 @@ def codex_usage_to_usd(totals: dict[str, int] | None,
 
 def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None,
               out_path: pathlib.Path, schema_path: pathlib.Path,
-              label: str = "codex agent") -> AgentRun:
+              label: str = "codex agent",
+              model: str = "") -> AgentRun:
     # codex exec is non-interactive and never prompts; the sandbox policy is
     # the enforcement boundary for scripted runs. Codex has no per-run dollar
     # cap flag, so max_budget_usd is the accounting reserve when parsing fails.
@@ -1022,11 +1027,14 @@ def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None
         "--json",
         "-o", str(out_path),
     ]
+    if model:
+        command += ["--model", model]
     if effort:
         command += ["-c", f"model_reasoning_effort={effort}"]
     command.append(prompt)
     say(f"{label}: starting (limits: sandbox={cfg['sandbox']}, "
         f"{cfg.get('max_wall_seconds', 600)}s wall"
+        + (f", model={model}" if model else "")
         + (f", reasoning={effort}" if effort else "") + ")")
     started = time.time()
     events_path = out_path.with_suffix(".events.jsonl")
@@ -1115,7 +1123,8 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
 
 def run_grok(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
              schema: dict[str, Any] | None = None,
-             label: str = "grok agent") -> AgentRun:
+             label: str = "grok agent",
+             model: str = "") -> AgentRun:
     """Spawn Grok Build headless (streaming-json + --prompt-file)."""
     profile = str(cfg.get("permission_profile") or "edit")
     schema = schema or json.loads(RESULT_SCHEMA.read_text(encoding="utf-8"))
@@ -1137,12 +1146,15 @@ def run_grok(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
         "--cwd", str(ROOT),
         "--no-auto-update",
     ]
+    if model:
+        command += ["-m", model]
     max_turns = cfg.get("max_turns")
     if isinstance(max_turns, int) and max_turns > 0:
         command += ["--max-turns", str(max_turns)]
     command += grok_permission_flags(profile)
     say(f"{label}: starting (limits: profile={profile}, "
         f"{cfg.get('max_wall_seconds', 600)}s wall"
+        + (f", model={model}" if model else "")
         + (f", {max_turns} turns" if isinstance(max_turns, int) else "") + ")")
     started = time.time()
     stream_path = out_path.with_suffix(".stream.jsonl")
@@ -1247,7 +1259,13 @@ def run_grok(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
     return run
 
 
-def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict[str, Any] | None, AgentRun]:
+def mission_model(runtime: dict[str, Any], override: str = "") -> str:
+    """Model id/alias for this mission — CLI override wins, else runtime.json."""
+    return (override or str(runtime.get("model") or "")).strip()
+
+
+def run_critic(engine: str, runtime: dict[str, Any], state: State,
+               model: str = "") -> tuple[dict[str, Any] | None, AgentRun]:
     """Independent read-only review. The critic sees the contract, never the
     builder's narrative — it must gather its own evidence from the tree."""
     prompt_path = ROOT / runtime["critic_prompt_path"]
@@ -1272,7 +1290,7 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
     verdict: dict[str, Any] | None = None
     if engine == "claude":
         run = run_claude(prompt, runtime["claude"]["critic"], out_path,
-                         json_schema=CRITIC_SCHEMA, label="critic")
+                         json_schema=CRITIC_SCHEMA, label="critic", model=model)
         try:
             payload = json.loads(out_path.read_text(encoding="utf-8"))
             candidate = payload.get("structured_output") if isinstance(payload, dict) else None
@@ -1280,7 +1298,7 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
             candidate = None
     elif engine == "grok":
         run = run_grok(prompt, runtime["grok"]["critic"], out_path,
-                       schema=CRITIC_SCHEMA, label="critic")
+                       schema=CRITIC_SCHEMA, label="critic", model=model)
         try:
             candidate = json.loads(out_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1289,7 +1307,7 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
         schema_path = TMP / "critic-schema.json"
         atomic_write_json(schema_path, CRITIC_SCHEMA)
         run = run_codex(prompt, runtime["codex"]["critic"], runtime["codex"].get("pricing"),
-                        out_path, schema_path, label="critic")
+                        out_path, schema_path, label="critic", model=model)
         try:
             candidate = json.loads(out_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1313,7 +1331,8 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State) -> tuple[dict
 
 
 def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
-                     check_timeout: int) -> tuple[str, str] | None:
+                     check_timeout: int,
+                     model: str = "") -> tuple[str, str] | None:
     """Layered acceptance: optional integrity check, independent critic, then
     the human gate. Returns (stop_reason, terminal_status) when the mission
     should stop, or None when the repair loop should continue."""
@@ -1332,7 +1351,7 @@ def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
             # Weakened tests or edited checks are an automatic failure (14.3).
             return "integrity_violation", "REJECTED"
 
-    verdict, run = run_critic(engine, runtime, state)
+    verdict, run = run_critic(engine, runtime, state, model=model)
     state.cost_usd += run.cost_usd
     state.tokens_total += run.tokens or 0
     if not run.cost_is_exact:
@@ -1641,6 +1660,8 @@ def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", choices=["claude", "codex", "grok"])
+    parser.add_argument("--model", default="",
+                        help="model id/alias (overrides runtime.json model)")
     parser.add_argument("--deliver-only", action="store_true",
                         help="skip the loop: apply the mission's delivery mode to the "
                              "current results and regenerate the report (used by "
@@ -1648,6 +1669,7 @@ def main() -> int:
     args = parser.parse_args()
 
     runtime = load_json(RUNTIME_PATH)
+    model = mission_model(runtime, args.model)
     TMP.mkdir(parents=True, exist_ok=True)
 
     # Keep the live activity feed bounded: trim to its most recent tail when a
@@ -1690,10 +1712,13 @@ def main() -> int:
     check_timeout = min(900, int(max_wall))
 
     say(f"mission {state.mission_id}: {runtime['objective']}", "bold")
-    say(f"budgets: {runtime['max_iterations']} iterations, ${runtime['max_cost_usd']:.2f}, "
-        f"{int(max_wall)}s wall clock")
+    say(f"engine {args.engine}"
+        + (f" · model {model}" if model else "")
+        + f" · budgets: {runtime['max_iterations']} iterations, "
+        f"${runtime['max_cost_usd']:.2f}, {int(max_wall)}s wall clock")
     MONITOR.update(mission_id=state.mission_id, loop_id=runtime.get("loop_id"),
                    objective=runtime.get("objective"), engine=args.engine,
+                   model=model or None,
                    status="RUNNING", phase="starting",
                    iteration=state.iteration,
                    max_iterations=int(runtime["max_iterations"]),
@@ -1786,10 +1811,10 @@ def main() -> int:
                 # Real extended-thinking budget to match the prompt keyword.
                 extra_env["MAX_THINKING_TOKENS"] = str(int(tokens))
             run = run_claude(prompt, scaled(runtime["claude"]["builder"]), result_path,
-                             label="builder", extra_env=extra_env)
+                             label="builder", extra_env=extra_env, model=model)
         elif args.engine == "grok":
             run = run_grok(prompt, scaled(runtime["grok"]["builder"]), result_path,
-                           label="builder")
+                           label="builder", model=model)
         else:
             builder_cfg = scaled(runtime["codex"]["builder"])
             configured = str(builder_cfg.get("model_reasoning_effort", "medium"))
@@ -1799,7 +1824,7 @@ def main() -> int:
                 builder_cfg["model_reasoning_effort"] = codex_effort
             run = run_codex(prompt, builder_cfg,
                             runtime["codex"].get("pricing"), result_path, RESULT_SCHEMA,
-                            label="builder")
+                            label="builder", model=model)
 
         state.cost_usd += run.cost_usd
         state.tokens_total += run.tokens or 0
@@ -1839,7 +1864,9 @@ def main() -> int:
 
         if builder_done:
             checkpoint(state, "builder-done")
-            verdict = final_acceptance(runtime, state, args.engine, check_timeout)
+            verdict = final_acceptance(runtime, state, args.engine, check_timeout,
+                                       model=model)
+
             if verdict is not None:
                 return stop(state, *verdict, runtime)
             checkpoint(state, "critic-hold")

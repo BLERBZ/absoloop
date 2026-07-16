@@ -35,13 +35,16 @@ class Card(unittest.TestCase):
         brief = ux.Briefing(
             target="/tmp/demo", target_name=".", adopting=True,
             objective="Make all tests pass", delivery="local", engine="claude",
-            kinds=["tests"], engines_available=("claude",))
+            model="best", kinds=["tests"], engines_available=("claude",))
         card = ux.render_card(brief)
         self.assertIn("MISSION BRIEFING", card)
         self.assertIn("Make all tests pass", card)
         self.assertIn("Red to green", card)
         self.assertIn("Enter", card)
         self.assertIn("claude", card)
+        self.assertIn("best", card)
+        self.assertIn("model", card)
+        self.assertRegex(card, r"\bm\b.*model")
 
 
 class ReviewAbort(unittest.TestCase):
