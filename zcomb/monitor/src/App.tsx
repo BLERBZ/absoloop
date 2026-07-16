@@ -63,26 +63,47 @@ export default function App() {
         minHeight: 44,
       }}>
         {/* Left: Brand */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
-          <h1 style={{
-            margin: 0,
-            fontSize: 20,
-            fontWeight: 800,
-            color: '#3fb950',
-            letterSpacing: 1.5,
-            textTransform: 'uppercase'
-          }}>
-            Absoloop
-          </h1>
-          <span style={{
-            color: mutedColor,
-            fontSize: 13,
-            fontWeight: 500,
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <img
+            src="/absoloop-logo-mark.png"
+            alt=""
+            width={28}
+            height={28}
+            style={{
+              width: 28,
+              height: 28,
+              objectFit: 'contain',
+              display: 'block',
+              flexShrink: 0,
+              borderRadius: 6,
+            }}
+          />
+          <div style={{
+            display: 'flex',
+            alignItems: 'baseline',
+            gap: 8,
             borderLeft: `1px solid ${borderColor}`,
-            paddingLeft: 14
+            paddingLeft: 12,
           }}>
-            ZComb · Kanban Monitor
-          </span>
+            <h1 style={{
+              margin: 0,
+              fontSize: 17,
+              fontWeight: 700,
+              color: textColor,
+              letterSpacing: '-0.02em',
+              lineHeight: 1.2,
+            }}>
+              ZComb Kanban
+            </h1>
+            <span style={{
+              color: mutedColor,
+              fontSize: 12,
+              fontWeight: 500,
+              letterSpacing: '0.02em',
+            }}>
+              Monitor
+            </span>
+          </div>
         </div>
 
         {/* Right: Progress + Timer + Connection + Theme */}

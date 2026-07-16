@@ -26,7 +26,8 @@ objective ──► /goal contract ──► iterate: builder works, reports don
   process is prompted (and for Claude, env-enabled) to fan out with native
   Agent Teams / subagents when workstreams are independent.
 - **Observable** — console stream + `.absoloop/tmp/monitor.json` +
-  `live.jsonl`, rendered by `absoloop watch`.
+  `live.jsonl`, rendered by `absoloop watch` or the optional ZComb Kanban
+  (`absoloop --zcomb` on launch, or `absoloop zcomb` anytime).
 
 ## Mission Briefing
 
@@ -140,13 +141,14 @@ While running, every tool call / command / message streams to the console
 ```bash
 absoloop watch --once
 absoloop report --terminal
-absoloop --zcomb            # optional browser Kanban UI (Node.js 18+)
+absoloop zcomb              # browser Kanban UI (Node.js 18+)
 ```
 
-`absoloop --zcomb` (or `absoloop zcomb`) bridges `monitor.json` + `live.jsonl`
-into the vendored [ZComb](https://github.com/BLERBZ/zcomb) dashboard at
-`http://localhost:3141`, writing state under `.absoloop/zcomb/state/`. Pass
-`--zcomb` on a mission launch to open it alongside the loop.
+`absoloop --zcomb` runs the same Mission Briefing / launch as bare `absoloop`,
+then opens the vendored [ZComb](https://github.com/BLERBZ/zcomb) dashboard.
+`absoloop zcomb` opens that dashboard alone (no new mission). Both bridge
+`monitor.json` + `live.jsonl` into `.absoloop/zcomb/state/` at
+`http://localhost:3141`.
 
 Full agent event streams persist as
 `iteration-NNNN-agent-result.stream.jsonl` / `.events.jsonl`.

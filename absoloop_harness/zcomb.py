@@ -4,7 +4,8 @@ Vendors the ZCombinator dashboard (zcomb/monitor) and bridges Absoloop
 telemetry (.absoloop/tmp/monitor.json + live.jsonl + state/runtime) into
 ZComb's agents/tasks/activity/metrics state files.
 
-CLI:  absoloop --zcomb | absoloop zcomb [-C project] [--port N] [--no-browser]
+CLI:  absoloop --zcomb  → same briefing/launch as absoloop + Kanban UI
+      absoloop zcomb [-C project] [--port N] [--no-browser]  → dashboard only
 """
 from __future__ import annotations
 
@@ -543,7 +544,20 @@ def spawn_background(project: pathlib.Path, *, port: int = DEFAULT_PORT,
 def zcomb_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="absoloop zcomb",
-        description="Optional ZComb Kanban UI for Absoloop mission monitoring.",
+        description=(
+            "ZComb Kanban dashboard for monitoring an Absoloop mission. "
+            "Requires Node.js 18+. For briefing + launch with Kanban, use "
+            "'absoloop --zcomb' (same process as bare 'absoloop')."
+        ),
+        epilog=(
+            "examples:\n"
+            "  absoloop --zcomb\n"
+            "  absoloop \"Make all tests pass\" --zcomb\n"
+            "  absoloop zcomb -C ./my-mission --port 3141\n"
+            "\n"
+            "Dashboard: http://localhost:3141  ·  state: .absoloop/zcomb/state/"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")

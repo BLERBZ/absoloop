@@ -6,9 +6,9 @@ wired into Absoloop as an optional Kanban / live UI.
 ## Start from Absoloop
 
 ```bash
-absoloop --zcomb                 # dashboard for the current project
-absoloop zcomb -C ./my-mission   # same, explicit project
-absoloop "Make tests pass" --zcomb   # brief + launch, open ZComb alongside
+absoloop --zcomb                 # same briefing/launch as absoloop + Kanban UI
+absoloop "Make tests pass" --zcomb   # objective + launch with Kanban
+absoloop zcomb -C ./my-mission   # dashboard only (monitor a running mission)
 ```
 
 Requires **Node.js 18+**. On first run Absoloop installs `monitor/` deps and

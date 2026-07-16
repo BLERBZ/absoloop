@@ -403,7 +403,8 @@ def _step_finish(yes: bool, result: SetupResult) -> bool:
     print("  " + tint("bold", "Handy commands"))
     _dim("absoloop doctor     environment + provider health")
     _dim("absoloop status     mission snapshot")
-    _dim("absoloop watch      live dashboard while looping")
+    _dim("absoloop watch      live terminal dashboard while looping")
+    _dim("absoloop --zcomb    briefing + launch with ZComb Kanban (Node.js 18+)")
     _dim("absoloop report     Markdown report + lite viewer")
     _dim("absoloop --help     full command list")
     print()
@@ -456,7 +457,9 @@ def run_wizard(*, yes: bool = False, force: bool = False) -> SetupResult:
         print()
         redo = ask("  Run the wizard again? [y/N]", "n").lower()
         if redo not in ("y", "yes"):
-            print(tint("dim", "  Tip: absoloop doctor · absoloop \"your objective\""))
+            print(tint("dim",
+                       "  Tip: absoloop doctor · absoloop \"your objective\" · "
+                       "absoloop --zcomb · absoloop zcomb"))
             result.completed = True
             for name, path, _hint in _probe_providers():
                 if path:

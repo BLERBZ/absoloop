@@ -88,6 +88,8 @@ absoloop "Make all tests pass"     # Mission Briefing → review card → Enter
 
 ```bash
 absoloop status · watch · report   # see, stream, then open the report viewer
+absoloop --zcomb                   # same briefing/launch as absoloop + ZComb UI
+absoloop zcomb                     # browser Kanban for a running mission
 absoloop approve                   # accept at the human gate
 absoloop reject "use the v2 API"   # steer the next iteration
 absoloop resume · resume --extend
@@ -162,21 +164,30 @@ See `templates/skills/toolbox.json`.
 ### Observability
 
 ```bash
-absoloop watch     # live dashboard (phase, budgets, activity feed)
+absoloop watch     # live terminal dashboard (phase, budgets, activity feed)
 absoloop status    # snapshot + exact next command
 absoloop report    # regenerates report.md + opens lite infographic viewer
                    #   --terminal · --no-open · --md-only
-absoloop --zcomb   # optional Kanban UI (vendored ZComb; needs Node.js 18+)
 ```
+
+#### ZComb Kanban UI (optional)
+
+Browser dashboard with agent cards, Kanban board, and activity feed — vendored
+from [ZComb](https://github.com/BLERBZ/zcomb). Requires **Node.js 18+**.
+
+```bash
+absoloop --zcomb                       # same briefing/launch as absoloop + Kanban
+absoloop "Make all tests pass" --zcomb # objective + launch with Kanban UI
+absoloop zcomb -C ./my-mission         # dashboard only (monitor a running mission)
+```
+
+On launch, opens [http://localhost:3141](http://localhost:3141) and bridges
+`.absoloop/tmp/monitor.json` + `live.jsonl` into `.absoloop/zcomb/state/`.
+Use `absoloop zcomb` anytime to open the dashboard without starting a mission.
+Details: [`zcomb/README.md`](zcomb/README.md) · [`docs/mission-loop.md`](docs/mission-loop.md).
 
 Telemetry lives under `.absoloop/tmp/` while running; the ledger and
 `report.md` are the durable story of the mission.
-
-Pass `--zcomb` on a mission launch to open the browser UI alongside the loop:
-
-```bash
-absoloop "Make all tests pass" --zcomb
-```
 
 ## Repo layout
 

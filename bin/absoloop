@@ -68,13 +68,18 @@ examples:
   absoloop my-mission -o "…" -d local --start -y
                                           # one shot: skip review, launch now
   absoloop status · watch · report · goal
-  absoloop --zcomb · zcomb              # optional Kanban UI (Node.js)
   absoloop resume · resume --extend
   absoloop approve · reject "guidance"
   absoloop schedule add|list|tick|daemon   # cron / interval mission triggers
 
 Mission Briefing keys: Enter launch · o objective · e engine · d delivery
                        n rename · g preview /goal · q abort
+
+ZComb Kanban UI (optional · needs Node.js 18+):
+  absoloop --zcomb                      # same briefing/launch as absoloop, plus Kanban
+  absoloop "…" --zcomb                  # objective + launch with Kanban UI
+  absoloop zcomb [-C ./mission]         # dashboard only (monitor a running mission)
+  → http://localhost:3141
 
 Harness: doctor · providers · run · build · review · cancel · inspect · apply
 
@@ -995,8 +1000,10 @@ def render_watch(target: pathlib.Path, state: dict, runtime: dict,
 def watch_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="absoloop watch",
-        description="Live dashboard for a running mission: phase, budgets, and "
-                    "a streaming feed of what the agent is doing right now.")
+        description="Live terminal dashboard for a running mission: phase, "
+                    "budgets, and a streaming feed of what the agent is doing "
+                    "right now. Prefer 'absoloop zcomb' for the browser "
+                    "Kanban UI (or 'absoloop --zcomb' to brief + launch with it).")
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
     parser.add_argument("-n", "--interval", type=float, default=2.0,
@@ -1236,8 +1243,10 @@ def status_command(argv: list[str]) -> int:
         if state.get(key):
             print(f"latest {label}: {state[key]}")
     print(f"next:       {next_step_hint(state)}")
-    print("more:       'absoloop watch' is a live dashboard; 'absoloop report' "
-          "shows the full timeline; 'absoloop goal' shows the contract")
+    print("more:       'absoloop watch' is a live terminal dashboard; "
+          "'absoloop zcomb' opens the browser Kanban UI; "
+          "'absoloop report' shows the full timeline; "
+          "'absoloop goal' shows the contract")
     return 0
 
 
@@ -1657,9 +1666,9 @@ def main(argv: list[str]) -> int:
         _ensure_harness_path()
         from absoloop_harness import zcomb as zcomb_mod
         return zcomb_mod.zcomb_command(argv[1:])
-    # Bare `absoloop --zcomb` (optionally with zcomb-only flags) → dashboard.
-    if want_zcomb and zcomb_mod is not None and not argv:
-        return zcomb_mod.zcomb_command([])
+    # ZComb-only flags without a mission → dashboard (e.g. --port / -C / --once).
+    # Bare `absoloop --zcomb` falls through to the same briefing/launch as
+    # `absoloop`, then opens the Kanban UI when the loop starts.
     if want_zcomb and zcomb_mod is not None and argv and argv[0].startswith("-") \
             and not any(a in ("-o", "--objective", "--engine", "--start", "-y",
                               "--yes", "--no-start", "-d", "--deliver")
@@ -1731,8 +1740,10 @@ def main(argv: list[str]) -> int:
                         help="skip the interactive briefing review and launch")
     parser.add_argument("--no-start", action="store_true",
                         help="scaffold only; do not launch the loop")
-    parser.add_argument("--zcomb", action="store_true",
-                        help="open the optional ZComb Kanban UI alongside the mission")
+    parser.add_argument(
+        "--zcomb", action="store_true",
+        help="same briefing/launch as absoloop, then open ZComb Kanban "
+             "(Node.js 18+; dashboard-only: absoloop zcomb)")
     args = parser.parse_args(argv)
     # Flag may arrive via argparse (after extract) only if someone passes it
     # again; prefer the early extract.

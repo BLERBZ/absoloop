@@ -66,11 +66,15 @@ Review the Mission Briefing card → **Enter** launches. Keys: `o` objective ·
 ## 5. While it runs / after
 
 ```bash
-absoloop watch     # live dashboard
+absoloop watch     # live terminal dashboard
+absoloop zcomb     # browser Kanban UI for a running mission (Node.js 18+)
 absoloop status    # snapshot + next command
 absoloop report    # Markdown + lite viewer
 absoloop approve   # accept at the human gate
 ```
+
+Tip: `absoloop --zcomb` (or `absoloop "…" --zcomb`) runs the same Mission
+Briefing / launch as bare `absoloop`, then opens the Kanban alongside the loop.
 
 ## Codex Micro
 
