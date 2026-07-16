@@ -32,15 +32,54 @@ objective ──► /goal contract ──► iterate: builder works, reports don
   (`.absoloop/tmp/monitor.json` + `live.jsonl`) that `absoloop watch` renders
   as a refreshing dashboard: phase, budget bars, current activity, risk flags.
 
+## Multi-provider harness
+
+Beyond the mission loop, `absoloop` is a provider-neutral harness that runs
+**Grok Build, Claude Code, and Codex** as first-class backends — native
+auth/tools/sessions preserved, isolated git worktrees, normalized event
+streams, deterministic quality gates, and reproducible run artifacts:
+
+```
+absoloop doctor                                   # provider health + fixes
+absoloop run --provider grok "Fix the tests"     # single provider
+absoloop build --strategy race --providers grok,claude,codex "Issue #123"
+absoloop review --implementer claude --reviewer codex "Harden this change"
+absoloop inspect <run-id> · absoloop cancel <run-id> · absoloop apply <run-id>
+absoloop resume <run-id>
+```
+
+See `docs/multi-provider.md` (user guide) and
+`docs/architecture/multi-provider-harness.md` (design); configure with
+`absoloop.toml` (start from `absoloop.toml.example`).
+
+## Shortcuts & Codex Micro
+
+Same actions from the keyboard, CLI, or a [Work Louder Codex Micro](https://worklouder.cc/codex-micro)
+(HID keypad — map keys in Input, keymap stays on-device):
+
+```
+absoloop shortcuts list
+absoloop shortcuts layout          # 13-key Micro mission layer
+absoloop do status                 # fire any action
+absoloop shortcuts listen          # F13–F24 / line protocol
+absoloop shortcuts export --format input -o micro-input.md
+```
+
+Defaults use F13–F24 so typing never collides. Full guide: `docs/shortcuts.md`.
+
 ## Repo layout
 
 ```
 bin/absoloop              startup CLI (pure Python, cross-platform)
 bin/absoloop.cmd          Windows shim
+absoloop_harness/         multi-provider harness (core, process, providers,
+                          workspace, orchestrator, cli, config)
 templates/absoloop-run    reference loop runner copied into each project
 templates/absoloop-init   POSIX bootstrap convenience copy
 templates/skills/         the loopers-toolbox: mission skills seeded into
                           each project (+ toolbox.json engine manifest)
+tests/                    characterization + harness test suites
+docs/                     user guide and architecture docs
 out/                      (gitignored) deliveries from `-d out` missions
 ```
 
@@ -57,28 +96,24 @@ run the command.
 
 ## Usage
 
-One shot — scaffold and start the loop, no prompts:
+**Mission Briefing** — say what you want, review one card, hit Enter:
 
 ```
-absoloop my-mission -o "Make all tests pass" -d local --start
+absoloop "Make all tests pass"     # objective-first; review; Enter launches
+absoloop                           # one prompt for the objective, then review
+absoloop . -o "Fix the crash"      # adopt cwd with the same briefing
+absoloop my-mission -o "…" -y      # skip review, lock in and launch
+absoloop "…" --no-start            # scaffold only
 ```
 
-Anything you omit is prompted for:
+The briefing card shows objective, mission profile, engine, delivery, and
+budgets. Keys: `Enter` launch · `o` objective · `e` engine · `d` delivery ·
+`n` rename · `g` preview `/goal` · `q` abort. Defaults adopt the current
+directory, `local` delivery, and the first engine on PATH — so most missions
+are one sentence + Enter.
 
-```
-absoloop --help
-absoloop              # fully interactive (asks name, confirms, then mission)
-absoloop my-mission   # no confirmation; prompts for objective + delivery,
-                        # then offers to start the loop immediately
-absoloop .            # adopt the directory you are already in
-```
-
-It scaffolds `./<name>/` (scripts + `.absoloop/` config, git init) and
-generates the mission's **/goal contract** at `.absoloop/goal.md`.
-`--engine claude|codex` picks the engine and implies `--start`; without it,
-interactive setup asks which engine to use in a multiple-choice prompt that
-marks each one ✓ available or ✗ not found on PATH (non-interactive runs fall
-back to the first engine found).
+It scaffolds the project (scripts + `.absoloop/` config, git init) and
+writes the **/goal contract** at `.absoloop/goal.md`.
 
 To start (or resume) the loop later from inside the project:
 

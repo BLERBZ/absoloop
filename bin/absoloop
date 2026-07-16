@@ -47,42 +47,25 @@ class BannerParser(argparse.ArgumentParser):
 
 EPILOG = """\
 examples:
-  absoloop                      # fully interactive
-  absoloop my-mission           # prompts only for the objective
-  absoloop my-mission -o "Make all tests pass" --start
-                                  # one shot: scaffold and start the loop
-  absoloop existing-project     # adopts an existing directory in place
-  absoloop .                    # adopt the directory you are already in
-  absoloop status               # where is the mission? what should I do next?
-  absoloop watch                # live dashboard: phase, budgets, and a
-                                  # streaming feed of agent actions (--once
-                                  # for a single frame, -n 5 to refresh slower)
-  absoloop report               # iteration-by-iteration results timeline
-  absoloop goal                 # show the generated /goal contract
-                                  # (--regen rebuilds it; --check validates the
-                                  #  mission config it is generated from)
-  absoloop my-mission -d out    # deliver accepted work to ~/absoloop/out/<loop_id>/
-                                  # (-d git commits to a branch; -d local leaves
-                                  #  changes unstaged; prompted when omitted)
-  absoloop resume               # re-enter the active mission's loop in place
-  absoloop resume --extend      # follow-on run for a COMPLETED mission: fresh
-                                  budgets, previous work carried in as context
-  absoloop resume --extend -m "finish the CLI flags too" --hours 4 --iterations 30
-                                  # extended follow-on run with a focus note —
-                                  # the note becomes a binding definition-of-done
-                                  # item (--min-iterations N sets the floor before
-                                  # a done claim is accepted; default 3 with a note)
-  absoloop approve              # accept a mission stopped at the human gate
-  absoloop reject "use the v2 API instead"
-                                  # answer the agent; feedback lands in the
-                                  # next iteration's prompt — then resume
+  absoloop                              # briefing: one prompt → review → launch
+  absoloop "Make all tests pass"        # objective first; review card; Enter
+  absoloop . -o "Fix the parser crash"  # adopt cwd, review, go
+  absoloop my-mission -o "…" -d local --start -y
+                                          # one shot: skip review, launch now
+  absoloop status · watch · report · goal
+  absoloop resume · resume --extend
+  absoloop approve · reject "guidance"
 
-New directories are scaffolded; existing ones are adopted — ABSOLOOP files
-are added only where missing, and an existing .absoloop/runtime.json is
-reused (pass -o to update the mission in place).
+Mission Briefing keys: Enter launch · o objective · e engine · d delivery
+                       n rename · g preview /goal · q abort
 
-Runner exit codes: 0 = completed, 3 = accepted & awaiting your approval,
-2 = stopped safely (see stop_reason in the printed state).
+Harness: doctor · providers · run · build · review · cancel · inspect · apply
+
+Shortcuts (keyboard + Codex Micro):
+  absoloop shortcuts list|layout|export|listen|bind
+  absoloop do status          # same actions the Micro keys fire
+
+Runner exit codes: 0 completed · 3 awaiting approval · 2 stopped safely.
 """
 
 CRITIC_PROMPT = """\
@@ -1456,9 +1439,126 @@ def start_loop(target: pathlib.Path, engine: str) -> int:
     sync_runner(target)
     sync_skills(target, engines=(engine,))
     runner = target / "scripts" / "absoloop-run"
-    print(f"\nStarting loop with engine '{engine}'...\n")
+    print(f"  engine {engine} · working tree {target}\n")
     return subprocess.run([sys.executable, str(runner), "--engine", engine],
                           cwd=target).returncode
+
+
+def _load_harness():
+    """The multi-provider harness package lives in the tooling home; import
+    it lazily so legacy mission commands never pay for (or break on) it."""
+    if str(ABSOLOOP_HOME) not in sys.path:
+        sys.path.insert(0, str(ABSOLOOP_HOME))
+    from absoloop_harness import cli as harness_cli
+    return harness_cli
+
+
+def _load_briefing():
+    if str(ABSOLOOP_HOME) not in sys.path:
+        sys.path.insert(0, str(ABSOLOOP_HOME))
+    from absoloop_harness import briefing
+    return briefing
+
+
+def scaffold_mission(target: pathlib.Path, objective: str,
+                     delivery_mode: str) -> tuple[dict, pathlib.Path]:
+    """Create/adopt project files and write runtime + /goal. Returns
+    (config, goal_path)."""
+    scripts = target / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    sync_runner(target)
+    sync_skills(target)
+    for tmpl in ("absoloop-init",):
+        src = TEMPLATES / tmpl
+        dest = scripts / tmpl
+        if not src.is_file():
+            continue
+        if dest.exists():
+            continue
+        shutil.copy(src, dest)
+        if os.name != "nt":
+            os.chmod(dest, 0o755)
+
+    if shutil.which("git"):
+        inside = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True)
+        if inside.returncode != 0:
+            subprocess.run(["git", "init", "-q", str(target)], check=False)
+
+    abs_dir = target / ".absoloop"
+    legacy_dir = target / ".absolution"
+    if legacy_dir.is_dir() and not abs_dir.exists():
+        legacy_dir.rename(abs_dir)
+        print("migrated legacy .absolution/ config to .absoloop/")
+    for legacy in ("absolution-run", "absolution-init"):
+        if (scripts / legacy).exists():
+            print(f"note: scripts/{legacy} is from the old ABSOLUTION name and can be "
+                  f"deleted; {legacy.replace('absolution', 'absoloop')} replaces it.")
+
+    runtime_path = abs_dir / "runtime.json"
+    existing_config = None
+    if runtime_path.is_file():
+        try:
+            existing_config = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            print(f"warning: {runtime_path} is unreadable — rebuilding it.",
+                  file=sys.stderr)
+
+    for sub in ("tmp", "checkpoints", "schemas", "prompts"):
+        (abs_dir / sub).mkdir(parents=True, exist_ok=True)
+    schema_path = abs_dir / "schemas" / "agent-result.schema.json"
+    if not schema_path.exists():
+        schema_path.write_text(json.dumps(RESULT_SCHEMA, indent=2) + "\n",
+                               encoding="utf-8")
+    critic_path = abs_dir / "prompts" / "critic-final-review.md"
+    if not critic_path.exists():
+        critic_path.write_text(CRITIC_PROMPT, encoding="utf-8")
+
+    if existing_config:
+        previous_objective = str(existing_config.get("objective", "")).strip()
+        existing_config["objective"] = objective
+        if (objective != previous_objective
+                or validate_thinking_ladder(existing_config.get("thinking_ladder"))):
+            existing_config["thinking_ladder"] = build_thinking_ladder(
+                classify_mission(objective))
+        existing_config.pop("verify_command", None)
+        critic_path_cfg = str(existing_config.get("critic_prompt_path", ""))
+        if critic_path_cfg.startswith(".absolution/"):
+            existing_config["critic_prompt_path"] = (
+                ".absoloop/" + critic_path_cfg[len(".absolution/"):])
+        existing_config.setdefault("loop_id", new_loop_id())
+        existing_config.setdefault("goal_path", ".absoloop/goal.md")
+        existing_config["delivery"] = default_delivery(
+            delivery_mode, existing_config["loop_id"])
+        config = existing_config
+    else:
+        config = runtime_config(objective, new_loop_id(), delivery_mode)
+
+    runtime_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    goal_path = write_goal(target, config)
+
+    gitignore = target / ".gitignore"
+    ignore_line = ".absoloop/tmp/"
+    existing_ignores = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
+    if ignore_line not in existing_ignores.splitlines():
+        gitignore.write_text(
+            existing_ignores
+            + ("" if existing_ignores.endswith("\n") or not existing_ignores else "\n")
+            + ignore_line + "\n", encoding="utf-8")
+    return config, goal_path
+
+
+def _resolve_target(name: str) -> pathlib.Path:
+    return (pathlib.Path.cwd() / pathlib.Path(name).expanduser()).resolve()
+
+
+def _engine_labels() -> dict:
+    labels = {}
+    for engine in ENGINES:
+        labels[engine] = ("✓ on PATH" if shutil.which(engine)
+                          else "✗ not found")
+    return labels
 
 
 def main(argv: list[str]) -> int:
@@ -1473,206 +1573,186 @@ def main(argv: list[str]) -> int:
     if argv and argv[0] == "goal":
         return goal_command(argv[1:])
     if argv and argv[0] == "resume":
+        harness = _load_harness()
+        outcome = harness.harness_resume_command(argv[1:])
+        if outcome is not None:
+            return outcome
         return resume_command(argv[1:])
+    if argv and argv[0] in ("doctor", "providers", "run", "build", "review",
+                            "cancel", "inspect", "apply", "config"):
+        return _load_harness().dispatch(argv[0], argv[1:])
+    if argv and argv[0] in ("shortcuts", "shortcut", "do"):
+        if str(ABSOLOOP_HOME) not in sys.path:
+            sys.path.insert(0, str(ABSOLOOP_HOME))
+        from absoloop_harness import shortcuts as sc
+        if argv[0] == "do":
+            return sc.do_command(argv[1:])
+        return sc.shortcuts_command(argv[1:])
 
     parser = BannerParser(
         prog="absoloop",
-        description="Scaffold and start an ABSOLOOP mission loop project.",
+        description="Absoloop — bounded AI repair loops. Briefing, then launch.",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("name", nargs="?", help="project name (prompted if omitted)")
+    parser.add_argument(
+        "mission", nargs="?",
+        help="project name, '.', or a quoted objective "
+             "(e.g. absoloop \"Make all tests pass\")")
     parser.add_argument("-o", "--objective", help="mission objective (one sentence)")
     parser.add_argument("-d", "--deliver", choices=sorted(DELIVERY_MODES),
-                        help="where accepted work lands: git (commit to branch), "
-                             "local (leave unstaged), out (~/absoloop/out/<loop_id>/)")
-    parser.add_argument("--engine", choices=["claude", "codex"],
-                        help="engine for the loop (implies --start)")
+                        help="where accepted work lands (default: local)")
+    parser.add_argument("--engine", choices=list(ENGINES),
+                        help="engine for the loop")
     parser.add_argument("--start", action="store_true",
-                        help="start the loop immediately after scaffolding")
+                        help="launch after scaffolding (default on TTY after review)")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="skip the interactive briefing review and launch")
+    parser.add_argument("--no-start", action="store_true",
+                        help="scaffold only; do not launch the loop")
     args = parser.parse_args(argv)
 
-    print_banner()
+    print_banner(compact=True)
+    ux = _load_briefing()
 
     runner_template = TEMPLATES / "absoloop-run"
     if not runner_template.is_file():
         print(f"error: missing template {runner_template}", file=sys.stderr)
         return 1
 
-    if shutil.which("jq") is None:
-        print("warning: 'jq' not found on PATH — some blueprint recipes use it.", file=sys.stderr)
-    if default_engine() is None:
-        print("warning: neither 'claude' nor 'codex' CLI found on PATH — "
-              "install one before running the loop.", file=sys.stderr)
+    available = tuple(e for e in ENGINES if shutil.which(e))
+    print(ux.opening_line(available))
+    print()
 
-    name = args.name or ""
-    name_from_arg = bool(name)
-    while True:
-        if not name:
-            name = ask("Project name (or path to an existing project): ")
-        if re.fullmatch(r"[A-Za-z0-9._-]+", name) or pathlib.Path(name).expanduser().is_dir():
-            break
-        print("Use only letters, numbers, dots, dashes, underscores — "
-              "or the path of an existing directory.", file=sys.stderr)
-        name = ""
+    # --- parse positional: name vs free-text objective -----------------------
+    positional = (args.mission or "").strip()
+    objective = (args.objective or "").strip()
+    name = ""
+    if positional:
+        if ux.looks_like_objective(positional) and not objective:
+            objective = positional
+        else:
+            name = positional
 
-    target = (pathlib.Path.cwd() / pathlib.Path(name).expanduser()).resolve()
+    # Peek at an existing runtime for defaults when adopting a named path.
+    peek_target = _resolve_target(name or ".")
+    existing_objective = ""
+    existing_delivery = ""
+    if (peek_target / ".absoloop" / "runtime.json").is_file():
+        try:
+            peek = json.loads(
+                (peek_target / ".absoloop" / "runtime.json").read_text(encoding="utf-8"))
+            existing_objective = str(peek.get("objective", "")).strip()
+            existing_delivery = str((peek.get("delivery") or {}).get("mode", ""))
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    objective = objective or existing_objective
+    delivery = args.deliver or existing_delivery or "local"
+    if delivery not in DELIVERY_MODES:
+        delivery = "local"
+    engine = args.engine or (available[0] if available else ENGINES[0])
+
+    # Default project: adopt cwd (fewest steps). Rename from the briefing card.
+    if not name:
+        name = "." if not objective else (
+            "." if peek_target.is_dir() else ux.slug_from_objective(objective))
+
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+
+    # Only ask for the one thing we cannot invent: the objective.
+    if not objective:
+        if not interactive:
+            print("error: pass -o/--objective or a quoted mission string.",
+                  file=sys.stderr)
+            return 1
+        print(ux.tint("bold", "What's the mission?"))
+        print(ux.tint("dim", "  one sentence — what should be true when we stop?"))
+        objective = ux.ask("  objective")
+        while not objective:
+            objective = ux.ask("  objective (required)")
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", name) and name != "." \
+            and not pathlib.Path(name).expanduser().is_dir():
+        print("error: project name must be letters/numbers/._- or '.'",
+              file=sys.stderr)
+        return 1
+
+    target = _resolve_target(name)
     if target.exists() and not target.is_dir():
         print(f"error: {target} exists and is not a directory.", file=sys.stderr)
         return 1
-    adopting = target.is_dir()
 
-    # Only confirm when the name came from an interactive prompt; passing it
-    # on the command line is confirmation enough.
-    if not name_from_arg:
-        question = (f"Set up ABSOLOOP in existing directory {target}? [y/N] " if adopting
-                    else f"Create ABSOLOOP project at {target}? [y/N] ")
-        if ask(question).lower() not in ("y", "yes"):
-            print("Aborted.")
+    brief = ux.Briefing(
+        target=str(target),
+        # Keep '.' as '.' so post-review path resolution adopts cwd —
+        # never rewrites to cwd/<basename>.
+        target_name=name or ".",
+        adopting=target.is_dir(),
+        objective=objective,
+        delivery=delivery,
+        engine=engine,
+        kinds=classify_mission(objective) or ["general"],
+        engines_available=available,
+    )
+
+    def preview_goal(b) -> None:
+        from_text = generate_goal_markdown(
+            runtime_config(b.objective, "preview", b.delivery))
+        print()
+        print(ux.tint("dim", "  ── /goal preview ──"))
+        for line in from_text.splitlines()[:40]:
+            print("  " + line)
+        if from_text.count("\n") > 40:
+            print(ux.tint("dim", "  …"))
+        print()
+
+    if interactive and not args.yes and not args.no_start:
+        confirmed = ux.review_loop(
+            brief,
+            engines=ENGINES,
+            engine_labels=_engine_labels(),
+            deliveries=("local", "git", "out"),
+            classify=classify_mission,
+            preview_goal=preview_goal,
+        )
+        if confirmed is None:
             return 1
-
-    scripts = target / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
-    # The runner is a managed file: always kept in step with the installed
-    # template so scaffolded projects pick up loop fixes on re-adoption.
-    sync_runner(target)
-    sync_skills(target)
-    for tmpl in ("absoloop-init",):
-        src = TEMPLATES / tmpl
-        dest = scripts / tmpl
-        if not src.is_file():
-            continue
-        if dest.exists():
-            print(f"kept existing scripts/{tmpl}")
-            continue
-        shutil.copy(src, dest)
-        if os.name != "nt":
-            os.chmod(dest, 0o755)
-
-    if shutil.which("git"):
-        inside = subprocess.run(["git", "-C", str(target), "rev-parse", "--is-inside-work-tree"],
-                                capture_output=True, text=True)
-        if inside.returncode != 0:
-            subprocess.run(["git", "init", "-q", str(target)], check=False)
-
-    abs_dir = target / ".absoloop"
-    legacy_dir = target / ".absolution"
-    if legacy_dir.is_dir() and not abs_dir.exists():
-        legacy_dir.rename(abs_dir)
-        print("migrated legacy .absolution/ config to .absoloop/")
-    for legacy in ("absolution-run", "absolution-init"):
-        if (scripts / legacy).exists():
-            print(f"note: scripts/{legacy} is from the old ABSOLUTION name and can be "
-                  f"deleted; {legacy.replace('absolution', 'absoloop')} replaces it.")
-    runtime_path = abs_dir / "runtime.json"
-    existing_config = None
-    if runtime_path.is_file():
-        try:
-            existing_config = json.loads(runtime_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            print(f"warning: {runtime_path} is unreadable — rebuilding it.", file=sys.stderr)
-
-    objective = (args.objective or "").strip()
-    if existing_config:
-        objective = objective or str(existing_config.get("objective", "")).strip()
-    if not objective:
-        status = "adopted" if adopting else "created"
-        print(f"\nProject '{target.name}' {status}. Now define the mission:")
-    while not objective:
-        objective = ask("Mission objective (one sentence): ")
-
-    # Delivery: flag wins, then an existing config's choice, then a prompt.
-    delivery_mode = args.deliver or ""
-    if not delivery_mode and existing_config:
-        delivery_mode = str((existing_config.get("delivery") or {}).get("mode", ""))
-    if delivery_mode and delivery_mode not in DELIVERY_MODES:
-        print(f"warning: unknown delivery mode {delivery_mode!r} in existing config — "
-              "asking again.", file=sys.stderr)
-        delivery_mode = ""
-    if not delivery_mode:
-        if sys.stdin.isatty():
-            print("\nWhere should accepted loop results land?")
-            ordered = ("git", "local", "out")
-            for index, mode in enumerate(ordered, 1):
-                print(f"  {index}. {mode:<5} — {DELIVERY_MODES[mode]}")
-            while not delivery_mode:
-                answer = ask("Delivery [1-3, or git/local/out] (default: local): ") or "local"
-                if answer in DELIVERY_MODES:
-                    delivery_mode = answer
-                elif answer in ("1", "2", "3"):
-                    delivery_mode = ordered[int(answer) - 1]
-                else:
-                    print("Answer 1, 2, 3, git, local, or out.", file=sys.stderr)
-        else:
-            delivery_mode = "local"
-
-    for sub in ("tmp", "checkpoints", "schemas", "prompts"):
-        (abs_dir / sub).mkdir(parents=True, exist_ok=True)
-    schema_path = abs_dir / "schemas" / "agent-result.schema.json"
-    if not schema_path.exists():
-        schema_path.write_text(json.dumps(RESULT_SCHEMA, indent=2) + "\n", encoding="utf-8")
-    critic_path = abs_dir / "prompts" / "critic-final-review.md"
-    if not critic_path.exists():
-        critic_path.write_text(CRITIC_PROMPT, encoding="utf-8")
-
-    if existing_config:
-        # Preserve any hand-tuned settings; only refresh the mission fields.
-        previous_objective = str(existing_config.get("objective", "")).strip()
-        existing_config["objective"] = objective
-        # The ladder derives from the objective's mission type: rebuild it when
-        # the mission changed or it is missing/invalid; keep a valid hand-tuned one.
-        if (objective != previous_objective
-                or validate_thinking_ladder(existing_config.get("thinking_ladder"))):
-            existing_config["thinking_ladder"] = build_thinking_ladder(
-                classify_mission(objective))
-        existing_config.pop("verify_command", None)
-        critic_path_cfg = str(existing_config.get("critic_prompt_path", ""))
-        if critic_path_cfg.startswith(".absolution/"):
-            existing_config["critic_prompt_path"] = ".absoloop/" + critic_path_cfg[len(".absolution/"):]
-        existing_config.setdefault("loop_id", new_loop_id())
-        existing_config.setdefault("goal_path", ".absoloop/goal.md")
-        existing_config["delivery"] = default_delivery(delivery_mode,
-                                                       existing_config["loop_id"])
-        config = existing_config
-        print("reusing existing .absoloop/runtime.json (mission fields updated)")
+        brief = confirmed
     else:
-        config = runtime_config(objective, new_loop_id(), delivery_mode)
-    runtime_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+        print(ux.render_card(brief))
 
-    goal_path = write_goal(target, config)
-    print(f"goal contract written to {goal_path.relative_to(target)} "
-          "(view or tweak with 'absoloop goal')")
-    print(f"delivery: {delivery_mode} — {DELIVERY_MODES[delivery_mode]}")
+    # Resolve project path from the (possibly renamed) briefing.
+    if brief.target_name in (".",):
+        target = pathlib.Path.cwd().resolve()
+    else:
+        target = _resolve_target(brief.target_name)
+    brief = __import__("dataclasses").replace(
+        brief, target=str(target), adopting=target.is_dir())
 
-    # Keep per-iteration loop scratch out of git; delivered commits stay clean.
-    gitignore = target / ".gitignore"
-    ignore_line = ".absoloop/tmp/"
-    existing_ignores = gitignore.read_text(encoding="utf-8") if gitignore.is_file() else ""
-    if ignore_line not in existing_ignores.splitlines():
-        gitignore.write_text(existing_ignores
-                             + ("" if existing_ignores.endswith("\n") or not existing_ignores else "\n")
-                             + ignore_line + "\n", encoding="utf-8")
+    if target.exists() and not target.is_dir():
+        print(f"error: {target} exists and is not a directory.", file=sys.stderr)
+        return 1
 
-    engine = args.engine or ""
-    if not engine and sys.stdin.isatty():
-        engine = choose_engine()
-    engine = engine or default_engine()
+    _config, goal_path = scaffold_mission(target, brief.objective, brief.delivery)
+    ux.celebrate_scaffold(brief, str(goal_path.relative_to(target)))
 
-    if args.start or args.engine:
-        if engine is None:
-            print("error: no engine available — install 'claude' or 'codex'.", file=sys.stderr)
-            return 1
-        return start_loop(target, engine)
+    launch = not args.no_start
+    if not launch:
+        run_cmd = ("python scripts/absoloop-run" if os.name == "nt"
+                   else "./scripts/absoloop-run")
+        steps = ([] if target == pathlib.Path.cwd().resolve()
+                 else [f"cd {os.path.relpath(target)}"])
+        steps.append(f"{run_cmd} --engine {brief.engine}")
+        print("\n" + ux.tint("dim", "  Scaffold ready. Launch when you are:"))
+        print("  " + "\n  ".join(steps))
+        return 0
 
-    if engine and shutil.which(engine) and sys.stdin.isatty():
-        if ask(f"\nMission ready. Start the loop now with '{engine}'? [Y/n] ").lower() in ("", "y", "yes"):
-            return start_loop(target, engine)
-
-    run_cmd = "python scripts/absoloop-run" if os.name == "nt" else "./scripts/absoloop-run"
-    steps = [] if target == pathlib.Path.cwd().resolve() else [f"cd {os.path.relpath(target)}"]
-    steps.append(f"{run_cmd} --engine {engine or 'claude'}")
-    print("\nMission ready. Next:\n  " + "\n  ".join(steps))
-    return 0
+    if brief.engine not in available:
+        print(f"error: engine '{brief.engine}' not on PATH — "
+              f"install it or re-run and pick another (e).", file=sys.stderr)
+        return 1
+    return start_loop(target, brief.engine)
 
 
 if __name__ == "__main__":

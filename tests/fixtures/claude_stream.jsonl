@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"sess-42","model":"claude-sonnet","tools":["Bash","Edit"]}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Let me look at the failing test."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pytest -x"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","is_error":false}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"toolu_2","name":"Edit","input":{"file_path":"src/app.py","old_string":"a","new_string":"b"}}]}}
+{"type":"stream_event","event":{"type":"content_block_delta"}}
+{"type":"result","subtype":"success","is_error":false,"session_id":"sess-42","result":"Fixed the bug.","num_turns":3,"usage":{"input_tokens":120,"output_tokens":80},"total_cost_usd":0.034}
