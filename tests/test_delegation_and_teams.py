@@ -41,10 +41,19 @@ class ClaudeTeamsEnv(unittest.TestCase):
         env = adapter.provider_extra_env(request)
         self.assertEqual(env.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"), "1")
 
+    def test_claude_argv_forces_in_process_teammates(self):
+        adapter = ClaudeAdapter({})
+        with tempfile.TemporaryDirectory() as tmp:
+            request = AgentRequest(prompt="hi", cwd=tmp, permission_profile="edit")
+            argv, _ = adapter.build_argv(request, None, pathlib.Path(tmp))
+        self.assertIn("--teammate-mode", argv)
+        self.assertIn("in-process", argv)
+
 
 class DelegationPosture(unittest.TestCase):
     def test_engine_specific_blocks(self):
-        self.assertIn("Agent Teams", delegation_posture("claude"))
+        self.assertIn("team lead", delegation_posture("claude").lower())
+        self.assertIn("Task tool", delegation_posture("claude"))
         self.assertIn("subagents", delegation_posture("codex"))
         self.assertIn("spawn_subagent", delegation_posture("grok"))
 
@@ -53,7 +62,8 @@ class DelegationPosture(unittest.TestCase):
         self.assertEqual(with_delegation(prompt, "claude", "read"), prompt)
         tasked = with_delegation(prompt, "claude", "edit")
         self.assertIn(prompt, tasked)
-        self.assertIn("Agent Teams", tasked)
+        self.assertIn("team lead", tasked.lower())
+        self.assertIn("Task tool", tasked)
 
     def test_orchestrator_request_appends_posture(self):
         from absoloop_harness.config import Config
@@ -91,7 +101,12 @@ class GrokMissionArgv(unittest.TestCase):
             'noise {"done": false, "summary": "x"} trailing')
         self.assertEqual(parsed.get("done"), False)
         posture = ns["delegation_posture"]("claude")
-        self.assertIn("Agent Teams", posture)
+        self.assertIn("Task tool", posture)
+        self.assertIn("team lead", posture.lower())
+        # Claude headless Builder must force in-process Agent Teams.
+        src = runner_path.read_text(encoding="utf-8")
+        self.assertIn("--teammate-mode", src)
+        self.assertIn("in-process", src)
 
 
 class SpawnEvidence(unittest.TestCase):

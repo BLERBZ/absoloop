@@ -38,31 +38,36 @@ ENGINE_SKILL_DIRS = {
     "grok": ".grok/skills",
 }
 
-# Two-layer teams: Absoloop spawns the engine CLI; the engine fans out with
-# native subagents / Agent Teams when the task warrants it.
+# Two-layer teams: Absoloop spawns the Builder CLI; that Builder is the team
+# lead and must fan out with native Agent Teams / subagents on complex work.
 _DELEGATION_POSTURE = {
     "claude": (
-        "## Native delegation (Claude Agent Teams)\n"
-        "Agent Teams are enabled for this session. When the task fans out across "
-        "independent workstreams (research, implement, test, review), spawn "
-        "teammates in parallel rather than doing every step serially. Keep the "
-        "lead focused on coordination and synthesis; give each teammate a clear "
-        "owned slice. Do not spawn teams for trivial single-file edits."
+        "## Builder role — you are the team lead\n"
+        "Agent Teams are enabled. You are the Builder / lead, not a solo coder.\n"
+        "For any multi-file, multi-component, or larger build (new feature, "
+        "multi-game polish, cross-layer change, research+implement+test):\n"
+        "1. Decompose into independent slices.\n"
+        "2. Spawn teammates NOW with the Task tool (one message, multiple "
+        "Task calls) — e.g. implementer, tester, polisher, reviewer.\n"
+        "3. Give each teammate a clear owned slice and success criteria.\n"
+        "4. Coordinate via the shared task list / SendMessage; synthesize "
+        "results yourself.\n"
+        "Do NOT implement the whole complex build serially alone. Solo only "
+        "true one-file / one-function fixes."
     ),
     "codex": (
-        "## Native delegation (Codex subagents)\n"
-        "When the task fans out across independent workstreams, spawn subagents "
-        "in parallel (e.g. explore vs implement vs test) rather than serial tool "
-        "loops. Ask for parallel agents explicitly when useful. Do not spawn "
-        "subagents for trivial single-file edits."
+        "## Builder role — you are the team lead\n"
+        "You are the Builder / lead, not a solo coder. For any multi-file, "
+        "multi-component, or larger build: spawn subagents in parallel "
+        "(implement / test / polish) before doing the work yourself. Ask for "
+        "parallel agents explicitly. Solo only true one-file / one-function fixes."
     ),
     "grok": (
-        "## Native delegation (Grok subagents)\n"
-        "When the task fans out across independent workstreams, use "
-        "`spawn_subagent` in parallel (research / build / review) rather than "
-        "serial tool loops. Prefer worktree isolation when subagents would "
-        "conflict on the same files. Do not spawn subagents for trivial "
-        "single-file edits."
+        "## Builder role — you are the team lead\n"
+        "You are the Builder / lead, not a solo coder. For any multi-file, "
+        "multi-component, or larger build: call `spawn_subagent` in parallel "
+        "(research / build / review), prefer worktree isolation when files "
+        "would conflict. Solo only true one-file / one-function fixes."
     ),
 }
 
@@ -555,8 +560,14 @@ def claude_stream_events(line: str) -> list[tuple[str, str]]:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use":
-                described.append(("tool", describe_tool_use(
-                    str(block.get("name", "tool")), block.get("input"))))
+                name = str(block.get("name", "tool"))
+                tool_input = block.get("input")
+                # Surface Agent Teams / subagent spawns clearly in watch.
+                if name in ("Task", "Agent", "SpawnAgent", "spawn_subagent"):
+                    detail = describe_tool_use(name, tool_input)
+                    described.append(("tool", f"spawn teammate · {detail}"))
+                else:
+                    described.append(("tool", describe_tool_use(name, tool_input)))
             elif block.get("type") == "text":
                 text = " ".join(str(block.get("text", "")).split())
                 if text:
@@ -839,15 +850,18 @@ Repeated failure count: {state.repeated_failure_count}
    iteration's work before solving from scratch.
 4. Choose one bounded strategy from the goal contract's strategy ladder that
    differs from any failed repeated strategy.
-5. Make only the smallest authorized changes needed for this iteration.
-   When the work reveals recurring complexity, codify it with the
-   `skill-creator` skill so later iterations inherit the capability.
+5. If this iteration is a multi-file / multi-component / larger build: spawn
+   your agent team first (see Builder role above), then coordinate. Stay
+   mission-scoped — no opportunistic edits outside the contract — but do not
+   interpret "scoped" as "work alone." Solo only true one-file fixes.
+   When work reveals recurring complexity, codify it with `skill-creator`.
 6. Run a focused check when available (tests, a build, the program itself)
    and record what you ran and what it showed.
 7. Never weaken tests or acceptance criteria.
 8. Return schema-valid JSON with changed artifacts, commands, evidence, risks,
-   and a concise decision summary. Set "done": true ONLY when every item in
-   the definition of done is genuinely met — an independent critic will
+   and a concise decision summary. Mention teammates you spawned (names/roles)
+   in the summary when you used a team. Set "done": true ONLY when every item
+   in the definition of done is genuinely met — an independent critic will
    inspect the working tree and reject unearned claims. Otherwise set
    "done": false and say what remains.
 
@@ -875,6 +889,8 @@ def run_claude(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
         # still delivering the same final result payload as a terminal event.
         "--output-format", "stream-json",
         "--verbose",
+        # Headless Builder runs: keep Agent Teams in-process (no tmux panes).
+        "--teammate-mode", "in-process",
     ]
     if model:
         command += ["--model", model]

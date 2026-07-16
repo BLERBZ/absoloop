@@ -326,8 +326,9 @@ MISSION_PROFILES = {
 GOAL_CONSTRAINTS = [
     "Never weaken, skip, or delete tests or acceptance criteria to make the "
     "mission look done — that is mission failure, not success.",
-    "Make the smallest authorized change that moves the mission forward; "
-    "avoid opportunistic edits outside the mission.",
+    "Stay mission-scoped — no opportunistic edits outside the contract. "
+    "Scoped does NOT mean solo: on multi-file or larger builds the Builder "
+    "must spawn an agent team and coordinate, not implement everything alone.",
     "Do not push, publish, deploy, or perform destructive or external actions "
     "— delivery is handled by the loop after acceptance.",
     "Report \"done\": true only with evidence; the critic and human gate make "
@@ -478,6 +479,14 @@ def generate_goal_markdown(config: dict) -> str:
     lines += ["", "## Constraints", ""]
     lines += [f"- {c}" for c in GOAL_CONSTRAINTS]
     lines += [
+        "",
+        "## Builder as team lead",
+        "",
+        "The Absoloop Builder is the team lead for this mission. On complex or "
+        "multi-component work it must spawn native teammates / subagents "
+        "(Claude Agent Teams via the Task tool, Codex subagents, or Grok "
+        "`spawn_subagent`), assign clear owned slices, and synthesize — not "
+        "solo the entire build. Solo only true one-file / one-function fixes.",
         "",
         "## Skills — the mission's capability pipeline",
         "",
@@ -648,8 +657,9 @@ def runtime_config(objective: str, loop_id: str, delivery_mode: str,
         "max_wall_seconds": 7200,
         "max_cost_usd": 25.0,
         "claude": {
-            "builder": {"permission_mode": "acceptEdits", "max_turns": 30,
-                        "max_budget_usd": 5.0, "max_wall_seconds": 1200},
+            # Higher turn/wall budgets: Builder leads Agent Teams on complex work.
+            "builder": {"permission_mode": "acceptEdits", "max_turns": 60,
+                        "max_budget_usd": 8.0, "max_wall_seconds": 2400},
             "critic": {"permission_mode": "plan", "max_turns": 12,
                        "max_budget_usd": 2.0, "max_wall_seconds": 600},
         },
