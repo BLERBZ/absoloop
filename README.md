@@ -54,7 +54,7 @@ your ledger.
 | **Adversarial critic** | A read-only reviewer tries to *disprove* the result. |
 | **Hard budgets** | Iterations, wall clock, and dollars — resume or extend anytime. |
 | **Provider-native** | Grok Build, Claude Code, and Codex keep their own auth, tools, and sessions. |
-| **Observable** | Live stream + `watch` dashboard + Markdown report with a lite viewer. |
+| **Observable** | Live stream + `watch` + optional ZComb Kanban (`--zcomb`) + Markdown report. |
 | **Stdlib-first** | Core CLI + runner: Python 3.9+, zero pip deps to install. |
 
 <p align="center">
@@ -166,17 +166,25 @@ absoloop watch     # live dashboard (phase, budgets, activity feed)
 absoloop status    # snapshot + exact next command
 absoloop report    # regenerates report.md + opens lite infographic viewer
                    #   --terminal · --no-open · --md-only
+absoloop --zcomb   # optional Kanban UI (vendored ZComb; needs Node.js 18+)
 ```
 
 Telemetry lives under `.absoloop/tmp/` while running; the ledger and
 `report.md` are the durable story of the mission.
+
+Pass `--zcomb` on a mission launch to open the browser UI alongside the loop:
+
+```bash
+absoloop "Make all tests pass" --zcomb
+```
 
 ## Repo layout
 
 ```text
 bin/absoloop                 Public CLI
 bin/absoloop_logo.py         Terminal infinity mark
-absoloop_harness/            Multi-provider harness + report viewer
+absoloop_harness/            Multi-provider harness + report viewer + ZComb bridge
+zcomb/                       Optional Kanban UI (vendored from BLERBZ/zcomb)
 templates/absoloop-run       Reference loop runner (copied into projects)
 templates/skills/            Loopers-toolbox
 tests/                       Characterization + harness suites

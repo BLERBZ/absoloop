@@ -136,7 +136,13 @@ While running, every tool call / command / message streams to the console
 ```bash
 absoloop watch --once
 absoloop report --terminal
+absoloop --zcomb            # optional browser Kanban UI (Node.js 18+)
 ```
+
+`absoloop --zcomb` (or `absoloop zcomb`) bridges `monitor.json` + `live.jsonl`
+into the vendored [ZComb](https://github.com/BLERBZ/zcomb) dashboard at
+`http://localhost:3141`, writing state under `.absoloop/zcomb/state/`. Pass
+`--zcomb` on a mission launch to open it alongside the loop.
 
 Full agent event streams persist as
 `iteration-NNNN-agent-result.stream.jsonl` / `.events.jsonl`.

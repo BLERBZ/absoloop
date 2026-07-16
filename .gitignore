@@ -8,6 +8,11 @@ out/
 __pycache__/
 *.pyc
 
+# Optional ZComb UI (Node build artifacts — source lives under zcomb/)
+zcomb/monitor/node_modules/
+zcomb/monitor/dist/
+zcomb/monitor/state/activity.jsonl
+
 # macOS
 .DS_Store
 .grok-build-ref/

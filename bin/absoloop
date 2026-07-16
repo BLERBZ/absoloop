@@ -68,6 +68,7 @@ examples:
   absoloop my-mission -o "…" -d local --start -y
                                           # one shot: skip review, launch now
   absoloop status · watch · report · goal
+  absoloop --zcomb · zcomb              # optional Kanban UI (Node.js)
   absoloop resume · resume --extend
   absoloop approve · reject "guidance"
   absoloop schedule add|list|tick|daemon   # cron / interval mission triggers
@@ -1643,6 +1644,29 @@ def _engine_labels() -> dict:
 
 
 def main(argv: list[str]) -> int:
+    # Lightweight peel of --zcomb before any subcommand dispatch.
+    want_zcomb = False
+    if "--zcomb" in argv:
+        _ensure_harness_path()
+        from absoloop_harness import zcomb as zcomb_mod
+        argv, want_zcomb = zcomb_mod.extract_zcomb_flag(argv)
+    else:
+        zcomb_mod = None  # type: ignore[assignment]
+
+    if argv and argv[0] == "zcomb":
+        _ensure_harness_path()
+        from absoloop_harness import zcomb as zcomb_mod
+        return zcomb_mod.zcomb_command(argv[1:])
+    # Bare `absoloop --zcomb` (optionally with zcomb-only flags) → dashboard.
+    if want_zcomb and zcomb_mod is not None and not argv:
+        return zcomb_mod.zcomb_command([])
+    if want_zcomb and zcomb_mod is not None and argv and argv[0].startswith("-") \
+            and not any(a in ("-o", "--objective", "--engine", "--start", "-y",
+                              "--yes", "--no-start", "-d", "--deliver")
+                        for a in argv):
+        # e.g. absoloop --zcomb -C ./proj --port 3141
+        return zcomb_mod.zcomb_command(argv)
+
     if argv and argv[0] in ("approve", "reject"):
         return gate_command(argv[0], argv[1:])
     if argv and argv[0] == "status":
@@ -1669,7 +1693,7 @@ def main(argv: list[str]) -> int:
                 from absoloop_harness import setup_wizard as setup_ux
                 objective = setup_ux.offer_first_mission(False, result)
                 if objective:
-                    return main([objective])
+                    return main([objective] + (["--zcomb"] if want_zcomb else []))
             return code
         return outcome
     if argv and argv[0] in ("doctor", "providers", "run", "build", "review",
@@ -1707,7 +1731,12 @@ def main(argv: list[str]) -> int:
                         help="skip the interactive briefing review and launch")
     parser.add_argument("--no-start", action="store_true",
                         help="scaffold only; do not launch the loop")
+    parser.add_argument("--zcomb", action="store_true",
+                        help="open the optional ZComb Kanban UI alongside the mission")
     args = parser.parse_args(argv)
+    # Flag may arrive via argparse (after extract) only if someone passes it
+    # again; prefer the early extract.
+    want_zcomb = want_zcomb or bool(getattr(args, "zcomb", False))
 
     print_banner(compact=True)
     ux = _load_briefing()
@@ -1869,6 +1898,11 @@ def main(argv: list[str]) -> int:
         print(f"error: engine '{brief.engine}' not on PATH — "
               f"install it or re-run and pick another (e).", file=sys.stderr)
         return 1
+    if want_zcomb:
+        if zcomb_mod is None:
+            _ensure_harness_path()
+            from absoloop_harness import zcomb as zcomb_mod
+        zcomb_mod.spawn_background(target)
     return start_loop(target, brief.engine)
 
 
