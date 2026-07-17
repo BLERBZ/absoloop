@@ -6,6 +6,7 @@ Cross-platform: macOS, Linux, Windows (via absoloop.cmd shim or `python absoloop
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
@@ -146,6 +147,33 @@ def new_loop_id() -> str:
     return f"loop-{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}"
 
 
+# ---------------------------------------------------------------------------
+# Preparation notes — scaffolding/setup steps report through prep_note so the
+# briefing flow can consolidate them into a single MISSION PREP summary block
+# instead of scattering one-off prints between the card and the launch.
+# Outside a collection window (resume, approve, ...) notes print immediately.
+# ---------------------------------------------------------------------------
+
+_PREP_NOTES = None
+
+
+def prep_note(message: str) -> None:
+    if _PREP_NOTES is not None:
+        _PREP_NOTES.append(message)
+    else:
+        print(message)
+
+
+@contextlib.contextmanager
+def collect_prep_notes():
+    global _PREP_NOTES
+    _PREP_NOTES = []
+    try:
+        yield _PREP_NOTES
+    finally:
+        _PREP_NOTES = None
+
+
 def sync_runner(target: pathlib.Path) -> None:
     """Keep the project's scripts/absoloop-run in step with the installed
     template. Stale scaffolds otherwise keep running old loop logic forever
@@ -161,7 +189,8 @@ def sync_runner(target: pathlib.Path) -> None:
         shutil.copy(src, dest)
         if os.name != "nt":
             os.chmod(dest, 0o755)
-        print("updated scripts/absoloop-run to the installed ABSOLOOP version")
+        prep_note("runner: updated scripts/absoloop-run to the installed "
+                  "ABSOLOOP version")
     except OSError as exc:
         print(f"warning: could not update scripts/absoloop-run: {exc}", file=sys.stderr)
 
@@ -226,9 +255,9 @@ def sync_skills(target: pathlib.Path, engines=None) -> None:
                 print(f"warning: could not install skill {name!r}: {exc}",
                       file=sys.stderr)
         if installed:
-            print(f"installed mission skills for {engine} "
-                  f"({ENGINE_SKILL_DIRS.get(engine, '.claude/skills')}): "
-                  + ", ".join(installed))
+            prep_note(f"skills ({engine} → "
+                      f"{ENGINE_SKILL_DIRS.get(engine, '.claude/skills')}): "
+                      + ", ".join(installed))
 
 
 # ---------------------------------------------------------------------------
@@ -1507,15 +1536,19 @@ def gate_command(action: str, argv: list[str]) -> int:
     return 0
 
 
-def start_loop(target: pathlib.Path, engine: str, model: str = "") -> int:
+def start_loop(target: pathlib.Path, engine: str, model: str = "",
+               announce: bool = True) -> int:
     sync_runner(target)
     sync_skills(target, engines=(engine,))
     runner = target / "scripts" / "absoloop-run"
     cmd = [sys.executable, str(runner), "--engine", engine]
     if model:
         cmd += ["--model", model]
-    print(f"  engine {engine} · model {model or 'CLI default'} · "
-          f"working tree {target}\n")
+    if announce:
+        # The briefing path already covered this in the prep summary;
+        # resume/approve entry points still need the handoff line.
+        print(f"  engine {engine} · model {model or 'CLI default'} · "
+              f"working tree {target}\n")
     return subprocess.run(cmd, cwd=target).returncode
 
 
@@ -1592,16 +1625,18 @@ def scaffold_mission(target: pathlib.Path, objective: str,
             capture_output=True, text=True)
         if inside.returncode != 0:
             subprocess.run(["git", "init", "-q", str(target)], check=False)
+            prep_note("git: initialized a new repository")
 
     abs_dir = target / ".absoloop"
     legacy_dir = target / ".absolution"
     if legacy_dir.is_dir() and not abs_dir.exists():
         legacy_dir.rename(abs_dir)
-        print("migrated legacy .absolution/ config to .absoloop/")
+        prep_note("migrated legacy .absolution/ config to .absoloop/")
     for legacy in ("absolution-run", "absolution-init"):
         if (scripts / legacy).exists():
-            print(f"note: scripts/{legacy} is from the old ABSOLUTION name and can be "
-                  f"deleted; {legacy.replace('absolution', 'absoloop')} replaces it.")
+            prep_note(f"note: scripts/{legacy} is from the old ABSOLUTION name and "
+                      f"can be deleted; {legacy.replace('absolution', 'absoloop')} "
+                      "replaces it.")
 
     runtime_path = abs_dir / "runtime.json"
     existing_config = None
@@ -1922,11 +1957,13 @@ def main(argv: list[str]) -> int:
 
     model = resolve_model(brief.engine, brief.model)
     brief = __import__("dataclasses").replace(brief, model=model)
-    _config, goal_path = scaffold_mission(
-        target, brief.objective, brief.delivery, model=brief.model)
-    ux.celebrate_scaffold(brief, str(goal_path.relative_to(target)))
-
     launch = not args.no_start
+    with collect_prep_notes() as prep_notes:
+        _config, goal_path = scaffold_mission(
+            target, brief.objective, brief.delivery, model=brief.model)
+    ux.prep_summary(brief, str(goal_path.relative_to(target)),
+                    notes=prep_notes, launching=launch)
+
     if not launch:
         run_cmd = ("python scripts/absoloop-run" if os.name == "nt"
                    else "./scripts/absoloop-run")
@@ -1934,7 +1971,7 @@ def main(argv: list[str]) -> int:
                  else [f"cd {os.path.relpath(target)}"])
         model_flag = f" --model {brief.model}" if brief.model else ""
         steps.append(f"{run_cmd} --engine {brief.engine}{model_flag}")
-        print("\n" + ux.tint("dim", "  Scaffold ready. Launch when you are:"))
+        print(ux.tint("dim", "  Scaffold ready. Launch when you are:"))
         print("  " + "\n  ".join(steps))
         return 0
 
@@ -1947,7 +1984,7 @@ def main(argv: list[str]) -> int:
             _ensure_harness_path()
             from absoloop_harness import zcomb as zcomb_mod
         zcomb_mod.spawn_background(target)
-    return start_loop(target, brief.engine, brief.model)
+    return start_loop(target, brief.engine, brief.model, announce=False)
 
 
 if __name__ == "__main__":

@@ -269,7 +269,8 @@ def review_loop(
                            "engine (e) or install it first."))
                 continue
             print()
-            print(tint("ok", "  ∞  Locking in. Loop engages."))
+            print(tint("ok", "  ∞  Locking in.")
+                  + tint("dim", " Preparing the workspace…"))
             print()
             return current
         if key in ("q", "quit", "abort", "no"):
@@ -334,7 +335,32 @@ def opening_line(engines_available: Sequence[str]) -> str:
             + tint("warn", "No engines on PATH yet (claude / codex / grok)."))
 
 
-def celebrate_scaffold(brief: Briefing, goal_rel: str) -> None:
-    print(tint("dim", "  ·") + f" goal contract → {goal_rel}")
-    print(tint("dim", "  ·")
-          + f" delivery {brief.delivery}: {DELIVERY_BLURBS.get(brief.delivery, '')}")
+def prep_summary(brief: Briefing, goal_rel: str,
+                 notes: Sequence[str] = (),
+                 launching: bool = True) -> None:
+    """The consolidated preparation report.
+
+    Every scaffold/setup step (runner sync, skill installs, git init,
+    migrations, goal write) lands in this single block, so the console
+    stays quiet until /goal work actually begins. When launching, the
+    closing line is the explicit hand-off to the loop."""
+    width = 58
+    rule = "─" * width
+    where = "adopted" if brief.adopting else "created"
+    print(tint("accent", "  ∞ ") + tint("bold", "MISSION PREP")
+          + tint("dim", "  ·  workspace ready"))
+    print(tint("dim", "  " + rule))
+    print(f"    {tint('cyan', 'workspace')}  {brief.target}  "
+          + tint("dim", f"({where})"))
+    print(f"    {tint('cyan', 'goal')}       {goal_rel}  "
+          + tint("dim", "(contract the loop re-reads every iteration)"))
+    print(f"    {tint('cyan', 'delivery')}   {brief.delivery}  "
+          + tint("dim", DELIVERY_BLURBS.get(brief.delivery, "")))
+    for note in notes:
+        print(tint("dim", f"    · {note}"))
+    print(tint("dim", "  " + rule))
+    if launching:
+        print(tint("ok", "  ∞ Prep complete — /goal takes over.")
+              + tint("dim", f"  engine {brief.engine}"
+                     + (f" · model {brief.model}" if brief.model else "")))
+        print()

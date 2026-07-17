@@ -380,6 +380,10 @@ def _pipeline_status(name: str, live: bool, status: str, phase: str,
         current = 4
     elif status == "FINAL_REVIEW" or "critic" in phase or "integrity" in phase:
         current = 3 if "critic" in phase else 2
+    elif live and phase in ("preparing", "starting"):
+        # Runner is still in its consolidated preparation block —
+        # /goal work has not begun yet.
+        current = 0
     elif live or status in ("EXECUTING", "READY"):
         current = 1
     else:
@@ -393,6 +397,8 @@ def _pipeline_status(name: str, live: bool, status: str, phase: str,
         if name == "gate" and status == "AWAITING_APPROVAL":
             return "review"
         if name == "scaffold":
+            if live and phase in ("preparing", "starting"):
+                return "in_progress"
             return "done" if iteration > 0 or live or status else "in_progress"
         return "in_progress" if live or status in (
             "EXECUTING", "FINAL_REVIEW", "AWAITING_APPROVAL", "READY"
@@ -488,7 +494,10 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         deliver_desc += f" · ${cost_usd:.2f} spent"
 
     pipe_defs = [
-        ("scaffold", "Scaffold mission + /goal contract", builder_id, "high", 0,
+        # One consolidated prep card: scaffold, skills, runner sync, and the
+        # /goal contract all live here rather than as separate setup noise.
+        ("scaffold", "Prepare mission — scaffold · skills · /goal contract",
+         builder_id, "high", 0,
          [], f"{mission_id} · {objective[:150]}"),
         ("execute", f"Execute repair iterations ({iter_label})",
          builder_id, "high", 1, ["task-scaffold"], execute_desc),
