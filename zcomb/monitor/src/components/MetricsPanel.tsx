@@ -20,7 +20,6 @@ function MiniDonut({ progress, color, size = 32, strokeWidth = 3.5, darkMode }: 
       viewBox={`0 0 ${size} ${size}`}
       style={{ transform: 'rotate(-90deg)', flexShrink: 0 }}
     >
-      {/* Background track */}
       <circle
         cx={size / 2}
         cy={size / 2}
@@ -29,7 +28,6 @@ function MiniDonut({ progress, color, size = 32, strokeWidth = 3.5, darkMode }: 
         stroke={trackColor}
         strokeWidth={strokeWidth}
       />
-      {/* Progress arc */}
       <circle
         className="donut-track"
         cx={size / 2}
@@ -49,6 +47,52 @@ function MiniDonut({ progress, color, size = 32, strokeWidth = 3.5, darkMode }: 
   );
 }
 
+function StatCard({ value, label, color, darkMode, emphasize }: {
+  value: number;
+  label: string;
+  color: string;
+  darkMode: boolean;
+  emphasize?: boolean;
+}) {
+  const tinted = emphasize || value > 0;
+  return (
+    <div className="footer-stat-card" style={{
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 3,
+      padding: '8px 14px',
+      minWidth: 78,
+      borderRadius: 10,
+      background: tinted
+        ? `${color}0e`
+        : (darkMode ? '#161b2266' : '#f6f8fa'),
+      border: `1px solid ${tinted ? `${color}2e` : (darkMode ? '#21262d' : '#e1e4e8')}`,
+    }}>
+      <span style={{
+        fontSize: 'clamp(18px, 2.2vw, 26px)',
+        fontWeight: 800,
+        color,
+        fontVariantNumeric: 'tabular-nums',
+        lineHeight: 1,
+      }}>
+        {value}
+      </span>
+      <span style={{
+        fontSize: 8.5,
+        fontWeight: 700,
+        color: '#7d8590',
+        letterSpacing: 0.8,
+        textTransform: 'uppercase',
+        whiteSpace: 'nowrap',
+      }}>
+        {label}
+      </span>
+    </div>
+  );
+}
+
 export function MetricsPanel({ tasks, agents, metrics, darkMode }: {
   tasks: Task[];
   agents: Agent[];
@@ -57,8 +101,6 @@ export function MetricsPanel({ tasks, agents, metrics, darkMode }: {
 }) {
   const mutedColor = darkMode ? '#7d8590' : '#656d76';
   const textColor = darkMode ? '#e6edf3' : '#1f2328';
-  const borderColor = darkMode ? '#30363d' : '#d0d7de';
-  const barBg = darkMode ? '#21262d' : '#e1e4e8';
 
   const totalTasks = tasks.length;
   const doneTasks = tasks.filter(t => t.status === 'done').length;
@@ -72,118 +114,115 @@ export function MetricsPanel({ tasks, agents, metrics, darkMode }: {
       alignItems: 'center',
       justifyContent: 'space-between',
       gap: 16,
-      flexWrap: 'wrap'
+      flexWrap: 'wrap',
+      minWidth: 0,
     }}>
-      {/* Large Stat Counters */}
+      {/* Stat cards */}
       <div style={{
         display: 'flex',
-        gap: 24,
-        alignItems: 'center'
+        gap: 8,
+        alignItems: 'stretch',
+        flexWrap: 'wrap',
+        minWidth: 0,
       }}>
-        <BigStat value={totalTasks} label="TOTAL TASKS" color={textColor} />
-        <div style={{ width: 1, height: 32, background: borderColor }} />
-        <BigStat value={doneTasks} label="COMPLETED" color="#3fb950" />
-        <div style={{ width: 1, height: 32, background: borderColor }} />
-        <BigStat value={activeTasks} label="ACTIVE" color="#58a6ff" />
-        <div style={{ width: 1, height: 32, background: borderColor }} />
-        <BigStat value={failedTasks} label="FAILED" color={failedTasks > 0 ? '#f85149' : textColor} />
-        <div style={{ width: 1, height: 32, background: borderColor }} />
-        <BigStat value={agents.length} label="AGENTS" color="#a371f7" />
+        <StatCard value={totalTasks} label="Total Tasks" color={textColor} darkMode={darkMode} />
+        <StatCard value={doneTasks} label="Completed" color="#3fb950" darkMode={darkMode} />
+        <StatCard value={activeTasks} label="Active" color="#58a6ff" darkMode={darkMode} />
+        <StatCard
+          value={failedTasks}
+          label="Failed"
+          color={failedTasks > 0 ? '#f85149' : mutedColor}
+          darkMode={darkMode}
+        />
+        <StatCard value={agents.length} label="Agents" color="#a371f7" darkMode={darkMode} />
       </div>
 
-      {/* Phase Tabs */}
+      {/* Pipeline gates */}
       {phases.length > 0 && (
         <div style={{
           display: 'flex',
-          gap: 2,
           alignItems: 'center',
-          flexWrap: 'wrap'
+          gap: 0,
+          flexWrap: 'wrap',
+          minWidth: 0,
+          rowGap: 6,
         }}>
-          {phases.map(p => {
+          {phases.map((p, i) => {
             const isComplete = p.progress === 100;
             const isActive = p.progress > 0 && p.progress < 100;
             const ringColor = isComplete ? '#3fb950' : isActive ? '#58a6ff' : '#30363d';
+            const labelColor = isActive ? '#58a6ff' : isComplete ? '#3fb950' : mutedColor;
             return (
-              <div
-                key={p.phase}
-                style={{
-                  display: 'flex',
-                  flexDirection: 'column',
-                  alignItems: 'center',
-                  padding: '4px 10px',
-                  borderRadius: 4,
-                  background: isActive ? (darkMode ? '#1f6feb22' : '#ddf4ff') :
-                    isComplete ? (darkMode ? '#23863618' : '#dafbe1') : 'transparent',
-                  border: `1px solid ${isActive ? '#58a6ff44' : isComplete ? '#3fb95033' : 'transparent'}`,
-                  minWidth: 70,
-                  cursor: 'default',
-                  gap: 2,
-                }}
-              >
-                {/* Mini donut chart */}
-                <div style={{ position: 'relative', width: 30, height: 30 }}>
-                  <MiniDonut
-                    progress={p.progress}
-                    color={ringColor}
-                    size={30}
-                    strokeWidth={3}
-                    darkMode={darkMode}
-                  />
-                  {/* Centered percentage text */}
+              <div key={p.phase} style={{ display: 'flex', alignItems: 'center' }}>
+                <div
+                  title={`${p.name}: ${p.progress}%`}
+                  style={{
+                    display: 'flex',
+                    flexDirection: 'column',
+                    alignItems: 'center',
+                    padding: '5px 9px 4px',
+                    borderRadius: 8,
+                    background: isActive ? (darkMode ? '#1f6feb1c' : '#ddf4ff') :
+                      isComplete ? (darkMode ? '#23863614' : '#dafbe1') : 'transparent',
+                    border: `1px solid ${isActive ? '#58a6ff44' : isComplete ? '#3fb95030' : 'transparent'}`,
+                    minWidth: 62,
+                    cursor: 'default',
+                    gap: 3,
+                  }}
+                >
+                  <div style={{ position: 'relative', width: 28, height: 28 }}>
+                    <MiniDonut
+                      progress={p.progress}
+                      color={ringColor}
+                      size={28}
+                      strokeWidth={3}
+                      darkMode={darkMode}
+                    />
+                    <span style={{
+                      position: 'absolute',
+                      top: '50%',
+                      left: '50%',
+                      transform: 'translate(-50%, -50%)',
+                      fontSize: isComplete ? 11 : 7,
+                      fontWeight: 700,
+                      color: labelColor,
+                      fontVariantNumeric: 'tabular-nums',
+                      lineHeight: 1,
+                    }}>
+                      {isComplete ? '✓' : p.progress}
+                    </span>
+                  </div>
                   <span style={{
-                    position: 'absolute',
-                    top: '50%',
-                    left: '50%',
-                    transform: 'translate(-50%, -50%)',
-                    fontSize: 7,
+                    fontSize: 8.5,
                     fontWeight: 700,
-                    color: isActive ? '#58a6ff' : isComplete ? '#3fb950' : mutedColor,
-                    fontVariantNumeric: 'tabular-nums',
+                    color: labelColor,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.4,
+                    whiteSpace: 'nowrap',
+                    maxWidth: 82,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
                   }}>
-                    {p.progress}
+                    {p.name}
                   </span>
                 </div>
-                <span style={{
-                  fontSize: 9,
-                  fontWeight: 600,
-                  color: isActive ? '#58a6ff' : isComplete ? '#3fb950' : mutedColor,
-                  textTransform: 'uppercase',
-                  letterSpacing: 0.3,
-                  whiteSpace: 'nowrap'
-                }}>
-                  {p.name}
-                </span>
+                {i < phases.length - 1 && (
+                  <svg width="12" height="12" viewBox="0 0 12 12" style={{ flexShrink: 0, opacity: 0.5 }}>
+                    <path
+                      d="M4 2 L8 6 L4 10"
+                      fill="none"
+                      stroke={isComplete ? '#3fb950' : mutedColor}
+                      strokeWidth="1.5"
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                    />
+                  </svg>
+                )}
               </div>
             );
           })}
         </div>
       )}
-    </div>
-  );
-}
-
-function BigStat({ value, label, color }: { value: number; label: string; color: string }) {
-  return (
-    <div style={{ textAlign: 'center' }}>
-      <div style={{
-        fontSize: 28,
-        fontWeight: 800,
-        color,
-        fontVariantNumeric: 'tabular-nums',
-        lineHeight: 1
-      }}>
-        {value}
-      </div>
-      <div style={{
-        fontSize: 9,
-        fontWeight: 600,
-        color: '#7d8590',
-        letterSpacing: 0.8,
-        marginTop: 4,
-        textTransform: 'uppercase'
-      }}>
-        {label}
-      </div>
     </div>
   );
 }

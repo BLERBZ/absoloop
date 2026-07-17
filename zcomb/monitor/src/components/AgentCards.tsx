@@ -87,8 +87,17 @@ export function AgentCards({ agents, darkMode }: { agents: Agent[]; darkMode: bo
             } as React.CSSProperties}
           >
             {/* Name + Status Badge */}
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-              <span style={{ fontWeight: 700, fontSize: 14, color: textColor }}>{agent.name}</span>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 6, marginBottom: 6 }}>
+              <span style={{
+                fontWeight: 700,
+                fontSize: 13,
+                color: textColor,
+                lineHeight: 1.3,
+                minWidth: 0,
+                wordBreak: 'break-word',
+              }}>
+                {agent.name}
+              </span>
               <span style={{
                 fontSize: 10,
                 fontWeight: 700,
@@ -101,6 +110,8 @@ export function AgentCards({ agents, darkMode }: { agents: Agent[]; darkMode: bo
                 display: 'inline-flex',
                 alignItems: 'center',
                 gap: 5,
+                flexShrink: 0,
+                whiteSpace: 'nowrap',
               }}>
                 {agent.status === 'active' && (
                   <span style={{
@@ -117,20 +128,25 @@ export function AgentCards({ agents, darkMode }: { agents: Agent[]; darkMode: bo
               </span>
             </div>
 
-            {/* Role */}
+            {/* Role — clamped so long descriptions don't dominate the card */}
             <div style={{
               fontSize: 11,
               color: mutedColor,
               marginBottom: 8,
-              lineHeight: 1.4
-            }}>
+              lineHeight: 1.4,
+              display: '-webkit-box',
+              WebkitLineClamp: 3,
+              WebkitBoxOrient: 'vertical',
+              overflow: 'hidden',
+              wordBreak: 'break-word',
+            }} title={agent.role}>
               {agent.role}
             </div>
 
-            {/* Current Task */}
+            {/* Current Task — long paths/commands wrap, clamped to 4 lines */}
             {agent.currentTask && (
               <div style={{
-                fontSize: 11,
+                fontSize: 10.5,
                 color: textColor,
                 background: darkMode ? '#0d1117' : '#f6f8fa',
                 padding: '6px 10px',
@@ -138,8 +154,14 @@ export function AgentCards({ agents, darkMode }: { agents: Agent[]; darkMode: bo
                 marginBottom: 8,
                 borderLeft: `2px solid ${color}`,
                 fontFamily: 'monospace',
-                lineHeight: 1.4
-              }}>
+                lineHeight: 1.45,
+                overflowWrap: 'anywhere',
+                wordBreak: 'break-word',
+                display: '-webkit-box',
+                WebkitLineClamp: 4,
+                WebkitBoxOrient: 'vertical',
+                overflow: 'hidden',
+              }} title={agent.currentTask}>
                 {agent.currentTask}
               </div>
             )}

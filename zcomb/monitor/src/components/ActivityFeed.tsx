@@ -115,7 +115,11 @@ export function ActivityFeed({ activity, filter, darkMode, agents }: {
               <span style={{
                 fontWeight: 600,
                 color: textColor,
-                fontSize: 11
+                fontSize: 11,
+                minWidth: 0,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
               }}>
                 {agentName}
               </span>
@@ -133,12 +137,14 @@ export function ActivityFeed({ activity, filter, darkMode, agents }: {
               </span>
             </div>
 
-            {/* Message */}
+            {/* Message — long paths and commands wrap instead of overflowing */}
             <div style={{
               color: textColor,
               lineHeight: 1.45,
-              fontSize: 12,
-              paddingLeft: 2
+              fontSize: 11.5,
+              paddingLeft: 2,
+              overflowWrap: 'anywhere',
+              wordBreak: 'break-word',
             }}>
               {item.message}
             </div>
