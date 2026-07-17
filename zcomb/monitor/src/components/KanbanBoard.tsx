@@ -111,8 +111,10 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
     return () => ro.disconnect();
   }, []);
 
-  // Scale factor: 1.0 at >=1100px, proportionally smaller below, floor at 0.42
-  const s = Math.min(1, Math.max(0.42, containerW / 1100));
+  // Scale factor: 1.0 at >=1100px, gently smaller below. Floor is high (0.85)
+  // because below the minimum column width the board scrolls horizontally
+  // instead of shrinking text further.
+  const s = Math.min(1, Math.max(0.85, containerW / 1100));
 
   // Scaled pixel helper — all sizes go through this
   const px = useCallback((base: number, min = 1) => Math.max(min, Math.round(base * s)), [s]);
@@ -250,14 +252,16 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
         </div>
       </div>
 
-      {/* Column grid — always fits, never overflows horizontally */}
-      <div ref={gridRef} style={{
+      {/* Column grid — columns keep a readable minimum width; when the
+          container is narrower than 6 columns the board scrolls horizontally */}
+      <div ref={gridRef} className="kanban-board-scroll" style={{
         display: 'grid',
-        gridTemplateColumns: 'repeat(6, 1fr)',
+        gridTemplateColumns: 'repeat(6, minmax(172px, 1fr))',
         gap: px(6),
         flex: 1,
         minHeight: 0,
-        overflow: 'hidden',
+        overflowX: 'auto',
+        overflowY: 'hidden',
         padding: `0 ${px(10)}px ${px(10)}px`,
       }}>
         {columns.map(col => {

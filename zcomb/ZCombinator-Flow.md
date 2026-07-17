@@ -44,7 +44,7 @@ Before any planning or agent work, build and launch the monitoring dashboard.
    │   │   ├── KanbanBoard.tsx  # Task board (inbox -> active -> review -> done)
    │   │   ├── ActivityFeed.tsx # Scrolling log of agent actions
    │   │   ├── MetricsPanel.tsx # Completion %, error rate, throughput
-   │   │   └── GanttChart.tsx   # Phase timeline
+   │   │   └── Timeline.tsx     # Milestone timeline
    │   └── hooks/
    │       └── usePolling.ts    # Polls /api/state every 3s
    └── state/                   # Shared persistence directory

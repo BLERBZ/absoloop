@@ -4,7 +4,7 @@ import { AgentCards } from './components/AgentCards';
 import { KanbanBoard } from './components/KanbanBoard';
 import { ActivityFeed } from './components/ActivityFeed';
 import { MetricsPanel } from './components/MetricsPanel';
-import { GanttChart } from './components/GanttChart';
+import { Timeline } from './components/Timeline';
 import { MissionControls } from './components/MissionControls';
 
 function formatElapsed(startTime: number): string {
@@ -15,11 +15,133 @@ function formatElapsed(startTime: number): string {
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
 }
 
+/** Chevron button used to collapse / expand the side panels */
+function PanelToggle({ direction, onClick, mutedColor, title }: {
+  direction: 'left' | 'right';
+  onClick: () => void;
+  mutedColor: string;
+  title: string;
+}) {
+  return (
+    <button
+      type="button"
+      className="panel-toggle"
+      onClick={onClick}
+      title={title}
+      aria-label={title}
+      style={{
+        background: 'none',
+        border: 'none',
+        cursor: 'pointer',
+        padding: 4,
+        borderRadius: 6,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        color: mutedColor,
+        flexShrink: 0,
+      }}
+    >
+      <svg width="14" height="14" viewBox="0 0 16 16" style={{ display: 'block' }}>
+        <path
+          d={direction === 'left' ? 'M10.5 3 L5.5 8 L10.5 13' : 'M5.5 3 L10.5 8 L5.5 13'}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+    </button>
+  );
+}
+
+/** Slim vertical rail shown when a side panel is collapsed */
+function CollapsedRail({ label, side, count, onExpand, darkMode, mutedColor, borderColor }: {
+  label: string;
+  side: 'left' | 'right';
+  count: number;
+  onExpand: () => void;
+  darkMode: boolean;
+  mutedColor: string;
+  borderColor: string;
+}) {
+  return (
+    <button
+      type="button"
+      className="collapsed-rail"
+      onClick={onExpand}
+      title={`Expand ${label}`}
+      aria-label={`Expand ${label}`}
+      style={{
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'center',
+        gap: 10,
+        padding: '12px 0',
+        width: '100%',
+        height: '100%',
+        background: darkMode ? '#0d1117' : '#f6f8fa',
+        border: 'none',
+        borderLeft: side === 'right' ? `1px solid ${borderColor}` : 'none',
+        borderRight: side === 'left' ? `1px solid ${borderColor}` : 'none',
+        cursor: 'pointer',
+        color: mutedColor,
+      }}
+    >
+      <svg width="13" height="13" viewBox="0 0 16 16" style={{ display: 'block', flexShrink: 0 }}>
+        <path
+          d={side === 'left' ? 'M5.5 3 L10.5 8 L5.5 13' : 'M10.5 3 L5.5 8 L10.5 13'}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.8"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+        />
+      </svg>
+      {count > 0 && (
+        <span style={{
+          fontSize: 9,
+          fontWeight: 700,
+          background: darkMode ? '#21262d' : '#e1e4e8',
+          color: mutedColor,
+          borderRadius: 8,
+          padding: '1px 5px',
+          fontVariantNumeric: 'tabular-nums',
+        }}>
+          {count}
+        </span>
+      )}
+      <span style={{
+        writingMode: 'vertical-rl',
+        fontSize: 10,
+        fontWeight: 700,
+        textTransform: 'uppercase',
+        letterSpacing: 1.5,
+        color: mutedColor,
+      }}>
+        {label}
+      </span>
+    </button>
+  );
+}
+
 export default function App() {
   const { state, error, startTime, lastUpdate, connectionHealth } = usePolling(3000);
   const [darkMode, setDarkMode] = useState(true);
   const [activityFilter, setActivityFilter] = useState<string>('all');
   const [elapsed, setElapsed] = useState('00:00:00');
+  const [agentsOpen, setAgentsOpen] = useState(() => localStorage.getItem('zc-panel-agents') !== '0');
+  const [feedOpen, setFeedOpen] = useState(() => localStorage.getItem('zc-panel-feed') !== '0');
+
+  const toggleAgents = () => setAgentsOpen(open => {
+    localStorage.setItem('zc-panel-agents', open ? '0' : '1');
+    return !open;
+  });
+  const toggleFeed = () => setFeedOpen(open => {
+    localStorage.setItem('zc-panel-feed', open ? '0' : '1');
+    return !open;
+  });
 
   // Update elapsed time every second
   useEffect(() => {
@@ -115,11 +237,11 @@ export default function App() {
         </div>
 
         {/* Right: Progress + Timer + Connection + Theme */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 20 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'clamp(10px, 1.5vw, 20px)', flexWrap: 'wrap', minWidth: 0 }}>
           {/* Progress */}
           <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
             <div style={{
-              width: 140,
+              width: 'clamp(70px, 10vw, 140px)',
               height: 6,
               borderRadius: 3,
               background: darkMode ? '#21262d' : '#e1e4e8',
@@ -195,112 +317,186 @@ export default function App() {
         </div>
       </header>
 
-      {/* Main Layout — sidebars scale with viewport, center fills remainder */}
+      {/* Main Layout — collapsible sidebars, center fills remainder */}
       <div style={{
         display: 'grid',
-        gridTemplateColumns: 'clamp(120px, 16vw, 250px) 1fr clamp(140px, 18vw, 290px)',
+        gridTemplateColumns: `${agentsOpen ? 'clamp(160px, 16vw, 260px)' : '34px'} minmax(0, 1fr) ${feedOpen ? 'clamp(180px, 18vw, 300px)' : '34px'}`,
         flex: 1,
         overflow: 'hidden',
         minHeight: 0,
+        transition: 'grid-template-columns 0.25s ease',
       }}>
-        {/* Left: Agent Cards — independent scroll */}
-        <div style={{
-          borderRight: `1px solid ${borderColor}`,
-          overflow: 'hidden',
-          display: 'flex',
-          flexDirection: 'column',
-          minHeight: 0,
-        }}>
-          <div style={{ padding: '14px 14px 0', flexShrink: 0 }}>
-            <h3 style={{
-              margin: '0 0 12px',
-              fontSize: 12,
-              fontWeight: 700,
-              textTransform: 'uppercase',
-              color: mutedColor,
-              letterSpacing: 1.5
+        {/* Left: Agent Cards — collapsible, independent scroll */}
+        {agentsOpen ? (
+          <div style={{
+            borderRight: `1px solid ${borderColor}`,
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
+            minHeight: 0,
+            minWidth: 0,
+          }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '12px 10px 10px 14px',
+              flexShrink: 0,
+              gap: 6,
             }}>
-              Agents
-            </h3>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 7, minWidth: 0 }}>
+                <h3 style={{
+                  margin: 0,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  textTransform: 'uppercase',
+                  color: mutedColor,
+                  letterSpacing: 1.5,
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}>
+                  Agents
+                </h3>
+                {agents.length > 0 && (
+                  <span style={{
+                    fontSize: 9,
+                    fontWeight: 700,
+                    background: darkMode ? '#21262d' : '#eaeef2',
+                    color: mutedColor,
+                    borderRadius: 8,
+                    padding: '1px 6px',
+                    fontVariantNumeric: 'tabular-nums',
+                    flexShrink: 0,
+                  }}>
+                    {agents.length}
+                  </span>
+                )}
+              </div>
+              <PanelToggle
+                direction="left"
+                onClick={toggleAgents}
+                mutedColor={mutedColor}
+                title="Collapse agents panel"
+              />
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 14px', minHeight: 0 }}>
+              <AgentCards agents={agents} darkMode={darkMode} />
+            </div>
           </div>
-          <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 14px', minHeight: 0 }}>
-            <AgentCards agents={agents} darkMode={darkMode} />
-          </div>
-        </div>
+        ) : (
+          <CollapsedRail
+            label="Agents"
+            side="left"
+            count={agents.length}
+            onExpand={toggleAgents}
+            darkMode={darkMode}
+            mutedColor={mutedColor}
+            borderColor={borderColor}
+          />
+        )}
 
-        {/* Center: Task Board + Gantt — independent scroll */}
+        {/* Center: Task Board + Timeline — independent scroll */}
         <div style={{
           overflow: 'hidden',
           display: 'flex',
           flexDirection: 'column',
           minHeight: 0,
+          minWidth: 0,
         }}>
           <KanbanBoard tasks={tasks} agents={agents} darkMode={darkMode} />
-          <div style={{ flexShrink: 0, padding: '0 14px 14px', overflowX: 'auto' }}>
-            <GanttChart tasks={tasks} metrics={state?.metrics} darkMode={darkMode} />
+          <div style={{ flexShrink: 0, padding: '2px 14px 8px', minWidth: 0 }}>
+            <Timeline tasks={tasks} metrics={state?.metrics} darkMode={darkMode} />
           </div>
         </div>
 
-        {/* Right: Activity Feed — independent scroll */}
-        <div style={{
-          borderLeft: `1px solid ${borderColor}`,
-          overflow: 'hidden',
-          display: 'flex',
-          flexDirection: 'column',
-          minHeight: 0,
-        }}>
+        {/* Right: Activity Feed — collapsible, independent scroll */}
+        {feedOpen ? (
           <div style={{
+            borderLeft: `1px solid ${borderColor}`,
+            overflow: 'hidden',
             display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'space-between',
-            padding: '14px 14px 10px',
-            flexShrink: 0,
+            flexDirection: 'column',
+            minHeight: 0,
+            minWidth: 0,
           }}>
-            <h3 style={{
-              margin: 0,
-              fontSize: 12,
-              fontWeight: 700,
-              textTransform: 'uppercase',
-              color: mutedColor,
-              letterSpacing: 1.5
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '12px 14px 10px 10px',
+              flexShrink: 0,
+              gap: 6,
+              flexWrap: 'wrap',
             }}>
-              Activity Feed
-            </h3>
-            <select
-              value={activityFilter}
-              onChange={e => setActivityFilter(e.target.value)}
-              style={{
-                background: darkMode ? '#161b22' : '#ffffff',
-                border: `1px solid ${borderColor}`,
-                borderRadius: 6,
-                padding: '3px 8px',
-                color: textColor,
-                fontSize: 11,
-                cursor: 'pointer',
-                outline: 'none'
-              }}
-            >
-              <option value="all">All Agents</option>
-              {agents.map(a => (
-                <option key={a.id} value={a.id}>{a.name}</option>
-              ))}
-            </select>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 4, minWidth: 0 }}>
+                <PanelToggle
+                  direction="right"
+                  onClick={toggleFeed}
+                  mutedColor={mutedColor}
+                  title="Collapse activity feed"
+                />
+                <h3 style={{
+                  margin: 0,
+                  fontSize: 12,
+                  fontWeight: 700,
+                  textTransform: 'uppercase',
+                  color: mutedColor,
+                  letterSpacing: 1.5,
+                  whiteSpace: 'nowrap',
+                }}>
+                  Activity
+                </h3>
+              </div>
+              <select
+                value={activityFilter}
+                onChange={e => setActivityFilter(e.target.value)}
+                style={{
+                  background: darkMode ? '#161b22' : '#ffffff',
+                  border: `1px solid ${borderColor}`,
+                  borderRadius: 6,
+                  padding: '3px 6px',
+                  color: textColor,
+                  fontSize: 11,
+                  cursor: 'pointer',
+                  outline: 'none',
+                  maxWidth: 110,
+                  flexShrink: 1,
+                  minWidth: 0,
+                }}
+              >
+                <option value="all">All Agents</option>
+                {agents.map(a => (
+                  <option key={a.id} value={a.id}>{a.name}</option>
+                ))}
+              </select>
+            </div>
+            <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 14px', minHeight: 0 }}>
+              <ActivityFeed
+                activity={state?.activity || []}
+                filter={activityFilter}
+                darkMode={darkMode}
+                agents={agents}
+              />
+            </div>
           </div>
-          <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 14px', minHeight: 0 }}>
-            <ActivityFeed
-              activity={state?.activity || []}
-              filter={activityFilter}
-              darkMode={darkMode}
-              agents={agents}
-            />
-          </div>
-        </div>
+        ) : (
+          <CollapsedRail
+            label="Activity"
+            side="right"
+            count={(state?.activity || []).length}
+            onExpand={toggleFeed}
+            darkMode={darkMode}
+            mutedColor={mutedColor}
+            borderColor={borderColor}
+          />
+        )}
       </div>
 
       {/* Bottom: Metrics Bar */}
       <div style={{
         borderTop: `1px solid ${borderColor}`,
-        padding: '12px 24px',
+        padding: 'clamp(8px, 1vw, 12px) clamp(12px, 2vw, 24px)',
         background: headerBg,
         flexShrink: 0
       }}>
