@@ -1727,15 +1727,26 @@ def main() -> int:
     max_wall = float(runtime["max_wall_seconds"])
     check_timeout = min(900, int(max_wall))
 
+    # One consolidated preparation block, then an explicit hand-off line —
+    # everything after "/goal active" is real loop work, not setup noise.
     say(f"mission {state.mission_id}: {runtime['objective']}", "bold")
-    say(f"engine {args.engine}"
+    say(f"  engine {args.engine}"
         + (f" · model {model}" if model else "")
-        + f" · budgets: {runtime['max_iterations']} iterations, "
-        f"${runtime['max_cost_usd']:.2f}, {int(max_wall)}s wall clock")
+        + f" · budgets {runtime['max_iterations']} iterations · "
+        f"${runtime['max_cost_usd']:.2f} · {int(max_wall)}s wall clock", "dim")
+    goal_path = ROOT / runtime.get("goal_path", ".absoloop/goal.md")
+    delivery = runtime.get("delivery") or {"mode": "local"}
+    delivery_detail = {"git": f"branch {delivery.get('branch', '?')}",
+                       "out": delivery.get("out_dir", "?"),
+                       "local": "working tree, unstaged"}.get(delivery.get("mode", "local"), "?")
+    say(f"  goal {goal_path.relative_to(ROOT)}"
+        + ("" if goal_path.is_file() else " (missing — using inline fallback)")
+        + f" · delivery {delivery.get('mode', 'local')} ({delivery_detail})", "dim")
+    say("  live view: run 'absoloop watch' in another terminal", "dim")
     MONITOR.update(mission_id=state.mission_id, loop_id=runtime.get("loop_id"),
                    objective=runtime.get("objective"), engine=args.engine,
                    model=model or None,
-                   status="RUNNING", phase="starting",
+                   status="RUNNING", phase="preparing",
                    iteration=state.iteration,
                    max_iterations=int(runtime["max_iterations"]),
                    cost_usd=round(state.cost_usd, 4),
@@ -1743,15 +1754,11 @@ def main() -> int:
                    tokens_total=state.tokens_total,
                    started_at=state.started_at, max_wall_seconds=max_wall,
                    repeated_failure_count=state.repeated_failure_count)
-    say("monitor: run 'absoloop watch' in another terminal for a live dashboard", "dim")
-    goal_path = ROOT / runtime.get("goal_path", ".absoloop/goal.md")
-    say(f"goal contract: {goal_path.relative_to(ROOT)}"
-        + ("" if goal_path.is_file() else " (missing — using inline fallback)"))
-    delivery = runtime.get("delivery") or {"mode": "local"}
-    delivery_detail = {"git": f"branch {delivery.get('branch', '?')}",
-                       "out": delivery.get("out_dir", "?"),
-                       "local": "working tree, unstaged"}.get(delivery.get("mode", "local"), "?")
-    say(f"delivery on acceptance: {delivery.get('mode', 'local')} ({delivery_detail})")
+    if state.iteration:
+        say(f"/goal active — resuming at iteration {state.iteration + 1} of "
+            f"{runtime['max_iterations']}", "ok")
+    else:
+        say("/goal active — repair loop engaged", "ok")
 
     last_tree = tree_fingerprint()
 
