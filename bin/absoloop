@@ -64,10 +64,12 @@ EPILOG = """\
 examples:
   absoloop setup                        # first-run wizard (PATH · providers · defaults)
   absoloop                              # briefing: one prompt → review → launch
+  absoloop new                          # same as bare absoloop (alias)
   absoloop "Make all tests pass"        # objective first; review card; Enter
   absoloop . -o "Fix the parser crash"  # adopt cwd, review, go
   absoloop my-mission -o "…" -d local --start -y
                                           # one shot: skip review, launch now
+  absoloop load                         # pick a previous run · extend it with a new objective
   absoloop status · watch · report · goal
   absoloop resume · resume --extend
   absoloop approve · reject "guidance"
@@ -768,7 +770,8 @@ def next_step_hint(state: dict) -> str:
     if status == "COMPLETED":
         return ("results were delivered per the mission's delivery mode (see "
                 "'absoloop report'); 'absoloop resume --extend' starts a "
-                "follow-on run that continues this work with fresh budgets")
+                "follow-on run that continues this work with fresh budgets; "
+                "'absoloop load' picks any previous run to extend")
     if status == "BUDGET_EXHAUSTED":
         return ("raise max_iterations / max_cost_usd / max_wall_seconds in "
                 ".absoloop/runtime.json, then 'absoloop resume'")
@@ -1293,7 +1296,8 @@ def status_command(argv: list[str]) -> int:
 
 def extend_mission(target: pathlib.Path, state: dict, engine: str,
                    note: str, iterations: int | None, budget: float | None,
-                   hours: float | None, min_iterations: int | None = None) -> int:
+                   hours: float | None, min_iterations: int | None = None,
+                   start: bool = True) -> int:
     """Start a follow-on loop run that continues a finished mission's work.
 
     Archives the previous run's records under .absoloop/runs/<loop_id>/, resets
@@ -1383,7 +1387,295 @@ def extend_mission(target: pathlib.Path, state: dict, engine: str,
           f"{int(runtime.get('max_wall_seconds', 0))}s wall clock")
     if note:
         print(f"continuation focus: {note}")
+    if not start:
+        run_cmd = ("python scripts/absoloop-run" if os.name == "nt"
+                   else "./scripts/absoloop-run")
+        engine_flag = f" --engine {engine}" if engine else ""
+        print(f"prepared — launch when ready: {run_cmd}{engine_flag}")
+        return 0
     return start_loop(target, engine)
+
+
+def mission_runs(target: pathlib.Path) -> list[dict]:
+    """Every loadable mission run under a project, newest first: the current
+    run (live .absoloop/state.json) plus each archived run under
+    .absoloop/runs/<loop_id>/. Harness one-shot runs live in the same runs/
+    directory but carry manifest.json instead of state.json, so they are
+    skipped here."""
+    abs_dir = target / ".absoloop"
+    runtime = load_runtime(target)
+
+    def describe(loop_id: str, state: dict, goal_path: pathlib.Path,
+                 current: bool, archive: pathlib.Path | None = None) -> dict:
+        objective = ""
+        try:
+            first = goal_path.read_text(encoding="utf-8").splitlines()[0]
+            if first.startswith("# /goal — "):
+                objective = first[len("# /goal — "):].strip()
+        except (OSError, IndexError):
+            pass
+        if current and not objective:
+            objective = str(runtime.get("objective", "")).strip()
+        summary = ""
+        if state.get("latest_agent_result"):
+            summary = agent_summary(target, str(state["latest_agent_result"]))
+        return {
+            "loop_id": loop_id,
+            "current": current,
+            "status": str(state.get("status", "?")),
+            "iteration": int(state.get("iteration") or 0),
+            "cost_usd": float(state.get("cost_usd") or 0),
+            "tokens": state.get("tokens_total"),
+            "started_at": state.get("started_at"),
+            "objective": objective,
+            "summary": summary,
+            "archive": archive,
+        }
+
+    runs: list[dict] = []
+    current_id = str(runtime.get("loop_id", "")).strip()
+    state_path = abs_dir / "state.json"
+    if state_path.is_file():
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        runs.append(describe(current_id or "current", state,
+                             abs_dir / "goal.md", True))
+    runs_dir = abs_dir / "runs"
+    if runs_dir.is_dir():
+        for entry in sorted((p for p in runs_dir.iterdir() if p.is_dir()),
+                            key=lambda p: p.name, reverse=True):
+            archived_state = entry / "state.json"
+            if not archived_state.is_file():
+                continue
+            if entry.name == current_id and runs and runs[0]["current"]:
+                continue  # already listed as the current run
+            try:
+                state = json.loads(archived_state.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                state = {}
+            if not isinstance(state, dict):
+                state = {}
+            runs.append(describe(entry.name, state, entry / "goal.md", False,
+                                 archive=entry))
+    return runs
+
+
+def prepare_previous_run(target: pathlib.Path, run: dict) -> dict | None:
+    """Restore an archived run's records (state, report, goal) as the
+    mission's current ones so a follow-on extension continues from that run
+    instead of the latest one. The run being replaced is archived first, so
+    nothing is lost. Returns the loaded state dict, or None on error."""
+    abs_dir = target / ".absoloop"
+    runtime = load_runtime(target)
+    if not runtime:
+        print(f"error: no readable .absoloop/runtime.json under {target}",
+              file=sys.stderr)
+        return None
+    archive = run["archive"]
+    try:
+        state = json.loads((archive / "state.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"error: unreadable {archive / 'state.json'}: {exc}", file=sys.stderr)
+        return None
+
+    current_id = str(runtime.get("loop_id", "")).strip()
+    if current_id and current_id != run["loop_id"] \
+            and (abs_dir / "state.json").is_file():
+        keep = abs_dir / "runs" / current_id
+        keep.mkdir(parents=True, exist_ok=True)
+        for name in ("state.json", "report.md", "goal.md"):
+            source = abs_dir / name
+            if source.is_file():
+                shutil.copy2(source, keep / name)
+
+    for name in ("state.json", "report.md", "goal.md"):
+        source = archive / name
+        if source.is_file():
+            shutil.copy2(source, abs_dir / name)
+
+    runtime["loop_id"] = run["loop_id"]
+    # The follow-on extends the loaded run's work, so its objective (kept in
+    # the archived goal contract) becomes the mission objective again —
+    # otherwise the regenerated goal would headline a later run's objective.
+    if run["objective"] and run["objective"] != runtime.get("objective"):
+        runtime["objective"] = run["objective"]
+        runtime["thinking_ladder"] = build_thinking_ladder(
+            classify_mission(run["objective"]))
+    # Extension requirements added for runs newer than the loaded one belong
+    # to work being rolled past — drop them so the loaded run's own contract,
+    # not a later run's, is what the follow-on extends. Loop ids embed their
+    # creation timestamp, so a plain string compare orders them.
+    done_items = []
+    for item in runtime.get("definition_of_done", []):
+        match = re.match(r"Extension requirement \((loop-[^)]*)\):", str(item))
+        if match and match.group(1) > run["loop_id"]:
+            continue
+        done_items.append(str(item))
+    runtime["definition_of_done"] = done_items
+    (abs_dir / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n",
+                                          encoding="utf-8")
+    with (abs_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"ts": time.time(), "type": "load",
+                                 "loop_id": run["loop_id"],
+                                 "replaced_loop_id": current_id},
+                                sort_keys=True) + "\n")
+    return state
+
+
+def load_command(argv: list[str]) -> int:
+    """`absoloop load` — list a project's previous mission runs, pick one,
+    and prepare it as the base of a follow-on run with a new objective."""
+    parser = argparse.ArgumentParser(
+        prog="absoloop load",
+        description="Choose a previous mission run and extend it with a new "
+                    "objective: lists available runs (current + archived), "
+                    "restores the chosen run's records as the mission's "
+                    "current base, and starts a follow-on run with fresh "
+                    "budgets (like 'absoloop resume --extend', but for any "
+                    "earlier run).")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    parser.add_argument("--run", default="",
+                        help="loop id (or unique prefix) to load without the "
+                             "interactive picker")
+    parser.add_argument("-o", "--objective", "-m", "--note", dest="note",
+                        default="",
+                        help="what the follow-on run should accomplish")
+    parser.add_argument("--engine", choices=list(ENGINES),
+                        help="engine for the loop (default: first one found on PATH)")
+    parser.add_argument("--iterations", type=int,
+                        help="raise max_iterations for the new run")
+    parser.add_argument("--budget", type=float,
+                        help="raise max_cost_usd for the new run")
+    parser.add_argument("--hours", type=float,
+                        help="wall-clock budget for the new run, in hours")
+    parser.add_argument("--min-iterations", type=int, dest="min_iterations",
+                        help="iteration floor — a \"done\" report is not "
+                             "accepted before this many iterations")
+    parser.add_argument("--no-start", action="store_true",
+                        help="prepare the follow-on run but do not launch the loop")
+    args = parser.parse_args(argv)
+
+    target = pathlib.Path(args.project).expanduser().resolve()
+    if not (target / ".absoloop").is_dir():
+        print(f"error: no .absoloop/ under {target} — not an ABSOLOOP project.",
+              file=sys.stderr)
+        return 1
+    runs = mission_runs(target)
+    if not runs:
+        print(f"no mission runs found under {target}/.absoloop/ — start one "
+              "with 'absoloop \"objective\"'.", file=sys.stderr)
+        return 1
+
+    ux = _load_briefing()
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    width = max(56, min(terminal_columns(100), 240))
+
+    def fmt_when(ts) -> str:
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+        except (TypeError, ValueError, OSError, OverflowError):
+            return "?"
+
+    print(ux.tint("bold", f" PREVIOUS RUNS — {target}"))
+    print(ux.tint("dim", " " + "─" * (width - 2)))
+    for index, run in enumerate(runs, 1):
+        mark = ux.tint("ok", "current") if run["current"] else ux.tint("dim", "archived")
+        print(f" {index}. {run['loop_id']}  · {mark} · {run['status']}")
+        if run["objective"]:
+            print(clip_text(f"      objective : {run['objective']}", width))
+        cost = with_tokens(f"${run['cost_usd']:.2f}", run["tokens"])
+        started = fmt_when(run["started_at"]) if run["started_at"] else "?"
+        print(f"      progress  : {run['iteration']} iteration(s) · {cost} · "
+              f"started {started}")
+        if run["summary"]:
+            print(ux.tint("dim",
+                          clip_text(f"      last work : {run['summary']}", width)))
+    runs_dir = target / ".absoloop" / "runs"
+    if runs_dir.is_dir():
+        harness_count = sum(1 for p in runs_dir.iterdir()
+                            if p.is_dir() and (p / "manifest.json").is_file())
+        if harness_count:
+            print(ux.tint("dim", f" (+{harness_count} harness run(s) not shown "
+                                 "— 'absoloop inspect' lists them)"))
+
+    chosen = None
+    if args.run:
+        matches = [r for r in runs if r["loop_id"] == args.run] or \
+                  [r for r in runs if r["loop_id"].startswith(args.run)]
+        if not matches:
+            print(f"error: no run matches {args.run!r}.", file=sys.stderr)
+            return 1
+        if len(matches) > 1:
+            print(f"error: {args.run!r} is ambiguous — matches "
+                  + ", ".join(r["loop_id"] for r in matches), file=sys.stderr)
+            return 1
+        chosen = matches[0]
+    elif interactive:
+        print()
+        while chosen is None:
+            answer = ux.ask(f"load which run? (1-{len(runs)}, or loop id; "
+                            "q aborts)", "1")
+            if answer.lower() in ("q", "quit"):
+                print(ux.tint("dim", "Aborted."))
+                return 0
+            if answer.isdigit() and 1 <= int(answer) <= len(runs):
+                chosen = runs[int(answer) - 1]
+                continue
+            matches = [r for r in runs if r["loop_id"] == answer] or \
+                      [r for r in runs if r["loop_id"].startswith(answer)]
+            if len(matches) == 1:
+                chosen = matches[0]
+            else:
+                print(ux.tint("warn", f"  pick 1-{len(runs)} or a loop id"))
+    else:
+        print("\nload a run with: absoloop load --run <loop-id> "
+              "-o \"follow-on objective\"")
+        return 0
+
+    if chosen["current"] and chosen["status"] == "AWAITING_APPROVAL":
+        print("mission is AWAITING_APPROVAL — decide the gate first "
+              "('absoloop approve' or 'absoloop reject \"...\"'), then load.",
+              file=sys.stderr)
+        return 3
+
+    note = args.note.strip()
+    if not note:
+        if not interactive:
+            print("error: pass -o/--objective with what the follow-on run "
+                  "should accomplish.", file=sys.stderr)
+            return 1
+        print()
+        print(ux.tint("bold", "What should the follow-on run accomplish?"))
+        print(ux.tint("dim", "  one sentence — it extends the loaded run's work"))
+        note = ux.ask("  objective")
+        while not note:
+            note = ux.ask("  objective (required)")
+
+    engine = args.engine or default_engine()
+    if engine is None and not args.no_start:
+        print("error: no engine available — install 'claude', 'codex', or 'grok'.",
+              file=sys.stderr)
+        return 1
+
+    if chosen["current"]:
+        state = read_state(target)
+        if state is None:
+            return 1
+    else:
+        state = prepare_previous_run(target, chosen)
+        if state is None:
+            return 1
+        print(f"loaded run {chosen['loop_id']} ({chosen['status']}) as the "
+              "mission's current base")
+
+    return extend_mission(target, state, engine or "", note, args.iterations,
+                          args.budget, args.hours, args.min_iterations,
+                          start=not args.no_start)
 
 
 def resume_command(argv: list[str]) -> int:
@@ -1730,8 +2022,15 @@ def main(argv: list[str]) -> int:
         # e.g. absoloop --zcomb -C ./proj --port 3141
         return zcomb_mod.zcomb_command(argv)
 
+    # `absoloop new` is the standard briefing flow under an explicit name —
+    # peel the word and fall through to the same parser as bare `absoloop`.
+    if argv and argv[0] == "new":
+        argv = argv[1:]
+
     if argv and argv[0] in ("approve", "reject"):
         return gate_command(argv[0], argv[1:])
+    if argv and argv[0] == "load":
+        return load_command(argv[1:])
     if argv and argv[0] == "status":
         return status_command(argv[1:])
     if argv and argv[0] == "watch":
