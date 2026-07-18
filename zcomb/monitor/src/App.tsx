@@ -136,6 +136,7 @@ export default function App() {
   const [elapsed, setElapsed] = useState('00:00:00');
   const [agentsOpen, setAgentsOpen] = useState(() => localStorage.getItem('zc-panel-agents') !== '0');
   const [feedOpen, setFeedOpen] = useState(() => localStorage.getItem('zc-panel-feed') !== '0');
+  const [objectiveCopied, setObjectiveCopied] = useState(false);
 
   const toggleAgents = () => setAgentsOpen(open => {
     localStorage.setItem('zc-panel-agents', open ? '0' : '1');
@@ -347,6 +348,74 @@ export default function App() {
           flexWrap: 'wrap',
           minHeight: 36,
         }}>
+          {objective && (
+            <button
+              type="button"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(objective);
+                  setObjectiveCopied(true);
+                  window.setTimeout(() => setObjectiveCopied(false), 1500);
+                } catch {
+                  // Clipboard may be unavailable in insecure contexts
+                }
+              }}
+              title={objectiveCopied ? 'Copied!' : 'Copy objective'}
+              aria-label={objectiveCopied ? 'Copied!' : 'Copy objective'}
+              style={{
+                background: 'none',
+                border: 'none',
+                cursor: 'pointer',
+                padding: 4,
+                borderRadius: 6,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                color: objectiveCopied ? '#3fb950' : mutedColor,
+                flexShrink: 0,
+              }}
+              onMouseEnter={e => {
+                if (!objectiveCopied) e.currentTarget.style.color = textColor;
+              }}
+              onMouseLeave={e => {
+                if (!objectiveCopied) e.currentTarget.style.color = mutedColor;
+              }}
+            >
+              {objectiveCopied ? (
+                <svg width="14" height="14" viewBox="0 0 16 16" style={{ display: 'block' }}>
+                  <path
+                    d="M3.5 8.5 L6.5 11.5 L12.5 4.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              ) : (
+                <svg width="14" height="14" viewBox="0 0 16 16" style={{ display: 'block' }}>
+                  <rect
+                    x="5.5"
+                    y="5.5"
+                    width="8"
+                    height="8"
+                    rx="1.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.4"
+                  />
+                  <path
+                    d="M10.5 5.5 V4 A1.5 1.5 0 0 0 9 2.5 H4 A1.5 1.5 0 0 0 2.5 4 V9 A1.5 1.5 0 0 0 4 10.5 H5.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              )}
+            </button>
+          )}
           {awaitingRun && (
             <span style={{
               fontSize: 11,
