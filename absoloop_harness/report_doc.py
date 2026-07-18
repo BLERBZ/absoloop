@@ -26,6 +26,16 @@ _SKILL_RE = re.compile(
     r"^\.(claude|codex|agents)/skills/([^/]+)",
     re.IGNORECASE,
 )
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+_JUNK_NAMES = {
+    ".ds_store", ".cfusertextencoding", ".bash_history", ".zsh_history",
+    ".viminfo", ".lesshst",
+}
+_MAX_EVIDENCE_IMAGES = 6
+_MAX_SHIPPED = 12
+_MAX_CHANGED_FILES = 40
+_MAX_THUMB_PX = 960
+_MAX_THUMB_BYTES = 180_000
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -68,6 +78,7 @@ class AgentHighlight:
     commands: List[str] = field(default_factory=list)
     risks: List[str] = field(default_factory=list)
     blocking_findings: List[str] = field(default_factory=list)
+    evidence: List[str] = field(default_factory=list)
     cost_usd: float = 0.0
     cost_exact: bool = True
     wall_seconds: float = 0.0
@@ -193,6 +204,75 @@ def _as_str_list(value: Any) -> List[str]:
     return [text] if text else []
 
 
+def _parse_evidence(value: Any) -> List[str]:
+    """Normalize evidence field: strings or {path/caption} dicts → path list."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = " ".join(value.split())
+        return [text] if text else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    out: List[str] = []
+    for item in value:
+        if isinstance(item, str):
+            text = " ".join(item.split())
+            if text:
+                out.append(text)
+            continue
+        if isinstance(item, dict):
+            path = item.get("path") or item.get("file") or item.get("src") or ""
+            text = " ".join(str(path).split())
+            if text:
+                out.append(text)
+    return out
+
+
+def _is_image_path(path: str) -> bool:
+    return pathlib.Path(path).suffix.lower() in _IMAGE_EXTS
+
+
+def _is_junk_path(path: str) -> bool:
+    name = pathlib.Path(path).name.lower()
+    if name in _JUNK_NAMES:
+        return True
+    return name.endswith(".pyc") or name == "__pycache__"
+
+
+def _short_path(path: str) -> str:
+    """Display-friendly basename-heavy path."""
+    text = path.replace("\\", "/").rstrip("/")
+    if not text:
+        return path
+    parts = [p for p in text.split("/") if p]
+    if len(parts) <= 2:
+        return "/".join(parts) if parts else text
+    return "/".join(parts[-2:])
+
+
+def _evidence_caption(path: str) -> str:
+    stem = pathlib.Path(path).stem
+    stem = re.sub(r"^q[-_]", "", stem, flags=re.IGNORECASE)
+    stem = re.sub(r"^p[-_]", "", stem, flags=re.IGNORECASE)
+    stem = stem.replace("_", " ").replace("-", " ").strip()
+    if not stem:
+        return pathlib.Path(path).name
+    return stem[:1].upper() + stem[1:]
+
+
+def _resolve_evidence_path(project: pathlib.Path, path: str) -> Optional[pathlib.Path]:
+    raw = pathlib.Path(path).expanduser()
+    if raw.is_absolute():
+        return raw if raw.is_file() else None
+    cand = (project / raw).resolve()
+    if cand.is_file():
+        return cand
+    # Absolute-looking paths stored without leading slash quirks
+    if pathlib.Path(path).is_file():
+        return pathlib.Path(path)
+    return None
+
+
 def _headline(summary: str, *, max_len: int = 160) -> str:
     text = " ".join(str(summary or "").split())
     if not text:
@@ -273,6 +353,7 @@ def _load_agent_structured(
         "changed_artifacts": _as_str_list(structured.get("changed_artifacts")),
         "commands_run": _as_str_list(structured.get("commands_run")),
         "risks": _as_str_list(structured.get("risks")),
+        "evidence": _parse_evidence(structured.get("evidence")),
         "recommendation": str(structured.get("recommendation") or "").strip().upper(),
         "blocking_findings": _as_str_list(structured.get("blocking_findings")),
         "is_error": bool(payload.get("is_error")),
@@ -344,6 +425,8 @@ def _split_files_and_skills(
     files: List[str] = []
     grouped: Dict[str, SkillEntry] = {}
     for path in paths:
+        if _is_junk_path(path):
+            continue
         match = _SKILL_RE.match(path.replace("\\", "/"))
         if not match:
             files.append(path)
@@ -362,6 +445,104 @@ def _split_files_and_skills(
             entry.paths.append(path)
     skills = sorted(grouped.values(), key=lambda s: s.name.lower())
     return files, skills
+
+
+def _artifact_paths_from_highlights(highlights: Sequence[AgentHighlight]) -> List[str]:
+    """Union of builder artifacts + evidence, latest-first, deduped."""
+    builders = [h for h in highlights if h.role == "builder"]
+    ordered: List[str] = []
+    seen: set = set()
+    for hl in reversed(builders):
+        for path in list(hl.artifacts) + list(hl.evidence):
+            key = path.replace("\\", "/")
+            if not path or key in seen or _is_junk_path(path):
+                continue
+            seen.add(key)
+            ordered.append(path)
+    return ordered
+
+
+def _shipped_artifacts(highlights: Sequence[AgentHighlight], *, limit: int = _MAX_SHIPPED) -> List[str]:
+    """Primary non-image deliverables (latest builder first)."""
+    out: List[str] = []
+    for path in _artifact_paths_from_highlights(highlights):
+        if _is_image_path(path):
+            continue
+        out.append(path)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _collect_evidence_images(
+    highlights: Sequence[AgentHighlight], *, limit: int = _MAX_EVIDENCE_IMAGES,
+) -> List[str]:
+    """Image paths from evidence + artifacts, latest builder first."""
+    builders = [h for h in highlights if h.role == "builder"]
+    out: List[str] = []
+    seen: set = set()
+    for hl in reversed(builders):
+        # Prefer explicit evidence, then image artifacts
+        for path in list(hl.evidence) + list(hl.artifacts):
+            if not _is_image_path(path):
+                continue
+            key = path.replace("\\", "/")
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(path)
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def _nuggets_for_highlight(hl: AgentHighlight, *, limit: int = 4) -> List[str]:
+    """Bite-sized result bullets — artifacts, verifies, risks/findings."""
+    nuggets: List[str] = []
+    if hl.role == "critic":
+        if hl.recommendation:
+            nuggets.append(f"Verdict: {hl.recommendation}")
+        for finding in hl.blocking_findings[:2]:
+            nuggets.append(finding)
+        if hl.recommendation == "PASS" and not hl.blocking_findings:
+            nuggets.append("No blocking findings")
+        return nuggets[:limit]
+
+    for path in hl.artifacts:
+        if _is_image_path(path):
+            continue
+        nuggets.append(_short_path(path))
+        if len(nuggets) >= 2:
+            break
+    for cmd in hl.commands[:2]:
+        short = cmd if len(cmd) <= 90 else cmd[:87].rstrip() + "…"
+        nuggets.append(f"Verified: {short}")
+        if len(nuggets) >= limit:
+            break
+    for risk in hl.risks[:2]:
+        if len(nuggets) >= limit:
+            break
+        short = risk if len(risk) <= 110 else risk[:107].rstrip() + "…"
+        nuggets.append(short)
+    if not nuggets and hl.summary:
+        nuggets.append(_headline(hl.summary, max_len=120))
+    return nuggets[:limit]
+
+
+def _select_changed_files(
+    git_files: Sequence[str],
+    highlights: Sequence[AgentHighlight],
+) -> List[str]:
+    """Prefer builder artifacts when git porcelain is a noisy home-tree dump."""
+    artifacts = _artifact_paths_from_highlights(highlights)
+    clean_git = [p for p in git_files if not _is_junk_path(p)]
+    # Home-directory missions often return hundreds of unrelated paths.
+    if artifacts and (not clean_git or len(clean_git) > _MAX_CHANGED_FILES):
+        return artifacts[:_MAX_CHANGED_FILES]
+    if len(clean_git) > _MAX_CHANGED_FILES:
+        # Keep skill-adjacent + first N
+        return clean_git[:_MAX_CHANGED_FILES]
+    return clean_git
 
 
 def _which(name: str) -> bool:
@@ -510,6 +691,7 @@ def _timeline_from_ledger(
                 commands=list(structured.get("commands_run") or []),
                 risks=list(structured.get("risks") or []),
                 blocking_findings=list(structured.get("blocking_findings") or []),
+                evidence=list(structured.get("evidence") or []),
                 cost_usd=cost,
                 cost_exact=cost_exact,
                 wall_seconds=wall,
@@ -624,7 +806,8 @@ def collect_report(project: pathlib.Path) -> Optional[MissionReport]:
     delivery = runtime.get("delivery") if isinstance(runtime.get("delivery"), dict) else {}
     timeline, highlights, stats = _timeline_from_ledger(target)
     status = str(state.get("status") or "IDLE")
-    changed_files, skills = _split_files_and_skills(_git_changed_paths(target))
+    git_files, skills = _split_files_and_skills(_git_changed_paths(target))
+    changed_files = _select_changed_files(git_files, highlights)
 
     return MissionReport(
         project=target,
@@ -706,71 +889,62 @@ def _highlight_heading(hl: AgentHighlight) -> str:
     return f"{iter_label} · {role} · {hl.status_label}"
 
 
-def _render_highlights_markdown(report: MissionReport) -> List[str]:
-    if not report.highlights:
-        return ["_No builder/critic reports recorded yet._", ""]
+def _render_builder_nuggets_markdown(report: MissionReport) -> List[str]:
+    builders = [h for h in report.highlights if h.role == "builder"]
+    if not builders:
+        return ["_No builder reports recorded yet._", ""]
     lines: List[str] = []
-    for hl in report.highlights:
+    for hl in builders:
         lines.append(f"### {_highlight_heading(hl)}")
         lines.append("")
         exact = "" if hl.cost_exact else "~"
-        meta = (
-            f"`{hl.engine}` · {exact}${hl.cost_usd:.2f}"
-            + (f" · {hl.tokens_label}" if hl.tokens_label else "")
-            + f" · {hl.wall_seconds:.0f}s"
-        )
-        if hl.result_path:
-            meta += f" · `{hl.result_path}`"
+        meta = f"`{hl.engine}` · {exact}${hl.cost_usd:.2f} · {hl.wall_seconds:.0f}s"
         lines.append(meta)
         lines.append("")
         if hl.headline:
             lines.append(f"**{hl.headline}**")
             lines.append("")
-        if hl.summary and hl.summary != hl.headline:
-            lines.append(hl.summary)
-            lines.append("")
-        if hl.role == "critic":
-            if hl.recommendation:
-                lines.append(f"- **Verdict:** `{hl.recommendation}`")
-            if hl.blocking_findings:
-                lines.append("- **Blocking findings:**")
-                for finding in hl.blocking_findings:
-                    lines.append(f"  - {finding}")
-            elif hl.recommendation == "PASS":
-                lines.append("- **Blocking findings:** none")
-        else:
-            if hl.done is True:
-                lines.append("- **Done claim:** yes")
-            elif hl.done is False:
-                lines.append("- **Done claim:** no — work remains")
-            if hl.limit_reached:
-                lines.append(f"- **Limit:** `{hl.limit_reached}`")
-        if hl.artifacts:
-            lines.append("- **Artifacts:**")
-            for path in hl.artifacts[:12]:
-                lines.append(f"  - `{path}`")
-            if len(hl.artifacts) > 12:
-                lines.append(f"  - _+{len(hl.artifacts) - 12} more_")
-        if hl.commands:
-            lines.append("- **Verified commands:**")
-            for cmd in hl.commands[:10]:
-                lines.append(f"  - `{cmd}`")
-            if len(hl.commands) > 10:
-                lines.append(f"  - _+{len(hl.commands) - 10} more_")
-        if hl.risks:
-            lines.append("- **Risks / remaining:**")
-            for risk in hl.risks[:8]:
-                lines.append(f"  - {risk}")
-            if len(hl.risks) > 8:
-                lines.append(f"  - _+{len(hl.risks) - 8} more_")
+        nuggets = _nuggets_for_highlight(hl)
+        for nugget in nuggets:
+            lines.append(f"- {nugget}")
+        if not nuggets and hl.summary:
+            lines.append(f"- {_headline(hl.summary, max_len=140)}")
         lines.append("")
     return lines
 
 
+def _render_critic_markdown(report: MissionReport) -> List[str]:
+    critics = [h for h in report.highlights if h.role == "critic"]
+    if not critics:
+        return ["_No critic review yet._", ""]
+    hl = critics[-1]
+    lines = [
+        f"**Verdict:** `{hl.recommendation or hl.status_label}`"
+        + (f" · iteration {hl.iteration}" if hl.iteration is not None else ""),
+        "",
+    ]
+    if hl.headline:
+        lines += [hl.headline, ""]
+    if hl.blocking_findings:
+        lines.append("Blocking findings:")
+        for finding in hl.blocking_findings:
+            lines.append(f"- {finding}")
+    elif hl.recommendation == "PASS":
+        lines.append("- Blocking findings: none")
+    lines.append("")
+    return lines
+
+
 def render_markdown(report: MissionReport) -> str:
-    """Infographic-oriented Markdown — readable raw, great in the lite viewer."""
+    """Results-first Markdown — outcome, shipped work, evidence, then ops."""
     tokens = _fmt_tokens(report.tokens_total)
     gen = time.strftime("%Y-%m-%d %H:%M", time.localtime(report.generated_at))
+    critic = _latest_critic(report)
+    verdict = (critic.recommendation if critic else "") or "—"
+    shipped = _shipped_artifacts(report.highlights)
+    evidence = _collect_evidence_images(report.highlights)
+    objective = report.objective.strip() or "_(no objective recorded)_"
+
     lines: List[str] = [
         f"# {BRAND_NAME} Report",
         "",
@@ -778,23 +952,47 @@ def render_markdown(report: MissionReport) -> str:
         "",
         f"> Generated {gen}",
         "",
-        "---",
-        "",
-        "## Mission",
-        "",
-        report.objective.strip() or "_(no objective recorded)_",
-        "",
-        "| | |",
-        "|---|---|",
-        f"| **Engine** | `{report.engine}` |",
-        f"| **Delivery** | `{report.delivery_mode}` → {report.delivery_detail} |",
-        f"| **Status** | **{report.status}**"
-        + (f" ({report.stop_reason})" if report.stop_reason else "")
-        + " |",
+        objective,
         "",
         "---",
         "",
-        "## At a glance",
+        "## Outcome",
+        "",
+        f"**{report.status_label}** · critic `{verdict}`"
+        + (f" · gate `{report.human_decision}`" if report.human_decision else ""),
+        "",
+        _outcome_line(report),
+        "",
+        f"- Iterations: {report.iteration}/{report.max_iterations or '—'}",
+        f"- Spend: ${report.cost_usd:.2f}"
+        + (f" ({tokens})" if tokens else "")
+        + f" / ${report.max_cost_usd:.2f}",
+        f"- Delivery: `{report.delivery_mode}` → {report.delivery_detail}",
+        "",
+        "---",
+        "",
+        "## What shipped",
+        "",
+    ]
+    if shipped:
+        for path in shipped:
+            lines.append(f"- `{path}`")
+    else:
+        lines.append("_No primary artifacts recorded._")
+    lines += ["", "---", "", "## Evidence", ""]
+    if evidence:
+        for path in evidence:
+            lines.append(f"- **{_evidence_caption(path)}** — `{path}`")
+    else:
+        lines.append("_No screenshots or visual proof attached._")
+    lines += ["", "---", "", "## Builder work", ""]
+    lines += _render_builder_nuggets_markdown(report)
+    lines += ["---", "", "## Critic", ""]
+    lines += _render_critic_markdown(report)
+    lines += [
+        "---",
+        "",
+        "## Mission ops",
         "",
         "| Metric | Used | Budget | Progress |",
         "|---|---:|---:|---|",
@@ -814,30 +1012,15 @@ def render_markdown(report: MissionReport) -> str:
     lines += [
         f"| Agent runs | {report.agent_runs} | — | — |",
         "",
+        "### Run arc",
+        "",
     ]
-
-    # Snapshot chips as a short list (renders as pills in HTML)
-    chips: List[str] = [f"`{report.status_label}`"]
-    if report.integrity_ok is True:
-        chips.append("`Integrity ✓`")
-    elif report.integrity_ok is False:
-        chips.append("`Integrity ✗`")
-    if report.human_decision:
-        chips.append(f"`Gate: {report.human_decision}`")
-    if report.agent_runs:
-        chips.append(f"`{report.agent_runs} runs`")
-    lines += ["### Snapshot", "", " · ".join(chips), "", "---", "", "## Run arc", ""]
     lines += _render_arc_markdown(report)
-    lines += ["---", "", "## Builder highlights", ""]
-    lines += _render_highlights_markdown(report)
-    lines += ["---", "", "## Changed files", ""]
     if report.changed_files:
-        for path in report.changed_files:
+        lines += ["### Changed files", ""]
+        for path in report.changed_files[:_MAX_CHANGED_FILES]:
             lines.append(f"- `{path}`")
-    else:
-        lines.append("_None detected (or clean tree)._")
-    lines.append("")
-
+        lines.append("")
     lines += ["---", "", "## Skills", ""]
     if report.skills:
         for skill in report.skills:
@@ -849,15 +1032,6 @@ def render_markdown(report: MissionReport) -> str:
                 lines.append(f"  - _+{len(skill.paths) - 4} more paths_")
     else:
         lines.append("_No skill tree changes detected._")
-    lines.append("")
-
-    lines += ["---", "", "## Pointers", ""]
-    if report.latest_agent_path:
-        lines.append(f"- Latest agent result: `{report.latest_agent_path}`")
-    if report.critic_path:
-        lines.append(f"- Latest critic findings: `{report.critic_path}`")
-    if not report.latest_agent_path and not report.critic_path:
-        lines.append("_No saved agent/critic artifacts yet._")
     lines += [
         "",
         "---",
@@ -968,8 +1142,70 @@ body {
 .meta code { color: var(--ink); }
 .objective {
   margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line);
-  font-size: 1.05rem; max-width: 68ch;
+  font-size: 1.02rem; max-width: 68ch; color: #d5e0ec;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
 }
+.outcome-strip {
+  display: grid; gap: 12px;
+  grid-template-columns: 1fr;
+  margin-bottom: 16px;
+}
+@media (min-width: 720px) {
+  .outcome-strip { grid-template-columns: 1.4fr repeat(3, minmax(0, 1fr)); }
+}
+.outcome-main .value { font-size: 1.55rem; }
+.outcome-main .lead {
+  margin: 8px 0 0; font-size: 14px; font-weight: 500; color: #c9d7e8;
+  line-height: 1.4;
+}
+.ship-list, .nugget-list {
+  list-style: none; margin: 0; padding: 0; display: grid; gap: 8px;
+}
+.ship-list li, .nugget-list li {
+  font-size: 13px; color: #d5e0ec; line-height: 1.4;
+  padding: 8px 10px; border-radius: 10px;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--line);
+}
+.ship-list code {
+  font-family: var(--mono); font-size: 12px; color: #c9d7e8; word-break: break-all;
+}
+.evidence-grid {
+  display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.evidence-card {
+  margin: 0; border-radius: 12px; overflow: hidden;
+  background: rgba(255,255,255,0.03); border: 1px solid var(--line);
+}
+.evidence-card img {
+  display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover;
+  background: #0a0f16;
+}
+.evidence-card figcaption {
+  padding: 8px 10px 10px; font-size: 12px; color: #c9d7e8;
+}
+.evidence-card .cap { font-weight: 650; display: block; margin-bottom: 2px; }
+.evidence-card .path {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  word-break: break-all;
+}
+.ops-details {
+  background: var(--bg1); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 0; margin-bottom: 16px;
+  box-shadow: var(--shadow);
+}
+.ops-details > summary {
+  cursor: pointer; list-style: none; padding: 16px 22px;
+  font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--muted); font-weight: 700; user-select: none;
+}
+.ops-details > summary::-webkit-details-marker { display: none; }
+.ops-details > summary::after {
+  content: "▸"; float: right; color: var(--accent);
+}
+.ops-details[open] > summary::after { content: "▾"; }
+.ops-body { padding: 0 22px 18px; }
 .metrics-block { margin-bottom: 22px; }
 .grid {
   display: grid; gap: 12px;
@@ -1080,26 +1316,6 @@ body {
 }
 .legend-val {
   margin-left: auto; font-family: var(--mono); color: var(--muted); font-size: 11px;
-}
-.heatmap {
-  display: grid; gap: 4px; margin-top: 10px;
-  grid-template-columns: 52px repeat(var(--hm-cols, 2), minmax(0, 1fr));
-}
-.heatmap .hm-corner, .heatmap .hm-col, .heatmap .hm-row {
-  font-size: 10px; color: var(--muted); font-family: var(--mono);
-  text-transform: uppercase; letter-spacing: 0.04em;
-}
-.heatmap .hm-col { text-align: center; padding-bottom: 2px; }
-.heatmap .hm-row {
-  display: flex; align-items: center; justify-content: flex-end;
-  padding-right: 6px;
-}
-.heatmap .hm-cell {
-  min-height: 36px; border-radius: 8px;
-  display: flex; align-items: center; justify-content: center;
-  font-family: var(--mono); font-size: 11px; font-weight: 650;
-  border: 1px solid rgba(255,255,255,0.06);
-  color: rgba(232,238,246,0.92);
 }
 .iter-bars { display: grid; gap: 8px; margin-top: 10px; }
 .iter-bar-row {
@@ -1236,6 +1452,10 @@ body {
 .hl-block code {
   font-family: var(--mono); font-size: 12px; color: #c9d7e8;
 }
+.nugget-list { margin-top: 10px; }
+.nugget-list li {
+  padding: 6px 10px; font-size: 13px;
+}
 .empty { color: var(--muted); font-style: italic; }
 """
 
@@ -1273,6 +1493,130 @@ def _brand_html() -> str:
         f'<div class="brand">{logo}'
         f'<strong class="brand-name">{_esc(BRAND_NAME)}</strong></div>'
     )
+
+
+def _thumbnail_bytes(path: pathlib.Path) -> Optional[Tuple[bytes, str]]:
+    """Return (jpeg_bytes, mime) thumbnail, or None if unavailable."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    if not raw:
+        return None
+
+    # Prefer Pillow when present (tests + Linux); fall back to sips on macOS.
+    try:
+        from io import BytesIO
+        from PIL import Image
+
+        with Image.open(BytesIO(raw)) as img:
+            img = img.convert("RGB") if img.mode not in ("RGB", "L") else img.convert("RGB")
+            img.thumbnail((_MAX_THUMB_PX, _MAX_THUMB_PX))
+            quality = 82
+            while quality >= 55:
+                buf = BytesIO()
+                img.save(buf, format="JPEG", quality=quality, optimize=True)
+                data = buf.getvalue()
+                if len(data) <= _MAX_THUMB_BYTES or quality <= 55:
+                    return data, "image/jpeg"
+                quality -= 8
+    except Exception:
+        pass
+
+    if not _which("sips"):
+        # Last resort: embed small originals only.
+        if len(raw) <= _MAX_THUMB_BYTES:
+            ext = path.suffix.lower().lstrip(".") or "png"
+            mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+            return raw, mime
+        return None
+
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="absoloop-thumb-") as tmp:
+            out = pathlib.Path(tmp) / "thumb.jpg"
+            # Resize longest edge, then convert to JPEG.
+            subprocess.run(
+                ["sips", "-Z", str(_MAX_THUMB_PX), str(path), "--out", str(out)],
+                capture_output=True, check=False,
+            )
+            if not out.is_file():
+                subprocess.run(
+                    ["sips", "-s", "format", "jpeg", str(path), "--out", str(out)],
+                    capture_output=True, check=False,
+                )
+            else:
+                # Ensure JPEG even if source was PNG already resized in place.
+                if out.suffix.lower() != ".jpg":
+                    jpg = pathlib.Path(tmp) / "thumb2.jpg"
+                    subprocess.run(
+                        ["sips", "-s", "format", "jpeg", str(out), "--out", str(jpg)],
+                        capture_output=True, check=False,
+                    )
+                    if jpg.is_file():
+                        out = jpg
+            if not out.is_file():
+                return None
+            data = out.read_bytes()
+            if not data:
+                return None
+            if len(data) > _MAX_THUMB_BYTES:
+                # One more downscale pass
+                small = pathlib.Path(tmp) / "thumb-sm.jpg"
+                subprocess.run(
+                    ["sips", "-Z", "640", str(out), "--out", str(small)],
+                    capture_output=True, check=False,
+                )
+                if small.is_file():
+                    data = small.read_bytes()
+            return data, "image/jpeg"
+    except OSError:
+        return None
+
+
+def _image_data_uri(path: pathlib.Path) -> str:
+    thumb = _thumbnail_bytes(path)
+    if not thumb:
+        return ""
+    data, mime = thumb
+    return f"data:{mime};base64," + base64.standard_b64encode(data).decode("ascii")
+
+
+def _latest_critic(report: MissionReport) -> Optional[AgentHighlight]:
+    for hl in reversed(report.highlights):
+        if hl.role == "critic":
+            return hl
+    return None
+
+
+def _latest_builder(report: MissionReport) -> Optional[AgentHighlight]:
+    for hl in reversed(report.highlights):
+        if hl.role == "builder":
+            return hl
+    return None
+
+
+def _outcome_line(report: MissionReport) -> str:
+    critic = _latest_critic(report)
+    builder = _latest_builder(report)
+    if critic and critic.headline:
+        return critic.headline
+    if builder and builder.headline:
+        return builder.headline
+    if report.stop_reason:
+        return report.stop_reason
+    return report.status_label
+
+
+def _truncate_objective(text: str, *, max_len: int = 220) -> str:
+    clean = " ".join((text or "").split())
+    if len(clean) <= max_len:
+        return clean
+    cut = clean[: max_len - 1]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" ,;:") + "…"
 
 
 def _bar_html(used: float, cap: float) -> str:
@@ -1815,53 +2159,21 @@ def _hl_list_block(title: str, items: Sequence[str], *, code: bool = False,
     )
 
 
-def _render_highlights_html(report: MissionReport) -> str:
-    if not report.highlights:
-        return '<p class="empty">No builder/critic reports recorded yet.</p>'
+def _render_builder_nuggets_html(report: MissionReport) -> str:
+    builders = [h for h in report.highlights if h.role == "builder"]
+    if not builders:
+        return '<p class="empty">No builder reports recorded yet.</p>'
     cards: List[str] = []
-    for hl in report.highlights:
+    for hl in builders:
         exact = "" if hl.cost_exact else "~"
-        meta = (
-            f"{hl.engine} · {exact}${hl.cost_usd:.2f}"
-            + (f" · {hl.tokens_label}" if hl.tokens_label else "")
-            + f" · {hl.wall_seconds:.0f}s"
-        )
-        blocks: List[str] = []
-        if hl.role == "critic":
-            if hl.recommendation:
-                blocks.append(
-                    '<div class="hl-block"><h3>Verdict</h3>'
-                    f'<ul><li><code>{_esc(hl.recommendation)}</code></li></ul></div>'
-                )
-            if hl.blocking_findings:
-                blocks.append(_hl_list_block("Blocking findings", hl.blocking_findings))
-            elif hl.recommendation == "PASS":
-                blocks.append(
-                    '<div class="hl-block"><h3>Blocking findings</h3>'
-                    '<ul><li class="empty">none</li></ul></div>'
-                )
-        else:
-            claim = (
-                "yes" if hl.done is True
-                else "no — work remains" if hl.done is False
-                else ""
-            )
-            if claim:
-                blocks.append(
-                    '<div class="hl-block"><h3>Done claim</h3>'
-                    f"<ul><li>{_esc(claim)}</li></ul></div>"
-                )
-            if hl.limit_reached:
-                blocks.append(
-                    '<div class="hl-block"><h3>Limit</h3>'
-                    f'<ul><li><code>{_esc(hl.limit_reached)}</code></li></ul></div>'
-                )
-        blocks.append(_hl_list_block("Artifacts", hl.artifacts, code=True))
-        blocks.append(_hl_list_block("Verified commands", hl.commands, code=True, limit=10))
-        blocks.append(_hl_list_block("Risks / remaining", hl.risks, limit=8))
-        summary = ""
-        if hl.summary and hl.summary != hl.headline:
-            summary = f'<div class="hl-summary">{_esc(hl.summary)}</div>'
+        meta = f"{hl.engine} · {exact}${hl.cost_usd:.2f} · {hl.wall_seconds:.0f}s"
+        nuggets = _nuggets_for_highlight(hl)
+        if not nuggets and hl.summary:
+            nuggets = [_headline(hl.summary, max_len=140)]
+        nugget_html = ""
+        if nuggets:
+            items = "".join(f"<li>{_esc(n)}</li>" for n in nuggets)
+            nugget_html = f'<ul class="nugget-list">{items}</ul>'
         cards.append(
             f'<article class="hl-card {hl.tone}">'
             f'<div class="hl-head">'
@@ -1869,11 +2181,114 @@ def _render_highlights_html(report: MissionReport) -> str:
             f'<div class="hl-meta">{_esc(meta)}</div>'
             f"</div>"
             + (f'<div class="hl-headline">{_esc(hl.headline)}</div>' if hl.headline else "")
-            + summary
-            + "".join(blocks)
+            + nugget_html
             + "</article>"
         )
     return f'<div class="hl-list">{"".join(cards)}</div>'
+
+
+def _render_critic_html(report: MissionReport) -> str:
+    critic = _latest_critic(report)
+    if not critic:
+        return '<p class="empty">No critic review yet.</p>'
+    tone = _verdict_tone(critic.recommendation)
+    findings = ""
+    if critic.blocking_findings:
+        findings = _hl_list_block("Blocking findings", critic.blocking_findings)
+    elif critic.recommendation == "PASS":
+        findings = (
+            '<div class="hl-block"><h3>Blocking findings</h3>'
+            '<ul><li class="empty">none</li></ul></div>'
+        )
+    return (
+        f'<article class="hl-card {tone}">'
+        f'<div class="hl-head">'
+        f'<div class="hl-title">Critic · {_esc(critic.status_label)}</div>'
+        f'<div class="hl-meta">{_esc(critic.engine)} · ${critic.cost_usd:.2f}'
+        f' · {critic.wall_seconds:.0f}s</div>'
+        f"</div>"
+        + (f'<div class="hl-headline">{_esc(critic.headline)}</div>'
+           if critic.headline else "")
+        + findings
+        + "</article>"
+    )
+
+
+def _render_shipped_html(report: MissionReport) -> str:
+    shipped = _shipped_artifacts(report.highlights)
+    if not shipped:
+        return '<p class="empty">No primary artifacts recorded.</p>'
+    items = "".join(
+        f"<li><code>{_esc(path)}</code></li>" for path in shipped
+    )
+    return f'<ul class="ship-list">{items}</ul>'
+
+
+def _render_evidence_gallery_html(report: MissionReport) -> str:
+    paths = _collect_evidence_images(report.highlights)
+    if not paths:
+        return '<p class="empty">No screenshots or visual proof attached.</p>'
+    cards: List[str] = []
+    for path in paths:
+        resolved = _resolve_evidence_path(report.project, path)
+        uri = _image_data_uri(resolved) if resolved else ""
+        caption = _evidence_caption(path)
+        short = _short_path(path)
+        if uri:
+            img = (
+                f'<img src="{uri}" alt="{_esc(caption)}" loading="lazy">'
+            )
+        else:
+            img = (
+                f'<div class="hl-summary" style="padding:24px 12px;text-align:center">'
+                f'Missing file<br><code>{_esc(short)}</code></div>'
+            )
+        cards.append(
+            f'<figure class="evidence-card">{img}'
+            f'<figcaption><span class="cap">{_esc(caption)}</span>'
+            f'<span class="path">{_esc(short)}</span></figcaption></figure>'
+        )
+    return f'<div class="evidence-grid">{"".join(cards)}</div>'
+
+
+def _render_outcome_strip_html(report: MissionReport) -> str:
+    critic = _latest_critic(report)
+    verdict = (critic.recommendation if critic else "") or "—"
+    tone = _verdict_tone(verdict) if critic else report.status_tone
+    tokens = _fmt_tokens(report.tokens_total)
+    spend_sub = f"of ${report.max_cost_usd:.2f}"
+    if tokens:
+        spend_sub = f"{tokens} · {spend_sub}"
+    return (
+        '<div class="outcome-strip">'
+        f'<div class="card outcome-main {report.status_tone}">'
+        '<div class="label">Outcome</div>'
+        f'<div class="value">{_esc(report.status_label)}</div>'
+        f'<div class="lead">{_esc(_outcome_line(report))}</div>'
+        f'<div class="stat-row" style="margin-top:10px">'
+        f'<span class="stat-pill {tone}">Critic {_esc(verdict)}</span>'
+        + (f'<span class="stat-pill ok">Gate: {_esc(report.human_decision)}</span>'
+           if report.human_decision else "")
+        + "</div></div>"
+        '<div class="card">'
+        '<div class="label">Iterations</div>'
+        f'<div class="value">{report.iteration}'
+        f'<span style="color:var(--muted);font-size:1rem"> / '
+        f'{report.max_iterations or "—"}</span></div>'
+        f'{_bar_html(report.iteration, report.max_iterations)}'
+        "</div>"
+        '<div class="card">'
+        '<div class="label">Spend</div>'
+        f'<div class="value">${report.cost_usd:.2f}</div>'
+        f'<div class="sub">{_esc(spend_sub)}</div>'
+        f'{_bar_html(report.cost_usd, report.max_cost_usd)}'
+        "</div>"
+        '<div class="card">'
+        '<div class="label">Delivery</div>'
+        f'<div class="value" style="font-size:1.15rem">{_esc(report.delivery_mode)}</div>'
+        f'<div class="sub">{_esc(report.delivery_detail)}</div>'
+        "</div></div>"
+    )
 
 
 def _render_files_html(paths: Sequence[str]) -> str:
@@ -1906,44 +2321,32 @@ def _render_skills_html(skills: Sequence[SkillEntry]) -> str:
 
 
 def render_html(report: MissionReport) -> str:
-    tokens = _fmt_tokens(report.tokens_total)
     gen = time.strftime("%Y-%m-%d %H:%M", time.localtime(report.generated_at))
     title = f"{BRAND_NAME} Report · {report.mission_id}"
-
-    chips: List[str] = [
-        f'<span class="chip {report.status_tone}">{_esc(report.status_label)}</span>',
-        f'<span class="chip">{_esc(report.engine)}</span>',
-        f'<span class="chip">{_esc(report.delivery_mode)}</span>',
-    ]
-    if report.integrity_ok is True:
-        chips.append('<span class="chip ok">Integrity ✓</span>')
-    elif report.integrity_ok is False:
-        chips.append('<span class="chip err">Integrity ✗</span>')
-    if report.human_decision:
-        chips.append(f'<span class="chip">{_esc("Gate: " + report.human_decision)}</span>')
-    if report.agent_runs:
-        chips.append(f'<span class="chip accent">{report.agent_runs} agent runs</span>')
-
-    timeline_html = _render_arc_html(report)
-    highlights_html = _render_highlights_html(report)
-    files_html = _render_files_html(report.changed_files)
-    skills_html = _render_skills_html(report.skills)
-    pulse_html = _render_mission_pulse_html(report)
-    donut_html = _render_budget_donut_html(report)
-    outcome_html = _render_outcome_donut_html(report)
-    heatmap_html = _render_run_heatmap_html(report)
-    iter_bars_html = _render_iteration_bars_html(report)
-
     stop = f" · {_esc(report.stop_reason)}" if report.stop_reason else ""
-    spend_sub = f"of ${_esc(f'{report.max_cost_usd:.2f}')}"
-    if tokens:
-        spend_sub = f"{_esc(tokens)} · {spend_sub}"
+    objective = _truncate_objective(report.objective or "No objective recorded.")
 
-    latest_verdict = ""
-    for hl in reversed(report.highlights):
-        if hl.role == "critic" and hl.recommendation:
-            latest_verdict = hl.recommendation.upper()
-            break
+    outcome_html = _render_outcome_strip_html(report)
+    shipped_html = _render_shipped_html(report)
+    evidence_html = _render_evidence_gallery_html(report)
+    builder_html = _render_builder_nuggets_html(report)
+    critic_html = _render_critic_html(report)
+    skills_html = _render_skills_html(report.skills)
+    timeline_html = _render_arc_html(report)
+    files_html = _render_files_html(report.changed_files)
+    donut_html = _render_budget_donut_html(report)
+    outcome_donut_html = _render_outcome_donut_html(report)
+    iter_bars_html = _render_iteration_bars_html(report)
+    wall_card = ""
+    if report.max_wall_seconds or report.wall_seconds:
+        wall_card = (
+            '<div class="card">'
+            '<div class="label">Agent wall</div>'
+            f'<div class="value">{report.wall_seconds:.0f}s</div>'
+            f'<div class="sub">budget {report.max_wall_seconds:.0f}s</div>'
+            f'{_bar_html(report.wall_seconds, report.max_wall_seconds)}'
+            "</div>"
+        )
 
     body = f"""
 <div class="wrap">
@@ -1957,70 +2360,67 @@ def render_html(report: MissionReport) -> str:
       <code>{_esc(report.mission_id)}</code> · loop <code>{_esc(report.loop_id)}</code>
       · {_esc(gen)}{stop}
     </div>
-    <div class="objective">{_esc(report.objective or "No objective recorded.")}</div>
+    <div class="objective">{_esc(objective)}</div>
   </header>
 
-  <div class="metrics-block">
-    <div class="grid">
-      <div class="card">
-        <div class="label">Iterations</div>
-        <div class="value">{report.iteration}<span style="color:var(--muted);font-size:1rem"> / {report.max_iterations or "—"}</span></div>
-        {_bar_html(report.iteration, report.max_iterations)}
-      </div>
-      <div class="card">
-        <div class="label">Spend</div>
-        <div class="value">${report.cost_usd:.2f}</div>
-        <div class="sub">{spend_sub}</div>
-        {_bar_html(report.cost_usd, report.max_cost_usd)}
-      </div>
-      <div class="card">
-        <div class="label">Agent wall</div>
-        <div class="value">{report.wall_seconds:.0f}s</div>
-        <div class="sub">budget {report.max_wall_seconds:.0f}s</div>
-        {_bar_html(report.wall_seconds, report.max_wall_seconds)}
-      </div>
-      <div class="card">
-        <div class="label">Delivery</div>
-        <div class="value" style="font-size:1.15rem">{_esc(report.delivery_mode)}</div>
-        <div class="sub">{_esc(report.delivery_detail)}</div>
-        {f'<div class="sub" style="margin-top:8px">critic <strong style="color:var(--ink)">{_esc(latest_verdict)}</strong></div>' if latest_verdict else ""}
-      </div>
-    </div>
-    {pulse_html}
-    <div class="viz-grid">
-      {donut_html}
-      {outcome_html}
-    </div>
-    <div class="viz-grid">
-      {iter_bars_html}
-      {heatmap_html}
-    </div>
-  </div>
+  {outcome_html}
 
   <section class="section">
-    <h2>Snapshot</h2>
-    <div class="chips">{"".join(chips)}</div>
-    <div class="kv" style="margin-top:14px">
-      <div class="row"><div class="k">Engine</div><div class="v">{_esc(report.engine)}</div></div>
-      <div class="row"><div class="k">Status</div><div class="v">{_esc(report.status)}{_esc(" (" + report.stop_reason + ")" if report.stop_reason else "")}</div></div>
-      <div class="row"><div class="k">Project</div><div class="v">{_esc(str(report.project))}</div></div>
-    </div>
+    <h2>What shipped</h2>
+    {shipped_html}
   </section>
 
   <section class="section">
-    <h2>Run arc</h2>
-    {timeline_html}
+    <h2>Evidence</h2>
+    {evidence_html}
   </section>
 
   <section class="section">
-    <h2>Builder highlights</h2>
-    {highlights_html}
+    <h2>Builder work</h2>
+    {builder_html}
   </section>
 
   <section class="section">
-    <h2>Changed files</h2>
-    {files_html}
+    <h2>Critic</h2>
+    {critic_html}
   </section>
+
+  <details class="ops-details">
+    <summary>Mission ops</summary>
+    <div class="ops-body">
+      <div class="metrics-block">
+        <div class="grid">
+          <div class="card">
+            <div class="label">Iterations</div>
+            <div class="value">{report.iteration}<span style="color:var(--muted);font-size:1rem"> / {report.max_iterations or "—"}</span></div>
+            {_bar_html(report.iteration, report.max_iterations)}
+          </div>
+          <div class="card">
+            <div class="label">Spend</div>
+            <div class="value">${report.cost_usd:.2f}</div>
+            {_bar_html(report.cost_usd, report.max_cost_usd)}
+          </div>
+          {wall_card}
+          <div class="card">
+            <div class="label">Agent runs</div>
+            <div class="value">{report.agent_runs}</div>
+            <div class="sub">engine {_esc(report.engine)}</div>
+          </div>
+        </div>
+        <div class="viz-grid">
+          {donut_html}
+          {outcome_donut_html}
+        </div>
+        <div class="viz-grid">
+          {iter_bars_html}
+        </div>
+      </div>
+      <h2 style="margin:8px 0 14px;font-size:13px;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);font-weight:700">Run arc</h2>
+      {timeline_html}
+      <h2 style="margin:18px 0 14px;font-size:13px;text-transform:uppercase;letter-spacing:0.1em;color:var(--muted);font-weight:700">Changed files</h2>
+      {files_html}
+    </div>
+  </details>
 
   <section class="section">
     <h2>Skills</h2>
@@ -2075,31 +2475,36 @@ def render_terminal(report: MissionReport, *, color: bool = True) -> str:
         f"{c['cyan']}{'─' * w}{c['reset']}",
     ]
     if report.objective:
-        lines.append(f" {report.objective[: w - 2]}")
+        lines.append(f" {_truncate_objective(report.objective, max_len=w - 2)}")
         lines.append(f"{c['cyan']}{'─' * w}{c['reset']}")
     tokens = _fmt_tokens(report.tokens_total)
+    critic = _latest_critic(report)
+    verdict = (critic.recommendation if critic else "") or "—"
+    shipped = _shipped_artifacts(report.highlights, limit=4)
+    evidence = _collect_evidence_images(report.highlights, limit=4)
     lines += [
+        f" outcome     {_outcome_line(report)[: w - 14]}",
+        f" critic      {verdict}",
         f" iterations  {report.iteration}/{report.max_iterations or '—'}  "
         f"{_bar_md(report.iteration, report.max_iterations).replace('`', '')}",
         f" spend       ${report.cost_usd:.2f}"
         + (f" ({tokens})" if tokens else "")
-        + f" / ${report.max_cost_usd:.2f}  "
-        + _bar_md(report.cost_usd, report.max_cost_usd).replace("`", ""),
+        + f" / ${report.max_cost_usd:.2f}",
         f" delivery    {report.delivery_mode} → {report.delivery_detail}",
-        f" engine      {report.engine}",
         f"{c['cyan']}{'─' * w}{c['reset']}",
-        f"{c['bold']} run arc{c['reset']}",
+        f"{c['bold']} shipped{c['reset']}",
     ]
-    if not report.timeline:
-        lines.append(" (no ledger yet)")
+    if shipped:
+        for path in shipped:
+            lines.append(f"  · {_short_path(path)}")
     else:
-        for item in report.timeline[-12:]:
-            mark = {"ok": "✓", "warn": "!", "err": "✗", "accent": "◆"}.get(item.tone, "·")
-            parts = [ln.strip() for ln in item.detail.split("\n") if ln.strip()]
-            # Prefer the headline line when present; else the metrics line.
-            detail = parts[1] if len(parts) > 1 else (parts[0] if parts else "")
-            lines.append(f"  {_ts_md(item.ts)[5:]}  {mark} {item.title}"
-                         + (f" — {detail[:56]}" if detail else ""))
+        lines.append("  (none)")
+    lines.append(f"{c['bold']} evidence{c['reset']}")
+    if evidence:
+        for path in evidence:
+            lines.append(f"  · {_evidence_caption(path)}")
+    else:
+        lines.append("  (none)")
     lines += [
         f"{c['cyan']}{'─' * w}{c['reset']}",
         f" next: {report.next_step}",

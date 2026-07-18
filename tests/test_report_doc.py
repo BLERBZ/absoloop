@@ -1,6 +1,7 @@
 """Tests for AbsoLoop mission report Markdown + lite HTML viewer."""
 from __future__ import annotations
 
+import base64
 import json
 import tempfile
 import unittest
@@ -13,12 +14,19 @@ import sys
 sys.path.insert(0, str(REPO))
 from absoloop_harness import report_doc  # noqa: E402
 
+# 1x1 PNG
+_TINY_PNG = base64.standard_b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
-def _seed_mission(root: Path) -> None:
+
+def _seed_mission(root: Path) -> Path:
     abs_dir = root / ".absoloop"
     abs_dir.mkdir(parents=True)
     tmp = abs_dir / "tmp"
     tmp.mkdir(parents=True)
+    evidence_png = root / "qa-frame.png"
+    evidence_png.write_bytes(_TINY_PNG)
     (abs_dir / "runtime.json").write_text(json.dumps({
         "mission_id": "m-test",
         "loop_id": "loop-abc",
@@ -55,9 +63,14 @@ def _seed_mission(root: Path) -> None:
         "structured_output": {
             "done": True,
             "summary": "Hardened empty-input path; tests green.",
-            "changed_artifacts": ["parser.py", "tests/test_parser.py"],
+            "changed_artifacts": [
+                "parser.py",
+                "tests/test_parser.py",
+                "qa-frame.png",
+            ],
             "commands_run": ["pytest tests/test_parser.py -q (8 passed)"],
             "risks": ["No integration coverage for streaming input."],
+            "evidence": ["qa-frame.png"],
         },
     }), encoding="utf-8")
     (tmp / "iteration-0002-critic.json").write_text(json.dumps({
@@ -88,6 +101,7 @@ def _seed_mission(root: Path) -> None:
     ]
     (abs_dir / "ledger.jsonl").write_text(
         "\n".join(json.dumps(e) for e in ledger) + "\n", encoding="utf-8")
+    return evidence_png
 
 
 class ReportDocTests(unittest.TestCase):
@@ -106,6 +120,7 @@ class ReportDocTests(unittest.TestCase):
             roles = [h.role for h in report.highlights]
             self.assertEqual(roles, ["builder", "builder", "critic"])
             self.assertEqual(report.highlights[1].done, True)
+            self.assertEqual(report.highlights[1].evidence, ["qa-frame.png"])
             self.assertEqual(report.highlights[2].recommendation, "PASS")
             titles = [t.title for t in report.timeline]
             self.assertTrue(any("Builder" in t and "Iteration 1" in t for t in titles))
@@ -114,18 +129,25 @@ class ReportDocTests(unittest.TestCase):
             self.assertFalse(any(t == "Iteration 1" for t in titles))
             md = report_doc.render_markdown(report)
             self.assertIn("# AbsoLoop Report", md)
-            self.assertIn("At a glance", md)
-            self.assertIn("Run arc", md)
-            self.assertIn("## Builder highlights", md)
-            self.assertIn("## Skills", md)
+            self.assertIn("## Outcome", md)
+            self.assertIn("## What shipped", md)
+            self.assertIn("## Evidence", md)
+            self.assertIn("## Builder work", md)
+            self.assertIn("## Critic", md)
+            self.assertIn("## Mission ops", md)
+            self.assertIn("qa-frame.png", md)
             self.assertIn("Make the parser stop crashing", md)
             self.assertIn("Hardened empty-input path", md)
-            self.assertIn("Verified commands", md)
-            self.assertIn("pytest tests/test_parser.py", md)
+            self.assertIn("parser.py", md)
             self.assertIn("Verdict", md)
             self.assertIn("absoloop approve", md)
+            # Full procedural summary wall should not dump iter-1 prose body.
+            self.assertNotIn("Tests still failing on nested blanks.", md)
+            self.assertNotIn("## Builder highlights", md)
+            self.assertNotIn("## At a glance", md)
+            self.assertNotIn("## Pointers", md)
 
-    def test_html_viewer_contains_infographic_pieces(self):
+    def test_html_viewer_results_first(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             _seed_mission(root)
@@ -138,27 +160,31 @@ class ReportDocTests(unittest.TestCase):
             self.assertIn("Needs review", page)
             self.assertNotIn("status-pill", page)
             self.assertNotIn("mission report", page.lower())
-            self.assertIn("Run arc", page)
-            self.assertIn("Builder highlights", page)
+            self.assertIn("What shipped", page)
+            self.assertIn("Evidence", page)
+            self.assertIn("Builder work", page)
+            self.assertIn("Mission ops", page)
+            self.assertIn("ops-details", page)
+            self.assertIn("evidence-grid", page)
             self.assertIn("hl-card", page)
             self.assertIn("Skills", page)
             self.assertIn("class=\"bar\"", page)
             self.assertIn("donut-svg", page)
             self.assertIn("Budget mix", page)
             self.assertIn("Outcomes", page)
-            self.assertIn("heatmap", page)
             self.assertIn("Iteration spend", page)
-            self.assertIn("summary-grid", page)
-            self.assertIn(">Tasks<", page)
-            self.assertIn(">Decisions<", page)
-            self.assertIn(">Results<", page)
-            self.assertNotIn("treemap", page)
+            self.assertNotIn("Run heatmap", page)
+            self.assertNotIn('class="heatmap"', page)
+            self.assertNotIn(">Tasks<", page)
             self.assertIn("Hardened empty-input path", page)
             self.assertIn("AbsoLoop", page)
             self.assertIn('class="brand-logo"', page)
             self.assertIn("brand-name", page)
             self.assertIn("data:image/png;base64,", page)
+            self.assertIn("data:image/jpeg;base64,", page)
             self.assertNotIn("<strong>Absoloop</strong>", page)
+            # Full summary body should not appear on builder cards.
+            self.assertNotIn("Tests still failing on nested blanks.", page)
 
     def test_skills_split_from_changed_files(self):
         files, skills = report_doc._split_files_and_skills([
@@ -175,6 +201,20 @@ class ReportDocTests(unittest.TestCase):
         tdd = next(s for s in skills if s.name == "tdd")
         self.assertEqual(sorted(tdd.engines), ["claude", "codex"])
 
+    def test_artifact_first_changed_files_when_git_noisy(self):
+        highlights = [
+            report_doc.AgentHighlight(
+                ts=1, role="builder", iteration=1, engine="claude",
+                headline="x", summary="x", status_label="Done claimed", tone="ok",
+                artifacts=["out/video.mp4", "out/q-intro.png"],
+                evidence=["out/q-intro.png"],
+            )
+        ]
+        noisy = [f"home-file-{i}.txt" for i in range(50)]
+        selected = report_doc._select_changed_files(noisy, highlights)
+        self.assertIn("out/video.mp4", selected)
+        self.assertNotIn("home-file-0.txt", selected)
+
     def test_write_report_docs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -184,12 +224,15 @@ class ReportDocTests(unittest.TestCase):
             assert written is not None
             self.assertTrue(written.markdown_path.is_file())
             self.assertTrue(written.html_path.is_file())
-            self.assertIn("AbsoLoop Report", written.markdown_path.read_text(encoding="utf-8"))
+            md = written.markdown_path.read_text(encoding="utf-8")
+            self.assertIn("AbsoLoop Report", md)
+            self.assertIn("## Outcome", md)
             html = written.html_path.read_text(encoding="utf-8")
             self.assertIn("AbsoLoop", html)
             self.assertIn("data:image/png;base64,", html)
             self.assertIn("report.md", html)
             self.assertIn("hl-card", html)
+            self.assertIn("evidence-grid", html)
 
     def test_write_md_only_skips_html(self):
         with tempfile.TemporaryDirectory() as tmp:

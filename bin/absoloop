@@ -120,6 +120,11 @@ RESULT_SCHEMA = {
         "changed_artifacts": {"type": "array", "items": {"type": "string"}},
         "commands_run": {"type": "array", "items": {"type": "string"}},
         "risks": {"type": "array", "items": {"type": "string"}},
+        "evidence": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Screenshot or proof file paths (images preferred)",
+        },
     },
     "required": ["done", "summary", "changed_artifacts", "risks"],
 }
