@@ -1405,14 +1405,19 @@ def extend_mission(target: pathlib.Path, state: dict, engine: str,
         summary = agent_summary(target, str(state["latest_agent_result"]))
 
     # Archive the finished run's records; the ledger stays in place so the
-    # timeline remains continuous across runs.
+    # timeline remains continuous across runs. Clear live report artifacts so
+    # the next Report regenerates Evidence and peers for the new loop only.
     archive = abs_dir / "runs" / prev_loop_id
     archive.mkdir(parents=True, exist_ok=True)
-    for name in ("state.json", "report.md", "goal.md"):
+    for name in ("state.json", "report.md", "report.html", "goal.md"):
         source = abs_dir / name
         if source.is_file():
             shutil.copy2(source, archive / name)
     (abs_dir / "state.json").unlink()
+    for name in ("report.md", "report.html"):
+        stale = abs_dir / name
+        if stale.is_file():
+            stale.unlink()
 
     new_id = new_loop_id()
     runtime["loop_id"] = new_id
@@ -1573,12 +1578,12 @@ def prepare_previous_run(target: pathlib.Path, run: dict) -> dict | None:
             and (abs_dir / "state.json").is_file():
         keep = abs_dir / "runs" / current_id
         keep.mkdir(parents=True, exist_ok=True)
-        for name in ("state.json", "report.md", "goal.md"):
+        for name in ("state.json", "report.md", "report.html", "goal.md"):
             source = abs_dir / name
             if source.is_file():
                 shutil.copy2(source, keep / name)
 
-    for name in ("state.json", "report.md", "goal.md"):
+    for name in ("state.json", "report.md", "report.html", "goal.md"):
         source = archive / name
         if source.is_file():
             shutil.copy2(source, abs_dir / name)

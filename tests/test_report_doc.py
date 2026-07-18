@@ -259,6 +259,124 @@ class ReportDocTests(unittest.TestCase):
             code = cli.report_command(["-C", tmp, "--no-open"])
             self.assertEqual(code, 1)
 
+    def test_results_sections_refresh_after_extension(self):
+        """Evidence / shipped / builder / critic must reflect the current run only."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            abs_dir = root / ".absoloop"
+            abs_dir.mkdir(parents=True)
+            tmp_dir = abs_dir / "tmp"
+            tmp_dir.mkdir()
+            old_png = root / "old-frame.png"
+            new_png = root / "new-frame.png"
+            old_png.write_bytes(_TINY_PNG)
+            new_png.write_bytes(_TINY_PNG)
+            (abs_dir / "runtime.json").write_text(json.dumps({
+                "mission_id": "m-extend",
+                "loop_id": "loop-new",
+                "objective": "Refresh report evidence after extend",
+                "engine": "claude",
+                "max_iterations": 5,
+                "max_cost_usd": 10.0,
+                "max_wall_seconds": 600,
+                "delivery": {"mode": "local"},
+            }, indent=2) + "\n", encoding="utf-8")
+            (abs_dir / "state.json").write_text(json.dumps({
+                "mission_id": "m-extend",
+                "status": "AWAITING_APPROVAL",
+                "stop_reason": "builder done + critic PASS",
+                "iteration": 1,
+                "cost_usd": 0.5,
+                "latest_agent_result": ".absoloop/tmp/iteration-0001-agent-result.json",
+                "latest_critic_findings": ".absoloop/tmp/iteration-0001-critic.json",
+            }, indent=2) + "\n", encoding="utf-8")
+            (tmp_dir / "prior-loop-agent-result.json").write_text(json.dumps({
+                "structured_output": {
+                    "done": True,
+                    "summary": "Prior-run work that must not appear in results.",
+                    "changed_artifacts": ["legacy/shipped.py", "old-frame.png"],
+                    "commands_run": ["pytest -q"],
+                    "evidence": ["old-frame.png"],
+                },
+            }), encoding="utf-8")
+            (tmp_dir / "prior-loop-critic.json").write_text(json.dumps({
+                "structured_output": {
+                    "recommendation": "PASS",
+                    "blocking_findings": ["stale prior finding"],
+                    "summary": "Prior critic must not win.",
+                },
+            }), encoding="utf-8")
+            (tmp_dir / "iteration-0001-agent-result.json").write_text(json.dumps({
+                "structured_output": {
+                    "done": True,
+                    "summary": "Current-run deliverable with fresh evidence.",
+                    "changed_artifacts": ["fresh/shipped.py", "new-frame.png"],
+                    "commands_run": ["pytest tests/test_fresh.py -q"],
+                    "evidence": ["new-frame.png"],
+                },
+            }), encoding="utf-8")
+            (tmp_dir / "iteration-0001-critic.json").write_text(json.dumps({
+                "structured_output": {
+                    "recommendation": "PASS",
+                    "blocking_findings": [],
+                    "summary": "Current critic accepts the new evidence.",
+                },
+            }), encoding="utf-8")
+            ledger = [
+                {"type": "agent_run", "ts": 1700000000, "engine": "claude",
+                 "exit_code": 0, "cost_usd": 0.9, "wall_seconds": 30,
+                 "result": ".absoloop/tmp/prior-loop-agent-result.json"},
+                {"type": "agent_run", "ts": 1700000100, "engine": "claude",
+                 "exit_code": 0, "cost_usd": 0.2, "wall_seconds": 10,
+                 "result": ".absoloop/tmp/prior-loop-critic.json"},
+                {"type": "mission_stop", "ts": 1700000200,
+                 "status": "COMPLETED", "reason": "approved"},
+                {"type": "extension", "ts": 1700000300,
+                 "previous_loop_id": "loop-old", "loop_id": "loop-new",
+                 "note": "refresh evidence"},
+                {"type": "agent_run", "ts": 1700000400, "engine": "claude",
+                 "exit_code": 0, "cost_usd": 0.4, "wall_seconds": 20,
+                 "result": ".absoloop/tmp/iteration-0001-agent-result.json"},
+                {"type": "agent_run", "ts": 1700000500, "engine": "claude",
+                 "exit_code": 0, "cost_usd": 0.1, "wall_seconds": 8,
+                 "result": ".absoloop/tmp/iteration-0001-critic.json"},
+            ]
+            (abs_dir / "ledger.jsonl").write_text(
+                "\n".join(json.dumps(e) for e in ledger) + "\n", encoding="utf-8")
+
+            report = report_doc.collect_report(root)
+            assert report is not None
+            evidence = report_doc._collect_evidence_images(report.highlights)
+            shipped = report_doc._shipped_artifacts(report.highlights)
+            self.assertEqual(evidence, ["new-frame.png"])
+            self.assertNotIn("old-frame.png", evidence)
+            self.assertEqual(shipped, ["fresh/shipped.py"])
+            self.assertNotIn("legacy/shipped.py", shipped)
+            self.assertEqual(len(report.highlights), 2)
+            self.assertTrue(all(
+                "prior" not in (h.result_path or "") for h in report.highlights
+            ))
+            critic = report_doc._latest_critic(report)
+            assert critic is not None
+            self.assertEqual(critic.blocking_findings, [])
+            self.assertIn("Current critic", critic.summary)
+
+            md = report_doc.render_markdown(report)
+            results_md = md.split("## Mission ops", 1)[0]
+            self.assertIn("new-frame.png", results_md)
+            self.assertNotIn("old-frame.png", results_md)
+            self.assertIn("fresh/shipped.py", results_md)
+            self.assertNotIn("legacy/shipped.py", results_md)
+            self.assertIn("Current-run deliverable", results_md)
+            self.assertNotIn("Prior-run work that must not appear", results_md)
+            self.assertNotIn("stale prior finding", results_md)
+            # Full mission arc under Mission ops may retain prior history.
+            self.assertIn("Mission extended", md)
+
+            html = report_doc.render_html(report)
+            self.assertIn("new-frame.png", html)
+            self.assertNotIn("old-frame.png", html)
+
 
 if __name__ == "__main__":
     unittest.main()

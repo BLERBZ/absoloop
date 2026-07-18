@@ -599,6 +599,20 @@ def _metrics_line(
     return " · ".join(parts)
 
 
+def _current_run_start_ts(events: Sequence[dict]) -> float:
+    """Timestamp of the latest mission extension; 0.0 when this is the first run.
+
+    Results sections (Evidence, What shipped, Builder work, Critic) must refresh
+    per run. The ledger is append-only across `--extend`, so anything at or
+    before this boundary belongs to prior runs.
+    """
+    start = 0.0
+    for event in events:
+        if event.get("type") == "extension":
+            start = float(event.get("ts") or 0)
+    return start
+
+
 def _timeline_from_ledger(
     target: pathlib.Path,
 ) -> Tuple[List[TimelineItem], List[AgentHighlight], dict]:
@@ -613,14 +627,21 @@ def _timeline_from_ledger(
         "builder_iters": set(),
     }
 
-    for event in _iter_ledger(target):
+    events = list(_iter_ledger(target))
+    run_start = _current_run_start_ts(events)
+    # Collapse noisy iteration markers across the full ledger, even though
+    # result highlights are scoped to the current run.
+    seen_builder_iters: set = set()
+
+    for event in events:
         ts = float(event.get("ts") or 0)
         kind = event.get("type")
+        # Full mission arc stays continuous; result highlights/stats are
+        # scoped to the active run so Evidence and peers refresh each loop.
+        in_current_run = ts > run_start
 
         if kind == "agent_run":
-            stats["agent_runs"] += 1
             wall = float(event.get("wall_seconds") or 0)
-            stats["wall_seconds"] += wall
             cost = float(event.get("cost_usd") or 0)
             cost_exact = bool(event.get("cost_is_exact", True))
             tokens_label = _fmt_tokens(event.get("tokens"))
@@ -640,7 +661,9 @@ def _timeline_from_ledger(
                     errors=str(structured.get("errors") or ""),
                 )
                 if iteration is not None:
-                    stats["builder_iters"].add(iteration)
+                    seen_builder_iters.add(iteration)
+                    if in_current_run:
+                        stats["builder_iters"].add(iteration)
             else:
                 status_label, tone = _critic_status(
                     str(structured.get("recommendation") or ""), exit_code,
@@ -676,6 +699,11 @@ def _timeline_from_ledger(
                 ts, role, title, "\n".join(detail_bits), tone, meta,
             ))
 
+            if not in_current_run:
+                continue
+
+            stats["agent_runs"] += 1
+            stats["wall_seconds"] += wall
             highlight = AgentHighlight(
                 ts=ts,
                 role=role,
@@ -709,7 +737,7 @@ def _timeline_from_ledger(
             # a compact done marker when we somehow lack that run.
             iteration = event.get("iteration")
             done = bool(event.get("done"))
-            if iteration in stats["builder_iters"]:
+            if iteration in seen_builder_iters:
                 continue
             items.append(TimelineItem(
                 ts, kind,
@@ -721,7 +749,7 @@ def _timeline_from_ledger(
         elif kind == "bounded_agent_failure":
             # Duplicate of agent_run failure signals — skip unless isolated.
             iteration = event.get("iteration")
-            if iteration in stats["builder_iters"]:
+            if iteration in seen_builder_iters:
                 continue
             limit = event.get("limit_reached") or f"exit {event.get('exit_code')}"
             items.append(TimelineItem(
@@ -740,10 +768,11 @@ def _timeline_from_ledger(
 
         elif kind == "integrity_check":
             ok = event.get("exit_code") == 0
-            if not ok:
-                stats["integrity_ok"] = False
-            elif stats["integrity_ok"] is None:
-                stats["integrity_ok"] = True
+            if in_current_run:
+                if not ok:
+                    stats["integrity_ok"] = False
+                elif stats["integrity_ok"] is None:
+                    stats["integrity_ok"] = True
             items.append(TimelineItem(
                 ts, kind, "Integrity check",
                 "Passed" if ok else "Violation",
@@ -752,7 +781,8 @@ def _timeline_from_ledger(
 
         elif kind == "human_gate":
             decision = str(event.get("decision") or "")
-            stats["human_decision"] = decision
+            if in_current_run:
+                stats["human_decision"] = decision
             note = event.get("feedback") or event.get("note") or ""
             tone = "ok" if decision.lower() in ("approve", "approved") else "warn"
             items.append(TimelineItem(
