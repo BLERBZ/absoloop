@@ -96,9 +96,9 @@ class Briefing:
     engine: str
     kinds: List[str]
     model: str = ""                      # engine model id / alias
-    max_iterations: int = 20
-    max_cost_usd: float = 25.0
-    max_wall_hours: float = 2.0
+    max_iterations: int = 50
+    max_cost_usd: float = 50.0
+    max_wall_hours: float = 3.0
     engines_available: Tuple[str, ...] = ()
 
 
