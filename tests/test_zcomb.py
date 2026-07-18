@@ -297,5 +297,45 @@ class CliDispatchTests(unittest.TestCase):
                 (project / ".absoloop" / "zcomb" / "state" / "tasks.json").is_file())
 
 
+class DashboardAttachTests(unittest.TestCase):
+    def test_ensure_dashboard_retargets_when_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            state_dir = project / ".absoloop" / "zcomb" / "state"
+            state_dir.mkdir(parents=True)
+            with mock.patch.object(zcomb, "_port_in_use", return_value=True), \
+                 mock.patch.object(zcomb, "retarget_dashboard",
+                                   return_value=True) as retarget, \
+                 mock.patch.object(zcomb, "stop_dashboard") as stop, \
+                 mock.patch.object(zcomb, "start_server") as start:
+                proc, status = zcomb.ensure_dashboard(project, state_dir, 3141)
+            self.assertIsNone(proc)
+            self.assertEqual(status, "retargeted")
+            retarget.assert_called_once()
+            stop.assert_not_called()
+            start.assert_not_called()
+
+    def test_ensure_dashboard_restarts_stale_pre_retarget_server(self):
+        """Health-up but no /api/retarget → replace the process."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            state_dir = project / ".absoloop" / "zcomb" / "state"
+            state_dir.mkdir(parents=True)
+            fake = mock.Mock()
+            with mock.patch.object(zcomb, "_port_in_use", return_value=True), \
+                 mock.patch.object(zcomb, "retarget_dashboard",
+                                   return_value=False), \
+                 mock.patch.object(zcomb, "stop_dashboard",
+                                   return_value=True) as stop, \
+                 mock.patch.object(zcomb, "start_server",
+                                   return_value=fake) as start, \
+                 mock.patch.object(zcomb, "wait_ready", return_value=True):
+                proc, status = zcomb.ensure_dashboard(project, state_dir, 3141)
+            self.assertIs(proc, fake)
+            self.assertEqual(status, "restarted")
+            stop.assert_called_once_with(3141)
+            start.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()

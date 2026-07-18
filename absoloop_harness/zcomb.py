@@ -16,6 +16,7 @@ import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -365,7 +366,7 @@ def _pipeline_status(name: str, live: bool, status: str, phase: str,
     """Map Absoloop lifecycle → Kanban column for a named pipeline task."""
     status = (status or "").upper()
     phase = (phase or "").lower()
-    terminal_fail = status in ("BLOCKED", "BUDGET_EXHAUSTED", "REJECTED")
+    terminal_fail = status in ("BLOCKED", "BUDGET_EXHAUSTED", "REJECTED", "STOPPED")
     terminal_done = status == "COMPLETED"
 
     order = ["scaffold", "execute", "integrity", "critic", "gate", "deliver"]
@@ -816,6 +817,51 @@ def _port_in_use(port: int) -> bool:
         return False
 
 
+def _pids_listening_on(port: int) -> list[int]:
+    """PIDs with a TCP listen socket on `port` (best-effort via lsof)."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", f"-tiTCP:{port}", "-sTCP:LISTEN"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return []
+    pids: list[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if line.isdigit():
+            pids.append(int(line))
+    return pids
+
+
+def stop_dashboard(port: int = DEFAULT_PORT, *, timeout: float = 5.0) -> bool:
+    """Stop a ZComb dashboard listening on `port`. Returns True when free."""
+    if not _port_in_use(port):
+        return True
+    pids = _pids_listening_on(port)
+    if not pids:
+        return False
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            return False
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _port_in_use(port):
+            return True
+        time.sleep(0.1)
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+    return not _port_in_use(port)
+
+
 def retarget_dashboard(project: pathlib.Path, port: int = DEFAULT_PORT,
                        state_dir: Optional[pathlib.Path] = None) -> bool:
     """Ask a running ZComb server to point at a new project/state dir.
@@ -841,6 +887,35 @@ def retarget_dashboard(project: pathlib.Path, port: int = DEFAULT_PORT,
             return bool(body.get("ok"))
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return False
+
+
+def ensure_dashboard(project: pathlib.Path, state_dir: pathlib.Path,
+                     port: int = DEFAULT_PORT) -> tuple[Optional[subprocess.Popen], str]:
+    """Attach to a live dashboard or start/replace one for `project`.
+
+    Prefer HTTP retarget when the server supports it. If the listener is an
+    older build (no `/api/retarget`) or retarget fails, replace the process
+    so new runs do not stay stuck on stale state.
+
+    Returns `(proc_or_None, status)` where status is one of:
+    `started`, `retargeted`, `restarted`, `failed`.
+    """
+    if not _port_in_use(port):
+        proc = start_server(state_dir, port, project=project)
+        if wait_ready(port, timeout=20):
+            return proc, "started"
+        return proc, "failed"
+
+    if retarget_dashboard(project, port=port, state_dir=state_dir):
+        return None, "retargeted"
+
+    # Pre-retarget servers answer /api/health but 404 on /api/retarget.
+    if not stop_dashboard(port):
+        return None, "failed"
+    proc = start_server(state_dir, port, project=project)
+    if wait_ready(port, timeout=20):
+        return proc, "restarted"
+    return proc, "failed"
 
 
 def start_server(state_dir: pathlib.Path, port: int,
@@ -920,21 +995,15 @@ def spawn_background(project: pathlib.Path, *, port: int = DEFAULT_PORT,
         # Sync first so the UI's next poll sees awaiting-run / new objective
         # immediately (before the runner has written monitor.json).
         state_dir = sync_state(project)
-        proc: Optional[subprocess.Popen]
-        if not _port_in_use(port):
-            proc = start_server(state_dir, port, project=project)
-            if not wait_ready(port, timeout=20):
-                print(f"  warning: ZComb dashboard did not become ready on :{port}",
-                      file=sys.stderr)
-                return proc
-        else:
-            proc = None
-            if retarget_dashboard(project, port=port, state_dir=state_dir):
-                print(f"  ZComb UI retargeted → {project.name}")
-            else:
-                print("  warning: ZComb dashboard is up but could not retarget; "
-                      "refresh may stay on the previous project",
-                      file=sys.stderr)
+        proc, status = ensure_dashboard(project, state_dir, port)
+        if status == "failed":
+            print(f"  warning: ZComb dashboard did not become ready on :{port}",
+                  file=sys.stderr)
+            return proc
+        if status == "retargeted":
+            print(f"  ZComb UI retargeted → {project.name}")
+        elif status == "restarted":
+            print(f"  ZComb UI restarted → {project.name}")
         # Detached bridge keeps state files fresh while the mission runs.
         subprocess.Popen(
             [sys.executable, "-c",
@@ -1007,23 +1076,22 @@ def zcomb_command(argv: list[str]) -> int:
 
     port = args.port
     url = f"http://localhost:{port}"
-    proc: Optional[subprocess.Popen] = None
     if _port_in_use(port):
         print(f"  Dashboard already running at {url}")
-        if retarget_dashboard(project, port=port, state_dir=state_dir):
-            print(f"  Retargeted dashboard → {project}")
-        else:
-            print("  warning: could not retarget the running dashboard",
-                  file=sys.stderr)
     else:
         print(f"  Starting ZComb dashboard on {url} …")
-        proc = start_server(state_dir, port, project=project)
-        if not wait_ready(port):
-            print(f"error: dashboard failed to start (see "
-                  f"{state_dir.parent / 'dashboard.log'})", file=sys.stderr)
-            if proc and proc.poll() is None:
-                proc.terminate()
-            return 1
+    proc, status = ensure_dashboard(project, state_dir, port)
+    if status == "failed":
+        print(f"error: dashboard failed to start (see "
+              f"{state_dir.parent / 'dashboard.log'})", file=sys.stderr)
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        return 1
+    if status == "retargeted":
+        print(f"  Retargeted dashboard → {project}")
+    elif status == "restarted":
+        print(f"  Replaced stale dashboard → {project}")
+    else:
         print(f"  ✔ Dashboard ready at {url}")
 
     if not args.no_browser:
@@ -1055,6 +1123,8 @@ __all__ = [
     "zcomb_command",
     "spawn_background",
     "retarget_dashboard",
+    "ensure_dashboard",
+    "stop_dashboard",
     "ensure_dashboard_built",
     "DEFAULT_PORT",
 ]

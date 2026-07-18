@@ -73,6 +73,7 @@ examples:
   absoloop status · watch · report · goal
   absoloop resume · resume --extend
   absoloop approve · reject "guidance"
+  absoloop abort                           # stop a live loop (SIGTERM the runner)
   absoloop schedule add|list|tick|daemon   # cron / interval mission triggers
 
 Mission Briefing keys: Enter launch · o objective · e engine · d delivery
@@ -783,7 +784,87 @@ def next_step_hint(state: dict) -> str:
     if status == "BLOCKED":
         return ("inspect stop_reason and the latest logs, fix the cause (or "
                 "'absoloop reject \"guidance\"'), then 'absoloop resume'")
+    if status == "STOPPED":
+        return ("loop was aborted — 'absoloop resume' continues from the last "
+                "checkpoint, or 'absoloop reject \"guidance\"' first to steer")
     return "'absoloop resume' continues the loop from saved state"
+
+
+def _child_pids(pid: int) -> list[int]:
+    """Recursive child PIDs via pgrep -P (best-effort on macOS/Linux)."""
+    found: list[int] = []
+    try:
+        out = subprocess.check_output(
+            ["pgrep", "-P", str(pid)],
+            stderr=subprocess.DEVNULL, text=True)
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line.isdigit():
+            continue
+        child = int(line)
+        found.append(child)
+        found.extend(_child_pids(child))
+    return found
+
+
+def terminate_mission_pid(pid: int, *, timeout: float = 4.0) -> bool:
+    """Stop a live mission runner and its descendants.
+
+    When the runner is a process-group leader (typical for detached
+    `absoloop resume` from ZComb), signal the whole group. Otherwise kill
+    the tree by PID so we never SIGTERM the operator's shell group.
+    """
+    import signal as _signal
+
+    if not pid_alive(pid):
+        return True
+    if os.name == "nt":
+        _ensure_harness_path()
+        from absoloop_harness.platform_util import kill_process_tree
+        return kill_process_tree(pid) or not pid_alive(pid)
+
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = None
+
+    group_leader = isinstance(pgid, int) and pgid == pid
+    try:
+        if group_leader:
+            os.killpg(pid, _signal.SIGTERM)
+        else:
+            for child in _child_pids(pid):
+                try:
+                    os.kill(child, _signal.SIGTERM)
+                except OSError:
+                    pass
+            os.kill(pid, _signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.05)
+
+    try:
+        if group_leader:
+            os.killpg(pid, _signal.SIGKILL)
+        else:
+            for child in _child_pids(pid):
+                try:
+                    os.kill(child, _signal.SIGKILL)
+                except OSError:
+                    pass
+            os.kill(pid, _signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    return not pid_alive(pid)
 
 
 def budget_bar(used: float, cap: float, width: int = 22) -> str:
@@ -1833,6 +1914,140 @@ def gate_command(action: str, argv: list[str]) -> int:
     return 0
 
 
+def abort_command(argv: list[str]) -> int:
+    """Stop a live mission loop: signal the runner, mark state STOPPED.
+
+    Used by `absoloop abort` and the ZComb Kanban Abort control. Safe to call
+    when the loop is already dead — clears a stuck EXECUTING status.
+    """
+    parser = argparse.ArgumentParser(
+        prog="absoloop abort",
+        description="Stop a live Absoloop mission loop (SIGTERM the runner tree).")
+    parser.add_argument("-C", "--project", default=".",
+                        help="project directory (default: current directory)")
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="skip confirmation prompt")
+    args = parser.parse_args(argv)
+
+    target = pathlib.Path(args.project).expanduser().resolve()
+    abs_dir = target / ".absoloop"
+    state_path = abs_dir / "state.json"
+    if not abs_dir.is_dir():
+        print(f"error: {abs_dir} not found — not an Absoloop project.",
+              file=sys.stderr)
+        return 1
+
+    monitor = load_monitor(target)
+    live = monitor_is_live(monitor)
+    pid = monitor.get("pid") if isinstance(monitor.get("pid"), int) else None
+    state: dict = {}
+    if state_path.is_file():
+        try:
+            loaded = json.loads(state_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state = loaded
+        except (OSError, json.JSONDecodeError):
+            state = {}
+
+    status = str(state.get("status") or monitor.get("status") or "").upper()
+    if not live and status not in ("EXECUTING", "FINAL_REVIEW", "RUNNING",
+                                   "STARTING"):
+        print(f"nothing to abort — mission is not running "
+              f"(status {status or 'unknown'}).")
+        return 0
+
+    mission = state.get("mission_id") or monitor.get("mission_id") or "?"
+    if not args.yes and sys.stdin.isatty():
+        prompt = (f"Abort live mission {mission}"
+                  + (f" (pid {pid})" if pid and live else "")
+                  + "? [y/N] ")
+        try:
+            answer = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 1
+        if answer not in ("y", "yes"):
+            print("Aborted abort.")
+            return 1
+
+    signaled = False
+    still_alive = False
+    # Only signal when the heartbeat proves this pid is *our* live runner.
+    # A stale monitor.json pid may have been reused by an unrelated process.
+    if live and pid and pid_alive(pid):
+        signaled = terminate_mission_pid(pid)
+        still_alive = pid_alive(pid)
+        if still_alive:
+            print(f"warning: runner pid {pid} is still alive after signal",
+                  file=sys.stderr)
+        elif signaled:
+            print(f"signaled runner pid {pid}")
+    elif live:
+        print("warning: monitor looked live but pid is gone — clearing state",
+              file=sys.stderr)
+    elif status in ("EXECUTING", "FINAL_REVIEW", "RUNNING", "STARTING"):
+        print("clearing stuck run state (loop not live)")
+
+    now = time.time()
+    if state:
+        state["status"] = "STOPPED"
+        state["stop_reason"] = "human_aborted"
+        try:
+            checkpoints = abs_dir / "checkpoints"
+            checkpoints.mkdir(parents=True, exist_ok=True)
+            iteration = int(state.get("iteration") or 0)
+            cp = checkpoints / f"{iteration:04d}-human-abort.json"
+            state["latest_checkpoint"] = str(cp.relative_to(target))
+            body = json.dumps(state, indent=2, sort_keys=True) + "\n"
+            cp.write_text(body, encoding="utf-8")
+            state_path.write_text(body, encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: could not update state.json: {exc}", file=sys.stderr)
+
+    # Freeze monitor so watch/ZComb immediately show the loop as stopped.
+    try:
+        tmp = abs_dir / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        snapshot = dict(monitor) if monitor else {"schema": 1}
+        snapshot.update({
+            "status": "STOPPED",
+            "phase": "stopped",
+            "stop_reason": "human_aborted",
+            "live": False,
+            "ended_at": now,
+            "heartbeat_ts": now - HEARTBEAT_STALE_SECONDS - 1,
+        })
+        if pid:
+            snapshot["pid"] = pid
+        mon_path = tmp / "monitor.json"
+        mon_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                            encoding="utf-8")
+    except OSError as exc:
+        print(f"warning: could not update monitor.json: {exc}", file=sys.stderr)
+
+    try:
+        with (abs_dir / "ledger.jsonl").open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "ts": now,
+                "type": "mission_stop",
+                "reason": "human_aborted",
+                "status": "STOPPED",
+                "pid": pid,
+                "signaled": signaled,
+            }, sort_keys=True) + "\n")
+    except OSError:
+        pass
+
+    if still_alive:
+        print(f"mission {mission} marked STOPPED, but the process did not exit "
+              f"— kill pid {pid} manually if it keeps running.", file=sys.stderr)
+        return 2
+
+    print(f"mission {mission} aborted (STOPPED · human_aborted).")
+    print(f"next: {next_step_hint(state or {'status': 'STOPPED'})}")
+    return 0
+
+
 def start_loop(target: pathlib.Path, engine: str, model: str = "",
                announce: bool = True) -> int:
     sync_runner(target)
@@ -2034,6 +2249,8 @@ def main(argv: list[str]) -> int:
 
     if argv and argv[0] in ("approve", "reject"):
         return gate_command(argv[0], argv[1:])
+    if argv and argv[0] in ("abort", "stop"):
+        return abort_command(argv[1:])
     if argv and argv[0] == "load":
         return load_command(argv[1:])
     if argv and argv[0] == "status":

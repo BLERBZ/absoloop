@@ -1,7 +1,7 @@
 import { useState, type CSSProperties } from 'react';
 import type { Metrics } from '../hooks/usePolling';
 
-type ActionName = 'approve' | 'resume' | 'report';
+type ActionName = 'approve' | 'resume' | 'report' | 'abort';
 
 interface MissionControlsProps {
   metrics?: Metrics | null;
@@ -48,16 +48,27 @@ export function MissionControls({
   const live = Boolean(metrics?.live);
   const awaitingRun = Boolean(metrics?.awaitingRun);
   const hasMission = Boolean(metrics?.missionId || status) && status !== 'IDLE';
+  const runningLike = live
+    || ['EXECUTING', 'FINAL_REVIEW', 'RUNNING', 'STARTING'].includes(status);
 
   const approveEnabled = !busy && hasMission && status === 'AWAITING_APPROVAL';
   const resumeEnabled = !busy && hasMission && !live && !awaitingRun
     && status !== 'AWAITING_APPROVAL' && status !== 'STARTING';
   const reportEnabled = !busy && hasMission && !awaitingRun;
+  const abortEnabled = !busy && hasMission && runningLike && !awaitingRun;
 
   const run = async (action: ActionName) => {
     if (action === 'approve') {
       const confirmed = window.confirm(
         'Approve this mission and mark it COMPLETED? Delivery will run next.',
+      );
+      if (!confirmed) return;
+    }
+    if (action === 'abort') {
+      const confirmed = window.confirm(
+        live
+          ? 'Abort the live loop now? The runner and its agent children will be stopped; you can resume later from the last checkpoint.'
+          : 'Mark this mission STOPPED? Use this to clear a stuck EXECUTING status.',
       );
       if (!confirmed) return;
     }
@@ -104,6 +115,15 @@ export function MissionControls({
     background: enabled ? '#238636' : 'transparent',
     border: `1px solid ${enabled ? '#238636' : borderColor}`,
     color: enabled ? '#fff' : mutedColor,
+    opacity: enabled ? 1 : 0.45,
+    cursor: enabled ? 'pointer' : 'not-allowed',
+  });
+
+  const abortBtn = (enabled: boolean): CSSProperties => ({
+    ...btnBase,
+    background: enabled ? (darkMode ? '#3d1215' : '#ffebe9') : 'transparent',
+    border: `1px solid ${enabled ? '#da3633' : borderColor}`,
+    color: enabled ? '#f85149' : mutedColor,
     opacity: enabled ? 1 : 0.45,
     cursor: enabled ? 'pointer' : 'not-allowed',
   });
@@ -191,6 +211,32 @@ export function MissionControls({
         }}
       >
         {busy === 'report' ? '…' : 'Report'}
+      </button>
+
+      <button
+        type="button"
+        disabled={!abortEnabled}
+        title={
+          live
+            ? 'Stop the live loop now (absoloop abort)'
+            : runningLike
+              ? 'Clear stuck run state (absoloop abort)'
+              : 'Available while the loop is running'
+        }
+        onClick={() => run('abort')}
+        style={abortBtn(abortEnabled)}
+        onMouseEnter={e => {
+          if (abortEnabled) {
+            e.currentTarget.style.background = darkMode ? '#67060c' : '#ffd7d5';
+          }
+        }}
+        onMouseLeave={e => {
+          if (abortEnabled) {
+            e.currentTarget.style.background = darkMode ? '#3d1215' : '#ffebe9';
+          }
+        }}
+      >
+        {busy === 'abort' ? '…' : 'Abort'}
       </button>
 
       {flash && (

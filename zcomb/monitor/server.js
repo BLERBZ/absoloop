@@ -16,7 +16,7 @@ let PROJECT_ROOT = process.env.ZCOMB_PROJECT
   ? resolve(process.env.ZCOMB_PROJECT)
   : resolve(STATE_DIR, '../../..');
 
-const ALLOWED_ACTIONS = new Set(['approve', 'resume', 'report']);
+const ALLOWED_ACTIONS = new Set(['approve', 'resume', 'report', 'abort']);
 
 app.use(express.json());
 
@@ -66,7 +66,7 @@ function resolveAbsoloopBin() {
 
 /**
  * Run an Absoloop CLI action against the bridged project.
- * Resume is detached (long-running loop); approve/report wait briefly for exit.
+ * Resume is detached (long-running loop); approve/report/abort wait for exit.
  */
 function runAbsoloopAction(action, extraArgs = []) {
   const project = resolveProjectRoot();
@@ -212,13 +212,13 @@ app.post('/api/retarget', (req, res) => {
   });
 });
 
-// Mission quick actions → absoloop approve | resume | report
+// Mission quick actions → absoloop approve | resume | report | abort
 app.post('/api/actions/:action', async (req, res) => {
   const action = String(req.params.action || '').toLowerCase();
   if (!ALLOWED_ACTIONS.has(action)) {
     res.status(400).json({
       ok: false,
-      error: `Unknown action '${action}'. Allowed: approve, resume, report`,
+      error: `Unknown action '${action}'. Allowed: approve, resume, report, abort`,
     });
     return;
   }
@@ -238,6 +238,9 @@ app.post('/api/actions/:action', async (req, res) => {
 
   if (action === 'resume' && status === 'COMPLETED') {
     extraArgs.push('--extend');
+  }
+  if (action === 'abort') {
+    extraArgs.push('--yes');
   }
 
   try {
