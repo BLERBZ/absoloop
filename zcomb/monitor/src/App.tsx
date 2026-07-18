@@ -6,6 +6,7 @@ import { ActivityFeed } from './components/ActivityFeed';
 import { MetricsPanel } from './components/MetricsPanel';
 import { Timeline } from './components/Timeline';
 import { MissionControls } from './components/MissionControls';
+import { matchesActivityFilter } from './components/ActivityFeed';
 
 function formatElapsed(startTime: number): string {
   const s = Math.floor((Date.now() - startTime) / 1000);
@@ -132,7 +133,7 @@ export default function App() {
     runEpoch, markRunRestarting,
   } = usePolling(3000);
   const [darkMode, setDarkMode] = useState(true);
-  const [activityFilter, setActivityFilter] = useState<string>('all');
+  const [activityFilter, setActivityFilter] = useState<string>('focused');
   const [elapsed, setElapsed] = useState('00:00:00');
   const [agentsOpen, setAgentsOpen] = useState(() => localStorage.getItem('zc-panel-agents') !== '0');
   const [feedOpen, setFeedOpen] = useState(() => localStorage.getItem('zc-panel-feed') !== '0');
@@ -149,7 +150,7 @@ export default function App() {
 
   // Reset activity filter when a new run/project identity arrives.
   useEffect(() => {
-    setActivityFilter('all');
+    setActivityFilter('focused');
   }, [runEpoch]);
 
   // Update elapsed time every second
@@ -600,6 +601,7 @@ export default function App() {
               <select
                 value={activityFilter}
                 onChange={e => setActivityFilter(e.target.value)}
+                title="Focused shows CLI blue agent messages (say); All shows every event"
                 style={{
                   background: darkMode ? '#161b22' : '#ffffff',
                   border: `1px solid ${borderColor}`,
@@ -609,12 +611,18 @@ export default function App() {
                   fontSize: 11,
                   cursor: 'pointer',
                   outline: 'none',
-                  maxWidth: 110,
+                  maxWidth: 120,
                   flexShrink: 1,
                   minWidth: 0,
                 }}
               >
-                <option value="all">All Agents</option>
+                <option value="focused">Focused</option>
+                <option value="all">All messages</option>
+                {agents.length > 0 && (
+                  <option value="__agents__" disabled>
+                    ── Agents ──
+                  </option>
+                )}
                 {agents.map(a => (
                   <option key={a.id} value={a.id}>{a.name}</option>
                 ))}
@@ -634,7 +642,7 @@ export default function App() {
           <CollapsedRail
             label="Activity"
             side="right"
-            count={(state?.activity || []).length}
+            count={(state?.activity || []).filter(a => matchesActivityFilter(a, activityFilter)).length}
             onExpand={toggleFeed}
             darkMode={darkMode}
             mutedColor={mutedColor}

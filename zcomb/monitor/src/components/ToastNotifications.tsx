@@ -9,7 +9,7 @@ const typeColors: Record<string, string> = {
   heartbeat: '#7d8590',
   research: '#d29922',
   spawned: '#79c0ff',
-  status_change: '#d2a8ff',
+  status_change: '#58a6ff',
   error: '#f85149',
   phase_start: '#58a6ff',
   session_start: '#3fb950'
@@ -23,7 +23,7 @@ const typeBadgeLabels: Record<string, string> = {
   heartbeat: 'HEARTBEAT',
   research: 'RESEARCH',
   spawned: 'SPAWNED',
-  status_change: 'STATUS',
+  status_change: 'SAY',
   error: 'ERROR',
   phase_start: 'PHASE',
   session_start: 'SESSION'

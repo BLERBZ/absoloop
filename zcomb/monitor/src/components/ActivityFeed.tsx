@@ -1,5 +1,11 @@
 import type { Activity } from '../hooks/usePolling';
 
+/**
+ * Types that match Absoloop CLI cyan/blue live lines (`say` → act style).
+ * Tool/think/usage noise is excluded from the Focused feed.
+ */
+export const FOCUSED_ACTIVITY_TYPES = new Set(['status_change']);
+
 const typeColors: Record<string, string> = {
   task_started: '#58a6ff',
   task_completed: '#3fb950',
@@ -8,7 +14,7 @@ const typeColors: Record<string, string> = {
   heartbeat: '#7d8590',
   research: '#d29922',
   spawned: '#79c0ff',
-  status_change: '#d2a8ff',
+  status_change: '#58a6ff',
   error: '#f85149',
   phase_start: '#58a6ff',
   session_start: '#3fb950'
@@ -22,11 +28,17 @@ const typeBadgeLabels: Record<string, string> = {
   heartbeat: 'HEARTBEAT',
   research: 'RESEARCH',
   spawned: 'SPAWNED',
-  status_change: 'STATUS',
+  status_change: 'SAY',
   error: 'ERROR',
   phase_start: 'PHASE',
   session_start: 'SESSION'
 };
+
+export function matchesActivityFilter(item: Activity, filter: string): boolean {
+  if (filter === 'focused') return FOCUSED_ACTIVITY_TYPES.has(item.type);
+  if (filter === 'all') return true;
+  return item.agentId === filter;
+}
 
 function formatTime(ts: string): string {
   try {
@@ -68,13 +80,15 @@ export function ActivityFeed({ activity, filter, darkMode, agents }: {
     agents.forEach(a => agentNameMap.set(a.id, a.name));
   }
 
-  const filtered = filter === 'all' ? activity : activity.filter(a => a.agentId === filter);
+  const filtered = activity.filter(a => matchesActivityFilter(a, filter));
   const reversed = [...filtered].reverse();
 
   if (reversed.length === 0) {
     return (
       <div style={{ color: mutedColor, fontSize: 12, textAlign: 'center', padding: 20 }}>
-        Waiting for agent activity...
+        {filter === 'focused'
+          ? 'Waiting for agent messages…'
+          : 'Waiting for agent activity...'}
       </div>
     );
   }
