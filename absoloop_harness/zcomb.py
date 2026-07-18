@@ -408,6 +408,42 @@ def _pipeline_status(name: str, live: bool, status: str, phase: str,
     return "inbox"
 
 
+def _awaiting_new_run(abs_dir: pathlib.Path, runtime: dict, state: dict,
+                      monitor: dict, live: bool) -> bool:
+    """True when a mission is scaffolded/extended but the runner has not
+    produced a live heartbeat for this loop yet.
+
+    Covers: fresh `absoloop` scaffold (runtime only), post-extend gap
+    (state.json archived), and stale monitor leftover from a prior loop_id.
+    """
+    if not (abs_dir / "runtime.json").is_file():
+        return False
+    if live:
+        return False
+    if not (abs_dir / "state.json").is_file():
+        return True
+    loop_id = str(runtime.get("loop_id") or "").strip()
+    monitor_loop = str(monitor.get("loop_id") or "").strip()
+    if loop_id and monitor_loop and monitor_loop != loop_id:
+        return True
+    # State exists but run never started (READY with no iterations / no start).
+    status = str(state.get("status") or "").upper()
+    iteration = int(state.get("iteration") or 0)
+    if status in ("", "READY") and iteration == 0 and not state.get("started_at"):
+        return True
+    return False
+
+
+def _run_key(loop_id: str, *, awaiting: bool, started: Any = None) -> str:
+    """Stable identity the Kanban UI uses to reset on a new run/project."""
+    lid = (loop_id or "mission").strip() or "mission"
+    if awaiting:
+        return f"{lid}:pending"
+    if isinstance(started, (int, float)) and started > 0:
+        return f"{lid}:{int(started)}"
+    return f"{lid}:active"
+
+
 def build_bridge_state(project: pathlib.Path) -> dict:
     """Translate Absoloop mission artifacts into ZComb dashboard state."""
     abs_dir = project / ".absoloop"
@@ -417,8 +453,20 @@ def build_bridge_state(project: pathlib.Path) -> dict:
     runtime = _read_json(abs_dir / "runtime.json")
     live = monitor_is_live(monitor)
 
+    loop_id = str(runtime.get("loop_id") or "").strip()
+    monitor_loop = str(monitor.get("loop_id") or "").strip()
+    # Ignore leftover telemetry from a previous loop so the board does not
+    # flash the old pipeline while a new run is activating.
+    if loop_id and monitor_loop and monitor_loop != loop_id:
+        monitor = {}
+        live = False
+
+    awaiting = _awaiting_new_run(abs_dir, runtime, state, monitor, live)
+
     source = monitor if live and monitor else state
     status = str(source.get("status") or state.get("status") or "READY")
+    if awaiting:
+        status = "STARTING"
     phase = str(monitor.get("phase") or "")
     iteration = int(source.get("iteration") or state.get("iteration") or 0)
     max_iter = int(runtime.get("max_iterations") or 0)
@@ -426,11 +474,15 @@ def build_bridge_state(project: pathlib.Path) -> dict:
                  or (runtime.get("builder") or {}).get("engine") or "builder")
     objective = str(runtime.get("objective") or "Absoloop mission").strip()
     mission_id = str(state.get("mission_id") or monitor.get("mission_id")
-                     or runtime.get("loop_id") or "mission")
-    started = (monitor.get("started_at") if live else state.get("started_at")) or time.time()
-    created = _iso(started)
+                     or runtime.get("mission_id") or loop_id or "mission")
+    started = (monitor.get("started_at") if live else state.get("started_at"))
+    if not isinstance(started, (int, float)) or started <= 0:
+        started = time.time() if not awaiting else 0
+    created = _iso(started) if started else _iso(time.time())
     updated = _iso(monitor.get("heartbeat_ts") or time.time())
     now = _iso(time.time())
+    project_name = project.name or str(project)
+    run_key = _run_key(loop_id or mission_id, awaiting=awaiting, started=started)
 
     builder_id = "builder-01"
     critic_id = "critic-01"
@@ -558,6 +610,42 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             {**agents[1], "status": "idle", "currentTask": None,
              "metrics": {"tasksCompleted": 0, "errors": 0}},
         ]
+        awaiting = True
+        run_key = _run_key("", awaiting=True)
+        objective = ""
+        mission_id = ""
+        loop_id = ""
+        status = "IDLE"
+    elif awaiting:
+        # New / extended run activated — clear prior pipeline and wait for
+        # the runner to publish live telemetry for this objective.
+        wait_title = "Waiting for new Absoloop run to start"
+        wait_desc = (
+            f"Project {project_name}"
+            + (f" · {loop_id}" if loop_id else "")
+            + (f" · {objective[:140]}" if objective else "")
+            + " — Kanban refreshes when the runner becomes live."
+        )
+        tasks = [
+            _task("task-waiting", wait_title, "inbox", None, "high", 0,
+                  now, now, description=wait_desc),
+            _task("task-objective",
+                  (f"Objective: {objective[:120]}" if objective
+                   else "Objective pending"),
+                  "assigned", builder_id, "high", 0, now, now,
+                  ["task-waiting"],
+                  description="New mission objective loaded; waiting for "
+                              "builder heartbeat."),
+        ]
+        agents = [
+            {**agents[0], "status": "idle",
+             "currentTask": "waiting for runner…",
+             "metrics": {"tasksCompleted": 0, "errors": 0}},
+            {**agents[1], "status": "idle", "currentTask": None,
+             "metrics": {"tasksCompleted": 0, "errors": 0}},
+        ]
+        teammates = {}
+        live_events = []
 
     # Spawned teammates get first-class agent cards with quirky names.
     for record in teammates.values():
@@ -594,7 +682,19 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "message": message[:240],
         })
 
-    if not activity:
+    if awaiting:
+        activity = [{
+            "timestamp": now,
+            "agentId": builder_id,
+            "type": "session_start",
+            "message": (
+                f"New run pending"
+                + (f" · {project_name}" if project_name else "")
+                + (f" · {loop_id}" if loop_id else "")
+                + (f": {objective[:140]}" if objective else "")
+            ),
+        }]
+    elif not activity:
         activity.append({
             "timestamp": now,
             "agentId": builder_id,
@@ -623,6 +723,14 @@ def build_bridge_state(project: pathlib.Path) -> dict:
     elapsed_h = max(1e-6, (time.time() - float(started or time.time())) / 3600.0)
     tasks_per_hour = round(max(0, iteration) / elapsed_h, 1)
 
+    if awaiting:
+        completion = 0
+        tasks_per_hour = 0.0
+        phase_progress = [
+            {"phase": phase_n, "name": name, "progress": 0}
+            for phase_n, name in PHASE_PIPELINE
+        ]
+
     return {
         "agents": {"agents": agents},
         "tasks": {"tasks": tasks},
@@ -632,18 +740,28 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "tasksPerHour": tasks_per_hour,
             "phases": phase_progress,
             "missionId": mission_id,
+            "loopId": loop_id,
             "objective": objective,
             "status": status,
             "live": live,
+            "awaitingRun": awaiting,
+            "runKey": run_key,
+            "projectName": project_name,
         },
         "activity": activity,
         "riskAnalysis": {
-            "summary": (f"Mission {mission_id} · status {status}"
-                        + (f" · phase {phase}" if phase else "")),
-            "iteration": iteration,
+            "summary": (
+                (f"Awaiting new run · {project_name}"
+                 + (f" · {loop_id}" if loop_id else "")
+                 + (f" · {objective[:80]}" if objective else ""))
+                if awaiting else
+                (f"Mission {mission_id} · status {status}"
+                 + (f" · phase {phase}" if phase else ""))
+            ),
+            "iteration": 0 if awaiting else iteration,
             "maxIterations": max_iter,
-            "costUsd": float(source.get("cost_usd") or 0),
-            "tokensTotal": source.get("tokens_total") or 0,
+            "costUsd": 0.0 if awaiting else float(source.get("cost_usd") or 0),
+            "tokensTotal": 0 if awaiting else (source.get("tokens_total") or 0),
         },
     }
 
@@ -695,6 +813,33 @@ def _port_in_use(port: int) -> bool:
                                     timeout=0.4) as resp:
             return resp.status == 200
     except (urllib.error.URLError, TimeoutError, OSError):
+        return False
+
+
+def retarget_dashboard(project: pathlib.Path, port: int = DEFAULT_PORT,
+                       state_dir: Optional[pathlib.Path] = None) -> bool:
+    """Ask a running ZComb server to point at a new project/state dir.
+
+    Returns True when the live dashboard acknowledged the retarget.
+    """
+    out = state_dir or project_state_dir(project)
+    payload = json.dumps({
+        "project": str(project.resolve()),
+        "stateDir": str(out.resolve()),
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/retarget",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            if resp.status != 200:
+                return False
+            body = json.loads(resp.read().decode("utf-8"))
+            return bool(body.get("ok"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
         return False
 
 
@@ -765,9 +910,15 @@ def spawn_background(project: pathlib.Path, *, port: int = DEFAULT_PORT,
 
     Used when `absoloop … --zcomb` launches a mission — never raises into
     the mission path. Returns the dashboard Popen (or None if already up).
+
+    When a dashboard is already listening, retarget it to this project so the
+    open Kanban refreshes for the new objective/run instead of staying on
+    stale state.
     """
     try:
         ensure_dashboard_built()
+        # Sync first so the UI's next poll sees awaiting-run / new objective
+        # immediately (before the runner has written monitor.json).
         state_dir = sync_state(project)
         proc: Optional[subprocess.Popen]
         if not _port_in_use(port):
@@ -778,6 +929,12 @@ def spawn_background(project: pathlib.Path, *, port: int = DEFAULT_PORT,
                 return proc
         else:
             proc = None
+            if retarget_dashboard(project, port=port, state_dir=state_dir):
+                print(f"  ZComb UI retargeted → {project.name}")
+            else:
+                print("  warning: ZComb dashboard is up but could not retarget; "
+                      "refresh may stay on the previous project",
+                      file=sys.stderr)
         # Detached bridge keeps state files fresh while the mission runs.
         subprocess.Popen(
             [sys.executable, "-c",
@@ -853,6 +1010,11 @@ def zcomb_command(argv: list[str]) -> int:
     proc: Optional[subprocess.Popen] = None
     if _port_in_use(port):
         print(f"  Dashboard already running at {url}")
+        if retarget_dashboard(project, port=port, state_dir=state_dir):
+            print(f"  Retargeted dashboard → {project}")
+        else:
+            print("  warning: could not retarget the running dashboard",
+                  file=sys.stderr)
     else:
         print(f"  Starting ZComb dashboard on {url} …")
         proc = start_server(state_dir, port, project=project)
@@ -892,6 +1054,7 @@ __all__ = [
     "sync_state",
     "zcomb_command",
     "spawn_background",
+    "retarget_dashboard",
     "ensure_dashboard_built",
     "DEFAULT_PORT",
 ]

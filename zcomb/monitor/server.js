@@ -1,15 +1,21 @@
 import express from 'express';
 import { spawn } from 'child_process';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync } from 'fs';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.ZCOMB_PORT || process.env.PORT || 3141);
-const STATE_DIR = resolve(
+
+/** Mutable binding — retargetable when a new Absoloop run/project activates. */
+let STATE_DIR = resolve(
   process.env.ZCOMB_STATE_DIR || join(__dirname, 'state')
 );
+let PROJECT_ROOT = process.env.ZCOMB_PROJECT
+  ? resolve(process.env.ZCOMB_PROJECT)
+  : resolve(STATE_DIR, '../../..');
+
 const ALLOWED_ACTIONS = new Set(['approve', 'resume', 'report']);
 
 app.use(express.json());
@@ -42,12 +48,9 @@ function readActivityLog() {
   }
 }
 
-/** Project root: STATE_DIR is project/.absoloop/zcomb/state */
+/** Project root for CLI actions */
 function resolveProjectRoot() {
-  if (process.env.ZCOMB_PROJECT) {
-    return resolve(process.env.ZCOMB_PROJECT);
-  }
-  return resolve(STATE_DIR, '../../..');
+  return PROJECT_ROOT;
 }
 
 function resolveAbsoloopBin() {
@@ -88,6 +91,7 @@ function runAbsoloopAction(action, extraArgs = []) {
         detached: true,
         pid: child.pid,
         message: `Started absoloop ${action} (pid ${child.pid})`,
+        restarting: true,
       });
       return;
     }
@@ -133,7 +137,9 @@ app.get('/api/state', (_req, res) => {
     metrics: readStateFile('metrics.json') || { completionPct: 0, errorRate: 0, tasksPerHour: 0, phases: [] },
     activity: readActivityLog().slice(-200),  // Last 200 entries
     riskAnalysis: readStateFile('risk-analysis.json') || null,
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    project: PROJECT_ROOT,
+    stateDir: STATE_DIR,
   });
 });
 
@@ -161,6 +167,48 @@ app.get('/api/health', (_req, res) => {
     stateDir: STATE_DIR,
     project: resolveProjectRoot(),
     port: PORT,
+  });
+});
+
+/**
+ * Point this dashboard at a different Absoloop project / state directory.
+ * Called when `absoloop --zcomb` activates a new run while the UI is already up.
+ */
+app.post('/api/retarget', (req, res) => {
+  const project = typeof req.body?.project === 'string' ? req.body.project.trim() : '';
+  const stateDir = typeof req.body?.stateDir === 'string' ? req.body.stateDir.trim() : '';
+  if (!project) {
+    res.status(400).json({ ok: false, error: 'project path required' });
+    return;
+  }
+  const nextProject = resolve(project);
+  if (!existsSync(nextProject)) {
+    res.status(400).json({ ok: false, error: `project not found: ${nextProject}` });
+    return;
+  }
+  const nextState = stateDir
+    ? resolve(stateDir)
+    : resolve(nextProject, '.absoloop', 'zcomb', 'state');
+  try {
+    mkdirSync(nextState, { recursive: true });
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+    return;
+  }
+  PROJECT_ROOT = nextProject;
+  STATE_DIR = nextState;
+  process.env.ZCOMB_PROJECT = nextProject;
+  process.env.ZCOMB_STATE_DIR = nextState;
+  console.log(`  retargeted → project ${nextProject}`);
+  console.log(`               state ${nextState}`);
+  res.json({
+    ok: true,
+    project: PROJECT_ROOT,
+    stateDir: STATE_DIR,
+    message: 'Dashboard retargeted to new project/run',
   });
 });
 

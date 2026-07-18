@@ -186,6 +186,93 @@ class BridgeStateTests(unittest.TestCase):
             agents = json.loads((out / "agents.json").read_text(encoding="utf-8"))
             self.assertIn("agents", agents)
 
+    def test_awaiting_new_run_after_scaffold(self):
+        """Runtime without state → Kanban waits for the new run/objective."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            _write(project / ".absoloop" / "runtime.json", {
+                "objective": "Ship the widget",
+                "max_iterations": 5,
+                "loop_id": "loop-new",
+            })
+            bridged = zcomb.build_bridge_state(project)
+            metrics = bridged["metrics"]
+            self.assertTrue(metrics["awaitingRun"])
+            self.assertEqual(metrics["status"], "STARTING")
+            self.assertEqual(metrics["loopId"], "loop-new")
+            self.assertEqual(metrics["objective"], "Ship the widget")
+            self.assertEqual(metrics["runKey"], "loop-new:pending")
+            self.assertEqual(metrics["projectName"], project.name)
+            titles = [t["title"] for t in bridged["tasks"]["tasks"]]
+            self.assertTrue(any("Waiting for new Absoloop run" in t for t in titles))
+            self.assertTrue(any("Ship the widget" in t for t in titles))
+
+    def test_stale_monitor_from_prior_loop_is_ignored(self):
+        """After extend, leftover monitor.json for the old loop must not paint."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Continue the work",
+                "max_iterations": 8,
+                "loop_id": "loop-2",
+            })
+            # No state.json (archived by extend); stale monitor from loop-1.
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "COMPLETED",
+                "phase": "deliver",
+                "iteration": 5,
+                "loop_id": "loop-1",
+                "mission_id": "ABS-9",
+                "pid": 1,
+                "heartbeat_ts": now - 10_000,
+                "started_at": now - 20_000,
+            })
+            bridged = zcomb.build_bridge_state(project)
+            metrics = bridged["metrics"]
+            self.assertTrue(metrics["awaitingRun"])
+            self.assertEqual(metrics["loopId"], "loop-2")
+            self.assertFalse(metrics["live"])
+            self.assertNotEqual(metrics["status"], "COMPLETED")
+            task_ids = {t["id"] for t in bridged["tasks"]["tasks"]}
+            self.assertIn("task-waiting", task_ids)
+            self.assertNotIn("task-execute", task_ids)
+
+    def test_live_run_emits_stable_run_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            started = now - 60
+            _write(abs_dir / "runtime.json", {
+                "objective": "Make tests pass",
+                "max_iterations": 10,
+                "loop_id": "loop-1",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 2,
+                "mission_id": "ABS-42",
+                "started_at": started,
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "EXECUTING",
+                "phase": "builder",
+                "iteration": 2,
+                "loop_id": "loop-1",
+                "pid": os.getpid(),
+                "heartbeat_ts": now,
+                "started_at": started,
+                "agent": "builder",
+            })
+            bridged = zcomb.build_bridge_state(project)
+            metrics = bridged["metrics"]
+            self.assertFalse(metrics["awaitingRun"])
+            self.assertTrue(metrics["live"])
+            self.assertEqual(metrics["runKey"], f"loop-1:{int(started)}")
+            self.assertEqual(metrics["loopId"], "loop-1")
+
 
 class CliDispatchTests(unittest.TestCase):
     def test_extract_zcomb_flag(self):
