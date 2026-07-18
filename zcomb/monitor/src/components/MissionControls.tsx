@@ -9,6 +9,8 @@ interface MissionControlsProps {
   borderColor: string;
   textColor: string;
   mutedColor: string;
+  /** Called when Resume starts a new/continued run so Kanban can reset. */
+  onRunRestarting?: () => void;
 }
 
 async function triggerAction(action: ActionName): Promise<{ ok: boolean; message: string }> {
@@ -37,17 +39,20 @@ export function MissionControls({
   borderColor,
   textColor,
   mutedColor,
+  onRunRestarting,
 }: MissionControlsProps) {
   const [busy, setBusy] = useState<ActionName | null>(null);
   const [flash, setFlash] = useState<{ ok: boolean; text: string } | null>(null);
 
   const status = String(metrics?.status || '').toUpperCase();
   const live = Boolean(metrics?.live);
-  const hasMission = Boolean(metrics?.missionId || status);
+  const awaitingRun = Boolean(metrics?.awaitingRun);
+  const hasMission = Boolean(metrics?.missionId || status) && status !== 'IDLE';
 
   const approveEnabled = !busy && hasMission && status === 'AWAITING_APPROVAL';
-  const resumeEnabled = !busy && hasMission && !live && status !== 'AWAITING_APPROVAL';
-  const reportEnabled = !busy && hasMission;
+  const resumeEnabled = !busy && hasMission && !live && !awaitingRun
+    && status !== 'AWAITING_APPROVAL' && status !== 'STARTING';
+  const reportEnabled = !busy && hasMission && !awaitingRun;
 
   const run = async (action: ActionName) => {
     if (action === 'approve') {
@@ -62,6 +67,9 @@ export function MissionControls({
     try {
       const result = await triggerAction(action);
       setFlash({ ok: result.ok, text: result.message });
+      if (action === 'resume' && result.ok) {
+        onRunRestarting?.();
+      }
     } catch (err: any) {
       setFlash({ ok: false, text: err?.message || `Failed to ${action}` });
     } finally {

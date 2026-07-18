@@ -127,7 +127,10 @@ function CollapsedRail({ label, side, count, onExpand, darkMode, mutedColor, bor
 }
 
 export default function App() {
-  const { state, error, startTime, lastUpdate, connectionHealth } = usePolling(3000);
+  const {
+    state, error, startTime, lastUpdate, connectionHealth,
+    runEpoch, markRunRestarting,
+  } = usePolling(3000);
   const [darkMode, setDarkMode] = useState(true);
   const [activityFilter, setActivityFilter] = useState<string>('all');
   const [elapsed, setElapsed] = useState('00:00:00');
@@ -143,6 +146,11 @@ export default function App() {
     return !open;
   });
 
+  // Reset activity filter when a new run/project identity arrives.
+  useEffect(() => {
+    setActivityFilter('all');
+  }, [runEpoch]);
+
   // Update elapsed time every second
   useEffect(() => {
     const id = setInterval(() => setElapsed(formatElapsed(startTime)), 1000);
@@ -151,9 +159,15 @@ export default function App() {
 
   const tasks = state?.tasks?.tasks || [];
   const agents = state?.agents?.agents || [];
+  const metrics = state?.metrics;
+  const awaitingRun = Boolean(metrics?.awaitingRun);
+  const objective = (metrics?.objective || '').trim();
+  const projectName = (metrics?.projectName || '').trim();
   const totalTasks = tasks.length;
   const doneTasks = tasks.filter(t => t.status === 'done').length;
-  const overallProgress = totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0;
+  const overallProgress = awaitingRun
+    ? 0
+    : (totalTasks > 0 ? Math.round((doneTasks / totalTasks) * 100) : 0);
 
   const bg = darkMode ? '#0d1117' : '#ffffff';
   const borderColor = darkMode ? '#30363d' : '#d0d7de';
@@ -228,11 +242,12 @@ export default function App() {
             </span>
           </div>
           <MissionControls
-            metrics={state?.metrics}
+            metrics={metrics}
             darkMode={darkMode}
             borderColor={borderColor}
             textColor={textColor}
             mutedColor={mutedColor}
+            onRunRestarting={markRunRestarting}
           />
         </div>
 
@@ -316,6 +331,71 @@ export default function App() {
           </button>
         </div>
       </header>
+
+      {/* New-run banner — shown while waiting for objective/runner after activation */}
+      {(awaitingRun || objective || projectName) && (
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          padding: '8px 16px',
+          borderBottom: `1px solid ${borderColor}`,
+          background: awaitingRun
+            ? (darkMode ? '#1f6feb22' : '#ddf4ff')
+            : headerBg,
+          flexShrink: 0,
+          flexWrap: 'wrap',
+          minHeight: 36,
+        }}>
+          {awaitingRun && (
+            <span style={{
+              fontSize: 11,
+              fontWeight: 700,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+              color: '#58a6ff',
+              whiteSpace: 'nowrap',
+            }}>
+              Waiting for new run
+            </span>
+          )}
+          {projectName && (
+            <span style={{
+              fontSize: 12,
+              fontWeight: 600,
+              color: textColor,
+              whiteSpace: 'nowrap',
+            }}>
+              {projectName}
+            </span>
+          )}
+          {objective && (
+            <span style={{
+              fontSize: 12,
+              color: mutedColor,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+              minWidth: 0,
+              flex: 1,
+            }}
+              title={objective}
+            >
+              {objective}
+            </span>
+          )}
+          {metrics?.loopId && (
+            <span style={{
+              fontSize: 11,
+              fontFamily: 'monospace',
+              color: mutedColor,
+              whiteSpace: 'nowrap',
+            }}>
+              {metrics.loopId}
+            </span>
+          )}
+        </div>
+      )}
 
       {/* Main Layout — collapsible sidebars, center fills remainder */}
       <div style={{
@@ -404,9 +484,9 @@ export default function App() {
           minHeight: 0,
           minWidth: 0,
         }}>
-          <KanbanBoard tasks={tasks} agents={agents} darkMode={darkMode} />
+          <KanbanBoard key={runEpoch} tasks={tasks} agents={agents} darkMode={darkMode} />
           <div style={{ flexShrink: 0, padding: '2px 14px 8px', minWidth: 0 }}>
-            <Timeline tasks={tasks} metrics={state?.metrics} darkMode={darkMode} />
+            <Timeline tasks={tasks} metrics={metrics} darkMode={darkMode} />
           </div>
         </div>
 
@@ -473,6 +553,7 @@ export default function App() {
             </div>
             <div style={{ flex: 1, overflowY: 'auto', padding: '0 14px 14px', minHeight: 0 }}>
               <ActivityFeed
+                key={runEpoch}
                 activity={state?.activity || []}
                 filter={activityFilter}
                 darkMode={darkMode}
@@ -503,7 +584,7 @@ export default function App() {
         <MetricsPanel
           tasks={tasks}
           agents={agents}
-          metrics={state?.metrics}
+          metrics={metrics}
           darkMode={darkMode}
         />
       </div>
