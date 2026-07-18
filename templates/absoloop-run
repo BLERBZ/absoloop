@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -126,6 +127,7 @@ def thinking_rung(runtime: dict[str, Any], state: "State") -> dict[str, Any]:
 
 CRITIC_SCHEMA: dict[str, Any] = {
     "type": "object",
+    "additionalProperties": False,
     "properties": {
         "recommendation": {"type": "string", "enum": ["PASS", "HOLD", "REJECT"]},
         "blocking_findings": {"type": "array", "items": {"type": "string"}},
@@ -133,6 +135,48 @@ CRITIC_SCHEMA: dict[str, Any] = {
     },
     "required": ["recommendation", "blocking_findings", "summary"],
 }
+
+
+def openai_strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy ``schema`` into OpenAI Structured Outputs strict form.
+
+    Codex ``--output-schema`` forwards the file to OpenAI's
+    ``response_format`` / ``codex_output_schema``, which rejects any object
+    node missing ``additionalProperties: false`` and any property omitted
+    from ``required``. Claude/Grok tolerate the looser shape; normalizing
+    here keeps a single portable schema source.
+    """
+    out = copy.deepcopy(schema)
+
+    def walk(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object" or "properties" in node:
+            node["additionalProperties"] = False
+            props = node.get("properties")
+            if isinstance(props, dict) and props:
+                node["required"] = list(props.keys())
+                for child in props.values():
+                    walk(child)
+        items = node.get("items")
+        if isinstance(items, dict):
+            walk(items)
+        elif isinstance(items, list):
+            for child in items:
+                walk(child)
+        for key in ("anyOf", "oneOf", "allOf"):
+            alts = node.get(key)
+            if isinstance(alts, list):
+                for child in alts:
+                    walk(child)
+        for key in ("$defs", "definitions"):
+            defs = node.get(key)
+            if isinstance(defs, dict):
+                for child in defs.values():
+                    walk(child)
+
+    walk(out)
+    return out
 
 
 @dataclass
@@ -1035,11 +1079,30 @@ def run_codex(prompt: str, cfg: dict[str, Any], pricing: dict[str, float] | None
     # codex exec is non-interactive and never prompts; the sandbox policy is
     # the enforcement boundary for scripted runs. Codex has no per-run dollar
     # cap flag, so max_budget_usd is the accounting reserve when parsing fails.
+    #
+    # Always pass an OpenAI-strict copy: missions scaffolded before the
+    # additionalProperties fix still have a loose agent-result.schema.json on
+    # disk, and Codex 400s those with invalid_json_schema / codex_output_schema.
+    try:
+        raw_schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        say(f"{label}: unreadable output schema {schema_path}: {exc}", "err")
+        return AgentRun(2, float(cfg.get("max_budget_usd", 5.0)), False,
+                        "schema_error", out_path)
+    if not isinstance(raw_schema, dict):
+        say(f"{label}: output schema root must be a JSON object", "err")
+        return AgentRun(2, float(cfg.get("max_budget_usd", 5.0)), False,
+                        "schema_error", out_path)
+    strict_schema = openai_strict_json_schema(raw_schema)
+    strict_path = out_path.with_suffix(".output.schema.json")
+    strict_path.write_text(json.dumps(strict_schema, indent=2) + "\n",
+                           encoding="utf-8")
+
     effort = str(cfg.get("model_reasoning_effort", "") or "")
     command = [
         shutil.which("codex") or "codex", "exec",
         "--sandbox", cfg["sandbox"],
-        "--output-schema", str(schema_path),
+        "--output-schema", str(strict_path),
         "--json",
         "-o", str(out_path),
     ]
@@ -1275,9 +1338,32 @@ def run_grok(prompt: str, cfg: dict[str, Any], out_path: pathlib.Path,
     return run
 
 
-def mission_model(runtime: dict[str, Any], override: str = "") -> str:
-    """Model id/alias for this mission — CLI override wins, else runtime.json."""
-    return (override or str(runtime.get("model") or "")).strip()
+def mission_model(runtime: dict[str, Any], override: str = "",
+                  engine: str = "") -> str:
+    """Model id/alias for this mission — CLI override wins, else runtime.json.
+
+    When ``engine`` is set, remap curated aliases that belong to another
+    engine (Claude ``best`` is not valid for Codex ChatGPT auth).
+    """
+    requested = (override or str(runtime.get("model") or "")).strip()
+    if not engine:
+        return requested
+    try:
+        from absoloop_harness.models import resolve_model
+    except ImportError:
+        # Project runners may not have the harness package on sys.path;
+        # fall back to a minimal remap for the known Claude → Codex case.
+        if engine == "codex" and requested in {
+                "best", "fable", "opus", "sonnet", "haiku"}:
+            return "gpt-5.6-sol"
+        if engine == "claude" and requested.startswith("gpt-5.6-"):
+            return "best"
+        return requested or ({
+            "claude": "best",
+            "codex": "gpt-5.6-sol",
+            "grok": "grok-build-0.1",
+        }.get(engine, ""))
+    return resolve_model(engine, requested)
 
 
 def run_critic(engine: str, runtime: dict[str, Any], state: State,
@@ -1685,7 +1771,7 @@ def main() -> int:
     args = parser.parse_args()
 
     runtime = load_json(RUNTIME_PATH)
-    model = mission_model(runtime, args.model)
+    model = mission_model(runtime, args.model, engine=args.engine or "")
     TMP.mkdir(parents=True, exist_ok=True)
 
     # Keep the live activity feed bounded: trim to its most recent tail when a

@@ -31,6 +31,16 @@ class Defaults(unittest.TestCase):
         self.assertEqual(resolve_model("claude", ""), "best")
         self.assertEqual(resolve_model("claude", "  "), "best")
 
+    def test_resolve_remaps_claude_alias_for_codex(self):
+        self.assertEqual(resolve_model("codex", "best"), "gpt-5.6-sol")
+        self.assertEqual(resolve_model("codex", "sonnet"), "gpt-5.6-sol")
+
+    def test_resolve_remaps_codex_id_for_claude(self):
+        self.assertEqual(resolve_model("claude", "gpt-5.6-sol"), "best")
+
+    def test_resolve_keeps_unknown_custom(self):
+        self.assertEqual(resolve_model("codex", "o3"), "o3")
+
     def test_catalog_nonempty(self):
         for engine in ("claude", "codex", "grok"):
             self.assertTrue(models_for(engine))

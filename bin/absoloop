@@ -113,6 +113,7 @@ Do not edit files.
 
 RESULT_SCHEMA = {
     "type": "object",
+    "additionalProperties": False,
     "properties": {
         "done": {"type": "boolean",
                  "description": "true only when every item in the definition "
@@ -127,7 +128,12 @@ RESULT_SCHEMA = {
             "description": "Screenshot or proof file paths (images preferred)",
         },
     },
-    "required": ["done", "summary", "changed_artifacts", "risks"],
+    # OpenAI Structured Outputs (Codex --output-schema) requires every key in
+    # properties to appear in required, plus additionalProperties: false.
+    "required": [
+        "done", "summary", "changed_artifacts", "commands_run", "risks",
+        "evidence",
+    ],
 }
 
 # ---------------------------------------------------------------------------
@@ -201,6 +207,26 @@ def sync_runner(target: pathlib.Path) -> None:
                   "ABSOLOOP version")
     except OSError as exc:
         print(f"warning: could not update scripts/absoloop-run: {exc}", file=sys.stderr)
+
+
+def sync_result_schema(target: pathlib.Path) -> None:
+    """Keep .absoloop/schemas/agent-result.schema.json OpenAI-strict.
+
+    Codex --output-schema rejects schemas missing additionalProperties: false.
+    Always rewrite so missions scaffolded before that requirement recover on
+    the next resume/start without a manual re-init.
+    """
+    schema_path = target / ".absoloop" / "schemas" / "agent-result.schema.json"
+    try:
+        schema_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(RESULT_SCHEMA, indent=2) + "\n"
+        if schema_path.is_file() and schema_path.read_text(encoding="utf-8") == payload:
+            return
+        schema_path.write_text(payload, encoding="utf-8")
+        prep_note("schema: refreshed agent-result.schema.json for Codex "
+                  "structured-output strict mode")
+    except OSError as exc:
+        print(f"warning: could not update {schema_path}: {exc}", file=sys.stderr)
 
 
 # Each engine's native project-skill discovery path: both CLIs scan their
@@ -731,6 +757,38 @@ def default_engine() -> str | None:
         if shutil.which(engine):
             return engine
     return None
+
+
+def resolve_engine_model(engine: str, target: pathlib.Path,
+                         override: str = "") -> str:
+    """Pick a model that the given engine can actually run.
+
+    Prefers an explicit override, else ``runtime.json``'s model, then remaps
+    curated aliases that belong to another engine (Claude ``best`` → Codex Sol).
+    """
+    _ensure_harness_path()
+    from absoloop_harness.models import resolve_model
+
+    requested = (override or "").strip()
+    if not requested:
+        runtime = load_runtime(target) or {}
+        requested = str(runtime.get("model") or "").strip()
+    return resolve_model(engine, requested)
+
+
+def persist_engine_model(target: pathlib.Path, engine: str, model: str) -> None:
+    """Write the resolved model back so the next resume keeps it."""
+    if not model:
+        return
+    runtime = load_runtime(target)
+    if not runtime or str(runtime.get("model") or "") == model:
+        return
+    runtime["model"] = model
+    path = target / ".absoloop" / "runtime.json"
+    try:
+        path.write_text(json.dumps(runtime, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        print(f"warning: could not update model in {path}: {exc}", file=sys.stderr)
 
 
 def choose_engine() -> str:
@@ -1456,6 +1514,11 @@ def extend_mission(target: pathlib.Path, state: dict, engine: str,
         runtime.setdefault("min_iterations", 3)
     delivery_mode = (runtime.get("delivery") or {}).get("mode", "local")
     runtime["delivery"] = default_delivery(delivery_mode, new_id)
+    model = ""
+    if engine:
+        model = resolve_engine_model(engine, target,
+                                     str(runtime.get("model") or ""))
+        runtime["model"] = model
 
     (abs_dir / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n",
                                           encoding="utf-8")
@@ -1482,9 +1545,10 @@ def extend_mission(target: pathlib.Path, state: dict, engine: str,
         run_cmd = ("python scripts/absoloop-run" if os.name == "nt"
                    else "./scripts/absoloop-run")
         engine_flag = f" --engine {engine}" if engine else ""
-        print(f"prepared — launch when ready: {run_cmd}{engine_flag}")
+        model_flag = f" --model {model}" if model else ""
+        print(f"prepared — launch when ready: {run_cmd}{engine_flag}{model_flag}")
         return 0
-    return start_loop(target, engine)
+    return start_loop(target, engine, model)
 
 
 def mission_runs(target: pathlib.Path) -> list[dict]:
@@ -1827,7 +1891,9 @@ def resume_command(argv: list[str]) -> int:
                               state.get("tokens_total"))
     print(f"resuming mission {state.get('mission_id')} at iteration "
           f"{state.get('iteration')} ({resume_cost} spent, status {status})")
-    return start_loop(target, engine)
+    model = resolve_engine_model(engine, target)
+    persist_engine_model(target, engine, model)
+    return start_loop(target, engine, model)
 
 
 def gate_command(action: str, argv: list[str]) -> int:
@@ -2056,6 +2122,7 @@ def abort_command(argv: list[str]) -> int:
 def start_loop(target: pathlib.Path, engine: str, model: str = "",
                announce: bool = True) -> int:
     sync_runner(target)
+    sync_result_schema(target)
     sync_skills(target, engines=(engine,))
     runner = target / "scripts" / "absoloop-run"
     cmd = [sys.executable, str(runner), "--engine", engine]
@@ -2124,6 +2191,7 @@ def scaffold_mission(target: pathlib.Path, objective: str,
     scripts = target / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     sync_runner(target)
+    sync_result_schema(target)
     sync_skills(target)
     for tmpl in ("absoloop-init",):
         src = TEMPLATES / tmpl
@@ -2166,10 +2234,7 @@ def scaffold_mission(target: pathlib.Path, objective: str,
 
     for sub in ("tmp", "checkpoints", "schemas", "prompts"):
         (abs_dir / sub).mkdir(parents=True, exist_ok=True)
-    schema_path = abs_dir / "schemas" / "agent-result.schema.json"
-    if not schema_path.exists():
-        schema_path.write_text(json.dumps(RESULT_SCHEMA, indent=2) + "\n",
-                               encoding="utf-8")
+    sync_result_schema(target)
     critic_path = abs_dir / "prompts" / "critic-final-review.md"
     if not critic_path.exists():
         critic_path.write_text(CRITIC_PROMPT, encoding="utf-8")

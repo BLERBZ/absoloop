@@ -51,10 +51,32 @@ def model_labels(engine: str) -> Dict[str, str]:
     return dict(MODEL_LABELS.get(engine, {}))
 
 
+def _owned_by_other_engine(engine: str, model: str) -> bool:
+    """True when ``model`` is a curated id for a different engine.
+
+    Switching engines (briefing ``e``, ``--engine codex``, …) must not keep
+    Claude-only aliases like ``best`` — Codex ChatGPT auth rejects them.
+    Custom / unknown ids are left alone so operators can still type freestyle.
+    """
+    if model in ENGINE_MODELS.get(engine, ()):
+        return False
+    for other, models in ENGINE_MODELS.items():
+        if other != engine and model in models:
+            return True
+    return False
+
+
 def resolve_model(engine: str, requested: str = "") -> str:
-    """Return a usable model id — requested if set, else engine best."""
+    """Return a usable model id — requested if set, else engine best.
+
+    Remaps curated aliases that belong to another engine (e.g. Claude ``best``
+    when the loop engine is Codex) so an engine switch cannot strand the
+    mission on an unsupported model id.
+    """
     requested = (requested or "").strip()
-    return requested or default_model(engine)
+    if not requested or _owned_by_other_engine(engine, requested):
+        return default_model(engine)
+    return requested
 
 
 def all_known_models() -> Sequence[str]:
