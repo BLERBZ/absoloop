@@ -2495,8 +2495,22 @@ def ui_settings_path(project: pathlib.Path) -> pathlib.Path:
     return project / ".absoloop" / "zcomb" / _UI_SETTINGS_NAME
 
 
+def _engine_on_path(name: str) -> bool:
+    """True when an engine CLI is resolvable (PATH + common install dirs)."""
+    if shutil.which(name):
+        return True
+    home = pathlib.Path.home()
+    candidates = (
+        home / ".local" / "bin" / name,
+        home / "bin" / name,
+        pathlib.Path("/opt/homebrew/bin") / name,
+        pathlib.Path("/usr/local/bin") / name,
+    )
+    return any(path.is_file() and os.access(path, os.X_OK) for path in candidates)
+
+
 def settings_catalog() -> dict[str, Any]:
-    """Engines/models for the ZComb gear menu — only PATH-available engines."""
+    """Engines/models for the ZComb gear menu — PATH-available engines marked."""
     from absoloop_harness.models import ENGINE_MODELS, MODEL_LABELS
 
     engines: list[dict[str, Any]] = []
@@ -2511,10 +2525,40 @@ def settings_catalog() -> dict[str, Any]:
         engines.append({
             "id": name,
             "label": name.capitalize(),
-            "available": bool(shutil.which(name)),
+            "available": _engine_on_path(name),
             "models": models,
         })
     return {"engines": engines}
+
+
+def load_loop_settings(project: pathlib.Path) -> dict[str, Any]:
+    """Read-only settings payload for the gear menu (no file writes)."""
+    project = project.expanduser().resolve()
+    abs_dir = project / ".absoloop"
+    runtime: dict[str, Any] = {}
+    runtime_path = abs_dir / "runtime.json"
+    if runtime_path.is_file():
+        try:
+            loaded = json.loads(runtime_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                runtime = loaded
+        except (OSError, json.JSONDecodeError):
+            runtime = {}
+    monitor = None
+    monitor_path = abs_dir / "tmp" / "monitor.json"
+    if monitor_path.is_file():
+        try:
+            loaded = json.loads(monitor_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                monitor = loaded
+        except (OSError, json.JSONDecodeError):
+            monitor = None
+    settings = _bridge_settings(
+        project, runtime=runtime, monitor=monitor,
+        active_engine=str((monitor or {}).get("engine")
+                          or runtime.get("engine") or ""),
+    )
+    return {"ok": True, "settings": settings}
 
 
 def read_ui_settings(project: pathlib.Path) -> dict[str, Any]:
@@ -3105,6 +3149,7 @@ __all__ = [
     "reset_kanban_session",
     "settings_catalog",
     "read_ui_settings",
+    "load_loop_settings",
     "save_loop_settings",
     "DEFAULT_PORT",
 ]

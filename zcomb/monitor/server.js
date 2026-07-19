@@ -193,6 +193,53 @@ function loopEngineArgs() {
   }
 }
 
+/** Read gear-menu catalog + prefs (live Python; independent of metrics.json). */
+function loadLoopSettings() {
+  const project = resolveProjectRoot();
+  const home = resolveAbsoloopHome();
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      process.env.PYTHON || 'python3',
+      ['-c',
+        'import json\n'
+        + 'from pathlib import Path\n'
+        + 'from absoloop_harness.zcomb import load_loop_settings\n'
+        + `print(json.dumps(load_loop_settings(Path(${JSON.stringify(project)}))))\n`],
+      {
+        cwd: home,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk) => { stdout += chunk; });
+    child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('load settings timed out'));
+    }, 30_000);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      try {
+        const line = stdout.trim().split('\n').filter(Boolean).pop() || '{}';
+        const result = JSON.parse(line);
+        if (code !== 0 && result.ok !== true) {
+          reject(new Error(result.error || stderr.trim() || `exit ${code}`));
+          return;
+        }
+        resolvePromise(result);
+      } catch (err) {
+        reject(new Error(stderr.trim() || err?.message || 'invalid settings response'));
+      }
+    });
+  });
+}
+
 /**
  * Persist gear-menu settings via the Python bridge.
  * Updates runtime.json for the next loop only — does not stop a live runner.
@@ -458,6 +505,27 @@ app.post('/api/retarget', (req, res) => {
     stateDir: STATE_DIR,
     message: 'Dashboard retargeted to new project/run',
   });
+});
+
+/** Gear menu catalog + current prefs (does not rely on metrics.json). */
+app.get('/api/settings', async (_req, res) => {
+  const project = resolveProjectRoot();
+  if (!existsSync(join(project, '.absoloop'))) {
+    res.status(400).json({
+      ok: false,
+      error: `No .absoloop/ under ${project} — not an Absoloop project`,
+    });
+    return;
+  }
+  try {
+    const result = await loadLoopSettings();
+    res.status(result.ok ? 200 : 400).json(result);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+  }
 });
 
 /**

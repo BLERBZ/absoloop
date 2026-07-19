@@ -1178,10 +1178,8 @@ class LoopSettingsTests(unittest.TestCase):
                 "model": "best",
                 "loop_id": "loop-settings",
             })
-            with mock.patch.object(zcomb.shutil, "which",
-                                   side_effect=lambda name: (
-                                       "/bin/" + name if name in ("claude", "codex")
-                                       else None)):
+            with mock.patch.object(zcomb, "_engine_on_path",
+                                   side_effect=lambda name: name in ("claude", "codex")):
                 result = zcomb.save_loop_settings(
                     project, engine="codex", model="gpt-5.6-terra", theme="light")
             self.assertTrue(result["ok"])
@@ -1207,9 +1205,8 @@ class LoopSettingsTests(unittest.TestCase):
                 "engine": "grok",
                 "model": "grok-build-0.1",
             })
-            with mock.patch.object(zcomb.shutil, "which",
-                                   side_effect=lambda name: (
-                                       "/bin/grok" if name == "grok" else None)):
+            with mock.patch.object(zcomb, "_engine_on_path",
+                                   side_effect=lambda name: name == "grok"):
                 metrics = zcomb.build_bridge_state(project)["metrics"]
             settings = metrics["settings"]
             available = [e for e in settings["engines"] if e["available"]]
@@ -1223,9 +1220,8 @@ class LoopSettingsTests(unittest.TestCase):
             project = pathlib.Path(tmp)
             abs_dir = project / ".absoloop"
             _write(abs_dir / "runtime.json", {"objective": "x", "max_iterations": 1})
-            with mock.patch.object(zcomb.shutil, "which",
-                                   side_effect=lambda name: (
-                                       "/bin/claude" if name == "claude" else None)):
+            with mock.patch.object(zcomb, "_engine_on_path",
+                                   side_effect=lambda name: name == "claude"):
                 result = zcomb.save_loop_settings(project, engine="grok")
             self.assertFalse(result["ok"])
             self.assertIn("not available", result["error"])

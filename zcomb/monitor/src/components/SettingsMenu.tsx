@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type CSSProperties } from 'react';
-import type { Metrics, SettingsCatalogEngine } from '../hooks/usePolling';
+import type { LoopSettings, Metrics, SettingsCatalogEngine } from '../hooks/usePolling';
 
 interface SettingsMenuProps {
   metrics?: Metrics | null;
@@ -46,8 +46,23 @@ export async function saveSettings(body: {
   };
 }
 
-function availableEngines(settings: Metrics['settings']): SettingsCatalogEngine[] {
-  return (settings?.engines || []).filter((e) => e.available);
+async function fetchSettings(): Promise<LoopSettings | null> {
+  try {
+    const res = await fetch('/api/settings');
+    if (!res.ok) return null;
+    const payload = await res.json();
+    return (payload?.settings as LoopSettings) || null;
+  } catch {
+    return null;
+  }
+}
+
+function selectableEngines(settings: LoopSettings | null | undefined): SettingsCatalogEngine[] {
+  const list = settings?.engines || [];
+  const active = list.filter((e) => e.available);
+  // Prefer PATH-available engines; if detection failed, still show the catalog
+  // so the gear menu is usable (Save will re-validate on the server).
+  return active.length ? active : list;
 }
 
 export function SettingsMenu({
@@ -62,26 +77,49 @@ export function SettingsMenu({
   const [open, setOpen] = useState(false);
   const [flash, setFlash] = useState<Flash>(null);
   const [saving, setSaving] = useState(false);
+  const [loading, setLoading] = useState(false);
   const [draftTheme, setDraftTheme] = useState<'dark' | 'light'>(darkMode ? 'dark' : 'light');
   const [draftEngine, setDraftEngine] = useState('');
   const [draftModel, setDraftModel] = useState('');
   const [modelOpen, setModelOpen] = useState(false);
+  const [liveSettings, setLiveSettings] = useState<LoopSettings | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const themeBeforeOpen = useRef<'dark' | 'light'>(darkMode ? 'dark' : 'light');
 
-  const settings = metrics?.settings;
-  const engines = availableEngines(settings);
+  const settings = liveSettings || metrics?.settings || null;
+  const engines = selectableEngines(settings);
   const selectedEngine = engines.find((e) => e.id === draftEngine) || engines[0];
   const models = selectedEngine?.models || [];
   const modelLabel = models.find((m) => m.id === draftModel)?.label || draftModel;
   const live = Boolean(metrics?.live);
 
-  // Seed drafts from bridge when the menu is closed (poll updates).
-  useEffect(() => {
-    if (!settings || open) return;
-    setDraftTheme(settings.theme === 'light' ? 'light' : 'dark');
-    if (settings.engine) setDraftEngine(settings.engine);
-    if (settings.model) setDraftModel(settings.model);
-  }, [settings?.engine, settings?.model, settings?.theme, open]); // eslint-disable-line react-hooks/exhaustive-deps
+  const applyTheme = (theme: 'dark' | 'light') => {
+    setDraftTheme(theme);
+    onThemeChange(theme === 'dark');
+    localStorage.setItem('zc-theme', theme);
+  };
+
+  const seedFrom = (next: LoopSettings | null | undefined) => {
+    if (!next) return;
+    setDraftTheme(next.theme === 'light' ? 'light' : 'dark');
+    if (next.engine) setDraftEngine(next.engine);
+    if (next.model) setDraftModel(next.model);
+  };
+
+  const openMenu = async () => {
+    themeBeforeOpen.current = darkMode ? 'dark' : 'light';
+    setDraftTheme(darkMode ? 'dark' : 'light');
+    seedFrom(metrics?.settings);
+    setOpen(true);
+    setFlash(null);
+    setLoading(true);
+    const fetched = await fetchSettings();
+    setLoading(false);
+    if (fetched) {
+      setLiveSettings(fetched);
+      seedFrom(fetched);
+    }
+  };
 
   useEffect(() => {
     if (!open) {
@@ -130,9 +168,11 @@ export function SettingsMenu({
     });
     setSaving(false);
     if (result.ok) {
-      onThemeChange(theme === 'dark');
-      localStorage.setItem('zc-theme', theme);
+      applyTheme(theme);
+      themeBeforeOpen.current = theme;
       setFlash({ ok: true, text: result.message });
+      const fetched = await fetchSettings();
+      if (fetched) setLiveSettings(fetched);
       onRefresh?.();
       window.setTimeout(() => setFlash(null), 3200);
     } else {
@@ -144,14 +184,15 @@ export function SettingsMenu({
   const menuHover = darkMode ? '#21262d' : '#eaeef2';
   const accent = darkMode ? '#58a6ff' : '#0969da';
 
-  const segmentBtn = (active: boolean): CSSProperties => ({
+  const segmentBtn = (active: boolean, disabled = false): CSSProperties => ({
     flex: 1,
     padding: '5px 8px',
     fontSize: 11,
     fontWeight: active ? 600 : 500,
     border: 'none',
     borderRadius: 5,
-    cursor: 'pointer',
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    opacity: disabled ? 0.45 : 1,
     background: active ? (darkMode ? '#30363d' : '#ffffff') : 'transparent',
     color: active ? textColor : mutedColor,
     boxShadow: active
@@ -168,13 +209,12 @@ export function SettingsMenu({
         aria-expanded={open}
         title="Settings"
         onClick={() => {
-          if (!open && settings) {
-            setDraftTheme(settings.theme === 'light' ? 'light' : (darkMode ? 'dark' : 'light'));
-            if (settings.engine) setDraftEngine(settings.engine);
-            if (settings.model) setDraftModel(settings.model);
+          if (open) {
+            setOpen(false);
+            setModelOpen(false);
+          } else {
+            void openMenu();
           }
-          setOpen((v) => !v);
-          setFlash(null);
         }}
         style={{
           display: 'flex',
@@ -225,9 +265,14 @@ export function SettingsMenu({
         >
           <div style={{ fontSize: 12, fontWeight: 600, color: textColor }}>
             Settings
+            {loading ? (
+              <span style={{ marginLeft: 8, fontWeight: 500, color: mutedColor, fontSize: 11 }}>
+                loading…
+              </span>
+            ) : null}
           </div>
 
-          {/* Theme */}
+          {/* Theme — preview immediately; Save persists */}
           <div>
             <div style={{ fontSize: 10, fontWeight: 600, color: mutedColor, marginBottom: 6, letterSpacing: 0.3 }}>
               APPEARANCE
@@ -242,10 +287,10 @@ export function SettingsMenu({
                 border: `1px solid ${borderColor}`,
               }}
             >
-              <button type="button" style={segmentBtn(draftTheme === 'light')} onClick={() => setDraftTheme('light')}>
+              <button type="button" style={segmentBtn(draftTheme === 'light')} onClick={() => applyTheme('light')}>
                 Light
               </button>
-              <button type="button" style={segmentBtn(draftTheme === 'dark')} onClick={() => setDraftTheme('dark')}>
+              <button type="button" style={segmentBtn(draftTheme === 'dark')} onClick={() => applyTheme('dark')}>
                 Dark
               </button>
             </div>
@@ -258,7 +303,7 @@ export function SettingsMenu({
             </div>
             {engines.length === 0 ? (
               <div style={{ fontSize: 11, color: mutedColor }}>
-                No engines on PATH
+                {loading ? 'Detecting engines…' : 'No engines on PATH'}
               </div>
             ) : (
               <div
@@ -275,8 +320,13 @@ export function SettingsMenu({
                   <button
                     key={eng.id}
                     type="button"
-                    style={segmentBtn(draftEngine === eng.id)}
+                    disabled={!eng.available && engines.some((e) => e.available)}
+                    style={segmentBtn(
+                      draftEngine === eng.id,
+                      !eng.available && engines.some((e) => e.available),
+                    )}
                     onClick={() => {
+                      if (!eng.available && engines.some((e) => e.available)) return;
                       setDraftEngine(eng.id);
                       const first = eng.models[0]?.id;
                       if (first) setDraftModel(first);
@@ -387,8 +437,8 @@ export function SettingsMenu({
 
           <div style={{ fontSize: 10, color: mutedColor, lineHeight: 1.4 }}>
             {live
-              ? 'Save applies on the next loop — the active run keeps its current engine/model.'
-              : 'Save applies on the next loop (resume / extend / start).'}
+              ? 'Engine/model apply on the next loop — the active run keeps its current engine/model.'
+              : 'Engine/model apply on the next loop (resume / extend / start).'}
             {settings?.pendingNextLoop && settings.activeEngine ? (
               <span style={{ display: 'block', marginTop: 4, color: accent }}>
                 Active now: {settings.activeEngine}
@@ -413,7 +463,7 @@ export function SettingsMenu({
 
           <button
             type="button"
-            disabled={saving || !engines.length}
+            disabled={saving || (!engines.length && !loading)}
             onClick={() => void onSave()}
             style={{
               padding: '7px 12px',
@@ -421,8 +471,8 @@ export function SettingsMenu({
               fontWeight: 600,
               borderRadius: 6,
               border: 'none',
-              cursor: saving || !engines.length ? 'not-allowed' : 'pointer',
-              opacity: saving || !engines.length ? 0.55 : 1,
+              cursor: saving || (!engines.length && !loading) ? 'not-allowed' : 'pointer',
+              opacity: saving || (!engines.length && !loading) ? 0.55 : 1,
               background: darkMode ? '#238636' : '#1a7f37',
               color: '#ffffff',
             }}
