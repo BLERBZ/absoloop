@@ -177,6 +177,85 @@ function markDashboardRestarting(action, note = '') {
   return marker;
 }
 
+/** Next-loop engine/model from runtime.json (ZComb gear Save). */
+function loopEngineArgs() {
+  const project = resolveProjectRoot();
+  try {
+    const runtimePath = join(project, '.absoloop', 'runtime.json');
+    if (!existsSync(runtimePath)) return [];
+    const runtime = JSON.parse(readFileSync(runtimePath, 'utf-8'));
+    const args = [];
+    if (runtime?.engine) args.push('--engine', String(runtime.engine));
+    if (runtime?.model) args.push('--model', String(runtime.model));
+    return args;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Persist gear-menu settings via the Python bridge.
+ * Updates runtime.json for the next loop only — does not stop a live runner.
+ */
+function saveLoopSettings({ theme, engine, model } = {}) {
+  const project = resolveProjectRoot();
+  const home = resolveAbsoloopHome();
+  const payload = JSON.stringify({
+    theme: theme || '',
+    engine: engine || '',
+    model: model || '',
+  });
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      process.env.PYTHON || 'python3',
+      ['-c',
+        'import json, sys\n'
+        + 'from pathlib import Path\n'
+        + 'from absoloop_harness.zcomb import save_loop_settings\n'
+        + `project = Path(${JSON.stringify(project)})\n`
+        + `body = json.loads(${JSON.stringify(payload)})\n`
+        + 'result = save_loop_settings(\n'
+        + '    project,\n'
+        + '    engine=str(body.get("engine") or ""),\n'
+        + '    model=str(body.get("model") or ""),\n'
+        + '    theme=str(body.get("theme") or ""),\n'
+        + ')\n'
+        + 'print(json.dumps(result))\n'],
+      {
+        cwd: home,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk) => { stdout += chunk; });
+    child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('save settings timed out'));
+    }, 30_000);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      try {
+        const line = stdout.trim().split('\n').filter(Boolean).pop() || '{}';
+        const result = JSON.parse(line);
+        if (code !== 0 && result.ok !== true) {
+          reject(new Error(result.error || stderr.trim() || `exit ${code}`));
+          return;
+        }
+        resolvePromise(result);
+      } catch (err) {
+        reject(new Error(stderr.trim() || err?.message || 'invalid settings response'));
+      }
+    });
+  });
+}
+
 /**
  * Run an Absoloop CLI action against the bridged project.
  * Resume/extend are detached (long-running loop); approve/report/abort wait.
@@ -381,6 +460,42 @@ app.post('/api/retarget', (req, res) => {
   });
 });
 
+/**
+ * Gear menu Save — theme + engine + model for the next loop.
+ * Does not interrupt a live Absoloop process.
+ */
+app.post('/api/settings', async (req, res) => {
+  const project = resolveProjectRoot();
+  if (!existsSync(join(project, '.absoloop'))) {
+    res.status(400).json({
+      ok: false,
+      error: `No .absoloop/ under ${project} — not an Absoloop project`,
+    });
+    return;
+  }
+  const theme = typeof req.body?.theme === 'string' ? req.body.theme.trim() : '';
+  const engine = typeof req.body?.engine === 'string' ? req.body.engine.trim() : '';
+  const model = typeof req.body?.model === 'string' ? req.body.model.trim() : '';
+  try {
+    const result = await saveLoopSettings({ theme, engine, model });
+    if (result.ok) {
+      // Refresh metrics so the gear menu reflects saved prefs immediately.
+      syncDashboardBridge();
+      const metrics = readStateFile('metrics.json') || {};
+      if (result.settings) {
+        metrics.settings = result.settings;
+        writeStateFile('metrics.json', metrics);
+      }
+    }
+    res.status(result.ok ? 200 : 400).json(result);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+  }
+});
+
 // Mission quick actions → absoloop approve | resume | extend | report | abort
 app.post('/api/actions/:action', async (req, res) => {
   const action = String(req.params.action || '').toLowerCase();
@@ -418,6 +533,10 @@ app.post('/api/actions/:action', async (req, res) => {
   }
   if (action === 'abort') {
     extraArgs.push('--yes');
+  }
+  // Prefer gear-menu / runtime.json engine+model for the new/continued loop.
+  if (action === 'extend' || action === 'resume') {
+    extraArgs.push(...loopEngineArgs());
   }
 
   // Flip Kanban to STARTING before the CLI returns so polls never briefly

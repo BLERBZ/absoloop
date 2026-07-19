@@ -45,6 +45,31 @@ export interface ObjectiveHistoryEntry {
   endedAt?: number | null;
 }
 
+export interface SettingsCatalogModel {
+  id: string;
+  label: string;
+}
+
+export interface SettingsCatalogEngine {
+  id: string;
+  label: string;
+  available: boolean;
+  models: SettingsCatalogModel[];
+}
+
+/** Gear-menu prefs from the bridge — next-loop engine/model + catalog. */
+export interface LoopSettings {
+  theme?: 'dark' | 'light' | string;
+  engine?: string;
+  model?: string;
+  activeEngine?: string;
+  activeModel?: string;
+  pendingNextLoop?: boolean;
+  engines?: SettingsCatalogEngine[];
+  savedAt?: number | null;
+  applyOn?: string;
+}
+
 export interface Metrics {
   completionPct: number;
   errorRate: number;
@@ -69,6 +94,8 @@ export interface Metrics {
   startedAt?: number | null;
   /** Unix seconds — when terminal; freezes the header elapsed timer. */
   endedAt?: number | null;
+  /** Gear menu: theme + next-loop engine/model. */
+  settings?: LoopSettings;
 }
 
 export interface RunResultsCritic {

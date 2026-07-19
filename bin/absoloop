@@ -794,18 +794,27 @@ def resolve_engine_model(engine: str, target: pathlib.Path,
 
 
 def persist_engine_model(target: pathlib.Path, engine: str, model: str) -> None:
-    """Write the resolved model back so the next resume keeps it."""
-    if not model:
+    """Write engine + model back so the next resume/extend keeps them."""
+    if not engine and not model:
         return
     runtime = load_runtime(target)
-    if not runtime or str(runtime.get("model") or "") == model:
+    if not runtime:
         return
-    runtime["model"] = model
+    changed = False
+    if engine and str(runtime.get("engine") or "") != engine:
+        runtime["engine"] = engine
+        changed = True
+    if model and str(runtime.get("model") or "") != model:
+        runtime["model"] = model
+        changed = True
+    if not changed:
+        return
     path = target / ".absoloop" / "runtime.json"
     try:
         path.write_text(json.dumps(runtime, indent=2) + "\n", encoding="utf-8")
     except OSError as exc:
-        print(f"warning: could not update model in {path}: {exc}", file=sys.stderr)
+        print(f"warning: could not update engine/model in {path}: {exc}",
+              file=sys.stderr)
 
 
 def choose_engine() -> str:
@@ -1541,6 +1550,7 @@ def extend_mission(target: pathlib.Path, state: dict, engine: str,
     if engine:
         model = resolve_engine_model(engine, target,
                                      str(runtime.get("model") or ""))
+        runtime["engine"] = engine
         runtime["model"] = model
 
     (abs_dir / "runtime.json").write_text(json.dumps(runtime, indent=2) + "\n",
@@ -1879,7 +1889,9 @@ def resume_command(argv: list[str], *, force_extend: bool = False) -> int:
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
     parser.add_argument("--engine", choices=["claude", "codex", "grok"],
-                        help="engine for the loop (default: first one found on PATH)")
+                        help="engine for the loop (default: runtime.json, else PATH)")
+    parser.add_argument("--model", default="",
+                        help="model id/alias (default: runtime.json / engine best)")
     if force_extend:
         parser.set_defaults(extend=True)
         note_help = "what the follow-on run should focus on"
@@ -1916,11 +1928,19 @@ def resume_command(argv: list[str], *, force_extend: bool = False) -> int:
         print(f"error: {runner} not found — re-adopt the project with "
               f"'absoloop {target}' first.", file=sys.stderr)
         return 1
-    engine = args.engine or default_engine()
+    runtime = load_runtime(target) or {}
+    # CLI flag → saved runtime (ZComb gear / prior run) → first on PATH.
+    preferred = args.engine or str(runtime.get("engine") or "").strip() or None
+    if preferred and not shutil.which(preferred):
+        print(f"warning: saved engine '{preferred}' not on PATH — "
+              f"falling back to an available CLI.", file=sys.stderr)
+        preferred = None
+    engine = preferred or default_engine()
     if engine is None:
         print("error: no engine available — install 'claude', 'codex', or 'grok'.",
               file=sys.stderr)
         return 1
+    model = resolve_engine_model(engine, target, args.model)
     status = state.get("status")
     if args.extend:
         if status == "AWAITING_APPROVAL":
@@ -1928,6 +1948,7 @@ def resume_command(argv: list[str], *, force_extend: bool = False) -> int:
                   "('absoloop approve' or 'absoloop reject \"...\"'), then extend.",
                   file=sys.stderr)
             return 3
+        persist_engine_model(target, engine, model)
         return extend_mission(target, state, engine, args.note,
                               args.iterations, args.budget, args.hours,
                               args.min_iterations)
@@ -1952,7 +1973,6 @@ def resume_command(argv: list[str], *, force_extend: bool = False) -> int:
                               state.get("tokens_total"))
     print(f"resuming mission {state.get('mission_id')} at iteration "
           f"{state.get('iteration')} ({resume_cost} spent, status {status})")
-    model = resolve_engine_model(engine, target)
     persist_engine_model(target, engine, model)
     return start_loop(target, engine, model)
 

@@ -1166,5 +1166,70 @@ class DashboardAttachTests(unittest.TestCase):
             start.assert_called_once()
 
 
+class LoopSettingsTests(unittest.TestCase):
+    def test_save_loop_settings_updates_runtime_not_live_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            _write(abs_dir / "runtime.json", {
+                "objective": "Tune engines",
+                "max_iterations": 5,
+                "engine": "claude",
+                "model": "best",
+                "loop_id": "loop-settings",
+            })
+            with mock.patch.object(zcomb.shutil, "which",
+                                   side_effect=lambda name: (
+                                       "/bin/" + name if name in ("claude", "codex")
+                                       else None)):
+                result = zcomb.save_loop_settings(
+                    project, engine="codex", model="gpt-5.6-terra", theme="light")
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["engine"], "codex")
+            self.assertEqual(result["model"], "gpt-5.6-terra")
+            self.assertEqual(result["theme"], "light")
+            self.assertEqual(result["applyOn"], "next_loop")
+            runtime = json.loads((abs_dir / "runtime.json").read_text(encoding="utf-8"))
+            self.assertEqual(runtime["engine"], "codex")
+            self.assertEqual(runtime["model"], "gpt-5.6-terra")
+            ui = json.loads(
+                (abs_dir / "zcomb" / "ui-settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(ui["theme"], "light")
+            self.assertEqual(ui["engine"], "codex")
+
+    def test_bridge_settings_lists_only_available_engines_as_selectable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            _write(abs_dir / "runtime.json", {
+                "objective": "Settings catalog",
+                "max_iterations": 3,
+                "engine": "grok",
+                "model": "grok-build-0.1",
+            })
+            with mock.patch.object(zcomb.shutil, "which",
+                                   side_effect=lambda name: (
+                                       "/bin/grok" if name == "grok" else None)):
+                metrics = zcomb.build_bridge_state(project)["metrics"]
+            settings = metrics["settings"]
+            available = [e for e in settings["engines"] if e["available"]]
+            self.assertEqual([e["id"] for e in available], ["grok"])
+            self.assertEqual(settings["engine"], "grok")
+            self.assertTrue(any(m["id"] == "grok-build-0.1"
+                                for m in available[0]["models"]))
+
+    def test_rejects_unavailable_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            _write(abs_dir / "runtime.json", {"objective": "x", "max_iterations": 1})
+            with mock.patch.object(zcomb.shutil, "which",
+                                   side_effect=lambda name: (
+                                       "/bin/claude" if name == "claude" else None)):
+                result = zcomb.save_loop_settings(project, engine="grok")
+            self.assertFalse(result["ok"])
+            self.assertIn("not available", result["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

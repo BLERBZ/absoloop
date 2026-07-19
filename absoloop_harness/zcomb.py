@@ -2461,6 +2461,11 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             # Mission wall-clock anchors for the header elapsed timer.
             "startedAt": started if started > 0 and not awaiting else None,
             "endedAt": ended_at if ended_at > 0 and not awaiting else None,
+            # Gear-menu prefs: next-loop engine/model + available engines.
+            "settings": _bridge_settings(
+                project, runtime=runtime, monitor=monitor,
+                active_engine=engine if engine != "builder" else "",
+            ),
         },
         "activity": activity,
         "riskAnalysis": {
@@ -2479,6 +2484,192 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "tokensTotal": 0 if awaiting else (source.get("tokens_total") or 0),
         },
         "runResults": run_results,
+    }
+
+
+_UI_SETTINGS_NAME = "ui-settings.json"
+_ENGINE_ORDER = ("claude", "codex", "grok")
+
+
+def ui_settings_path(project: pathlib.Path) -> pathlib.Path:
+    return project / ".absoloop" / "zcomb" / _UI_SETTINGS_NAME
+
+
+def settings_catalog() -> dict[str, Any]:
+    """Engines/models for the ZComb gear menu — only PATH-available engines."""
+    from absoloop_harness.models import ENGINE_MODELS, MODEL_LABELS
+
+    engines: list[dict[str, Any]] = []
+    for name in _ENGINE_ORDER:
+        models = [
+            {
+                "id": model_id,
+                "label": MODEL_LABELS.get(name, {}).get(model_id, model_id),
+            }
+            for model_id in ENGINE_MODELS.get(name, ())
+        ]
+        engines.append({
+            "id": name,
+            "label": name.capitalize(),
+            "available": bool(shutil.which(name)),
+            "models": models,
+        })
+    return {"engines": engines}
+
+
+def read_ui_settings(project: pathlib.Path) -> dict[str, Any]:
+    path = ui_settings_path(project)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_loop_settings(
+    project: pathlib.Path,
+    *,
+    engine: str = "",
+    model: str = "",
+    theme: str = "",
+) -> dict[str, Any]:
+    """Persist theme + next-loop engine/model. Never stops a live runner.
+
+    Writes ``.absoloop/zcomb/ui-settings.json`` and updates ``runtime.json``
+    ``engine`` / ``model``. The active process keeps its CLI argv; the next
+    ``resume`` / ``extend`` / start picks these up.
+    """
+    from absoloop_harness.models import resolve_model
+
+    project = project.expanduser().resolve()
+    abs_dir = project / ".absoloop"
+    if not abs_dir.is_dir():
+        return {"ok": False, "error": f"No .absoloop/ under {project}"}
+
+    catalog = settings_catalog()
+    available_ids = [e["id"] for e in catalog["engines"] if e.get("available")]
+    available = set(available_ids)
+    if not available_ids:
+        return {
+            "ok": False,
+            "error": "No engine on PATH — install claude, codex, or grok",
+        }
+
+    runtime_path = abs_dir / "runtime.json"
+    runtime: dict[str, Any] = {}
+    if runtime_path.is_file():
+        try:
+            loaded = json.loads(runtime_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                runtime = loaded
+        except (OSError, json.JSONDecodeError):
+            runtime = {}
+
+    ui = read_ui_settings(project)
+    next_engine = (engine or ui.get("engine") or runtime.get("engine") or "").strip()
+    if next_engine not in available:
+        # Prefer an explicit request only when it's installed; else first available.
+        if engine and engine.strip() in _ENGINE_ORDER and engine.strip() not in available:
+            return {
+                "ok": False,
+                "error": f"Engine '{engine.strip()}' is not available on PATH",
+            }
+        next_engine = available_ids[0]
+
+    next_model = resolve_model(next_engine, model or str(ui.get("model") or ""))
+    next_theme = (theme or ui.get("theme") or "dark").strip().lower()
+    if next_theme not in ("dark", "light"):
+        next_theme = "dark"
+
+    runtime["engine"] = next_engine
+    runtime["model"] = next_model
+    try:
+        runtime_path.write_text(
+            json.dumps(runtime, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not update runtime.json: {exc}"}
+
+    payload = {
+        "theme": next_theme,
+        "engine": next_engine,
+        "model": next_model,
+        "savedAt": time.time(),
+        "applyOn": "next_loop",
+    }
+    out = ui_settings_path(project)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not write ui-settings: {exc}"}
+
+    return {
+        "ok": True,
+        "theme": next_theme,
+        "engine": next_engine,
+        "model": next_model,
+        "applyOn": "next_loop",
+        "message": "Saved — applies on the next loop (won't interrupt a running run)",
+        "settings": _bridge_settings(
+            project, runtime=runtime, monitor=None,
+            active_engine=str(runtime.get("engine") or ""),
+        ),
+    }
+
+
+def _bridge_settings(
+    project: pathlib.Path,
+    *,
+    runtime: dict,
+    monitor: Optional[dict],
+    active_engine: str = "",
+) -> dict[str, Any]:
+    """Settings payload embedded in metrics for the gear menu."""
+    from absoloop_harness.models import resolve_model
+
+    catalog = settings_catalog()
+    ui = read_ui_settings(project)
+    monitor = monitor if isinstance(monitor, dict) else {}
+    live_engine = str(
+        monitor.get("engine") or active_engine
+        or runtime.get("engine") or ""
+    ).strip()
+    live_model = str(monitor.get("model") or runtime.get("model") or "").strip()
+
+    next_engine = str(
+        ui.get("engine") or runtime.get("engine") or live_engine or ""
+    ).strip()
+    available_ids = [e["id"] for e in catalog["engines"] if e.get("available")]
+    if next_engine not in available_ids and available_ids:
+        next_engine = available_ids[0]
+    next_model = resolve_model(
+        next_engine,
+        str(ui.get("model") or runtime.get("model") or live_model or ""),
+    )
+    theme = str(ui.get("theme") or "dark").strip().lower()
+    if theme not in ("dark", "light"):
+        theme = "dark"
+
+    pending = bool(
+        (ui.get("engine") or ui.get("model"))
+        and (
+            str(ui.get("engine") or "") != live_engine
+            or str(ui.get("model") or "") != live_model
+        )
+    )
+
+    return {
+        "theme": theme,
+        "engine": next_engine,
+        "model": next_model,
+        "activeEngine": live_engine,
+        "activeModel": live_model,
+        "pendingNextLoop": pending,
+        "engines": catalog["engines"],
+        "savedAt": ui.get("savedAt"),
+        "applyOn": "next_loop",
     }
 
 
@@ -2912,5 +3103,8 @@ __all__ = [
     "clear_restart_marker",
     "ensure_kanban_session",
     "reset_kanban_session",
+    "settings_catalog",
+    "read_ui_settings",
+    "save_loop_settings",
     "DEFAULT_PORT",
 ]

@@ -7,6 +7,7 @@ import { MetricsPanel } from './components/MetricsPanel';
 import { MissionControls, triggerAction } from './components/MissionControls';
 import { ObjectiveDropdown } from './components/ObjectiveDropdown';
 import { RunResultsPanel } from './components/RunResultsPanel';
+import { SettingsMenu } from './components/SettingsMenu';
 import { matchesActivityFilter } from './components/ActivityFeed';
 
 function formatElapsedSeconds(totalSeconds: number): string {
@@ -166,7 +167,12 @@ export default function App() {
     state, error, lastUpdate, connectionHealth,
     runEpoch, markRunRestarting, refreshNow,
   } = usePolling(3000);
-  const [darkMode, setDarkMode] = useState(true);
+  const [darkMode, setDarkMode] = useState(() => {
+    const stored = localStorage.getItem('zc-theme');
+    if (stored === 'light') return false;
+    if (stored === 'dark') return true;
+    return true;
+  });
   const [activityFilter, setActivityFilter] = useState<string>('focused');
   const [elapsed, setElapsed] = useState('—');
   const [agentsOpen, setAgentsOpen] = useState(() => localStorage.getItem('zc-panel-agents') !== '0');
@@ -449,25 +455,18 @@ export default function App() {
 
           {error && <span style={{ color: '#f85149', fontSize: 12 }}>Connection error</span>}
 
-          {/* Theme Toggle */}
-          <button
-            onClick={() => setDarkMode(!darkMode)}
-            style={{
-              background: 'none',
-              border: `1px solid ${borderColor}`,
-              borderRadius: 6,
-              padding: '4px 12px',
-              cursor: 'pointer',
-              color: textColor,
-              fontSize: 12,
-              fontWeight: 500,
-              transition: 'background 0.2s'
+          <SettingsMenu
+            metrics={metrics}
+            darkMode={darkMode}
+            borderColor={borderColor}
+            textColor={textColor}
+            mutedColor={mutedColor}
+            onThemeChange={(dark) => {
+              setDarkMode(dark);
+              localStorage.setItem('zc-theme', dark ? 'dark' : 'light');
             }}
-            onMouseEnter={e => (e.currentTarget.style.background = darkMode ? '#21262d' : '#e1e4e8')}
-            onMouseLeave={e => (e.currentTarget.style.background = 'none')}
-          >
-            {darkMode ? 'Light' : 'Dark'}
-          </button>
+            onRefresh={refreshNow}
+          />
         </div>
       </header>
 
