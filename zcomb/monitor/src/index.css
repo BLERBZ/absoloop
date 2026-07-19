@@ -249,3 +249,64 @@ textarea:focus-visible {
 .footer-stat-card:hover {
   transform: translateY(-1px);
 }
+
+/* Run Results — glanceable post-loop stance above the Kanban */
+.run-results-toggle:hover {
+  filter: brightness(1.03);
+}
+
+.run-results-pill {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-radius: 6px;
+  padding: 2px 7px;
+  white-space: nowrap;
+}
+
+.run-results-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.run-results-metric {
+  min-width: 0;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  padding: 8px 10px;
+}
+
+.run-results-summary-clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .run-results-body {
+    transition: none !important;
+  }
+
+  .run-results-toggle svg {
+    transition: none !important;
+  }
+}
+
+@media (max-width: 900px) {
+  .run-results-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .run-results-metrics {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .run-results-stance {
+    flex-direction: column;
+  }
+}

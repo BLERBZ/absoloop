@@ -171,6 +171,85 @@ class BridgeStateTests(unittest.TestCase):
             self.assertEqual(by_id["task-gate"]["status"], "review")
             self.assertGreaterEqual(bridged["metrics"]["completionPct"], 85)
 
+    def test_state_awaiting_approval_wins_over_live_final_review(self):
+        """Codex critic can leave monitor at FINAL_REVIEW after the gate.
+
+        CLI approve reads state.json; Kanban must publish the same status so
+        the green Approve control enables.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship via Codex",
+                "max_iterations": 8,
+                "engine": "codex",
+                "loop_id": "loop-codex-1",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "AWAITING_APPROVAL",
+                "iteration": 4,
+                "mission_id": "ABS-CODEX",
+                "started_at": now - 600,
+                "stop_reason": "accepted_pending_human_gate",
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "FINAL_REVIEW",
+                "phase": "critic review",
+                "iteration": 4,
+                "loop_id": "loop-codex-1",
+                "mission_id": "ABS-CODEX",
+                "engine": "codex",
+                "pid": os.getpid(),
+                "heartbeat_ts": now,
+                "started_at": now - 600,
+                "agent": "critic",
+            })
+            bridged = zcomb.build_bridge_state(project)
+            metrics = bridged["metrics"]
+            self.assertEqual(metrics["status"], "AWAITING_APPROVAL")
+            self.assertTrue(metrics["awaitingApproval"])
+            self.assertFalse(metrics["live"])
+            self.assertFalse(metrics["awaitingRun"])
+            by_id = {t["id"]: t for t in bridged["tasks"]["tasks"]}
+            self.assertEqual(by_id["task-gate"]["status"], "review")
+
+    def test_monitor_awaiting_approval_enables_gate_during_codex_wind_down(self):
+        """Live monitor already at the gate must enable Approve immediately."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship via Codex",
+                "max_iterations": 8,
+                "engine": "codex",
+                "loop_id": "loop-codex-2",
+            })
+            # Disk state can lag one flush behind monitor during stop()/report.
+            _write(abs_dir / "state.json", {
+                "status": "FINAL_REVIEW",
+                "iteration": 2,
+                "mission_id": "ABS-CODEX-2",
+                "started_at": now - 300,
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "AWAITING_APPROVAL",
+                "phase": "stopped",
+                "iteration": 2,
+                "loop_id": "loop-codex-2",
+                "engine": "codex",
+                "pid": os.getpid(),
+                "heartbeat_ts": now,
+                "started_at": now - 300,
+                "stop_reason": "accepted_pending_human_gate",
+            })
+            metrics = zcomb.build_bridge_state(project)["metrics"]
+            self.assertEqual(metrics["status"], "AWAITING_APPROVAL")
+            self.assertTrue(metrics["awaitingApproval"])
+            self.assertFalse(metrics["awaitingRun"])
+
     def test_sync_state_writes_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = pathlib.Path(tmp)
@@ -324,6 +403,99 @@ class BridgeStateTests(unittest.TestCase):
             self.assertEqual(texts[0], "Ship the original mission")
             self.assertEqual(texts[1], "First continuation — add tests")
             self.assertEqual(texts[2], "Second continuation — polish the UI")
+
+    def test_run_results_mirrors_cli_critic_spend_and_stop(self):
+        """Kanban Run Results panel gets critic finish, verdict, spend, stop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            critic_rel = ".absoloop/tmp/iteration-0003-critic.json"
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship via critic gate",
+                "max_iterations": 8,
+                "max_cost_usd": 50.0,
+                "loop_id": "loop-results-1",
+                "engine": "claude",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "AWAITING_APPROVAL",
+                "iteration": 3,
+                "mission_id": "ABS-RESULTS",
+                "started_at": now - 600,
+                "stop_reason": "accepted_pending_human_gate",
+                "cost_usd": 13.43,
+                "tokens_total": 2_283_900,
+            })
+            _write(abs_dir / "tmp" / "iteration-0003-critic.json", {
+                "num_turns": 8,
+                "total_cost_usd": 0.83,
+                "structured_output": {
+                    "recommendation": "PASS",
+                    "blocking_findings": [],
+                    "summary": (
+                        "Independently re-ran every documented gate and each "
+                        "passed exactly as claimed"
+                    ),
+                },
+            })
+            _write(abs_dir / "ledger.jsonl", "\n".join([
+                json.dumps({
+                    "ts": now - 120,
+                    "type": "agent_run",
+                    "engine": "claude",
+                    "exit_code": 0,
+                    "wall_seconds": 56.2,
+                    "cost_usd": 0.83,
+                    "cost_is_exact": True,
+                    "tokens": 200_600,
+                    "result": critic_rel,
+                }),
+                json.dumps({
+                    "ts": now - 100,
+                    "type": "mission_stop",
+                    "reason": "accepted_pending_human_gate",
+                    "status": "AWAITING_APPROVAL",
+                }),
+            ]) + "\n")
+            _write(abs_dir / "tmp" / "live.jsonl",
+                   json.dumps({
+                       "ts": now - 110,
+                       "agent": "critic",
+                       "kind": "verdict",
+                       "detail": (
+                           "PASS: Independently re-ran every documented gate "
+                           "and each passed exactly as claimed"
+                       ),
+                   }) + "\n")
+
+            bridged = zcomb.build_bridge_state(project)
+            results = bridged["runResults"]
+            self.assertTrue(results["available"])
+            self.assertEqual(results["verdict"]["recommendation"], "PASS")
+            self.assertIn("documented gate", results["verdict"]["summary"])
+            self.assertEqual(results["critic"]["outcome"], "finished")
+            self.assertEqual(results["critic"]["wallSeconds"], 56)
+            self.assertEqual(results["critic"]["costUsd"], 0.83)
+            self.assertEqual(results["critic"]["tokens"], 200_600)
+            self.assertEqual(results["critic"]["turns"], 8)
+            self.assertEqual(results["spend"]["costUsd"], 13.43)
+            self.assertEqual(results["spend"]["maxCostUsd"], 50.0)
+            self.assertEqual(results["spend"]["pctUsed"], 27)
+            self.assertAlmostEqual(results["spend"]["remainingUsd"], 36.57,
+                                   places=2)
+            self.assertEqual(results["mission"]["status"], "AWAITING_APPROVAL")
+            self.assertEqual(
+                results["mission"]["stopReason"],
+                "accepted_pending_human_gate",
+            )
+            self.assertEqual(results["mission"]["iteration"], 3)
+
+            out = zcomb.sync_state(project)
+            written = json.loads(
+                (out / "run-results.json").read_text(encoding="utf-8"))
+            self.assertTrue(written["available"])
+            self.assertEqual(written["verdict"]["recommendation"], "PASS")
 
 
 class CliDispatchTests(unittest.TestCase):

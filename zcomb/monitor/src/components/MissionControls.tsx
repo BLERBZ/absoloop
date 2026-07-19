@@ -59,20 +59,24 @@ export function MissionControls({
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  const status = String(metrics?.status || '').toUpperCase();
+  const status = String(metrics?.status || '').trim().toUpperCase();
   const live = Boolean(metrics?.live);
   const awaitingRun = Boolean(metrics?.awaitingRun);
+  const atHumanGate = Boolean(metrics?.awaitingApproval)
+    || status === 'AWAITING_APPROVAL';
   const hasMission = Boolean(metrics?.missionId || status) && status !== 'IDLE';
   const runningLike = live
     || ['EXECUTING', 'FINAL_REVIEW', 'RUNNING', 'STARTING'].includes(status);
 
-  const approveEnabled = !busy && hasMission && status === 'AWAITING_APPROVAL';
+  // Prefer the explicit bridge flag — Codex can briefly disagree between
+  // metrics.status and state.json while still being CLI-approvable.
+  const approveEnabled = !busy && hasMission && atHumanGate;
   const resumeEnabled = !busy && hasMission && !live && !awaitingRun
-    && status !== 'AWAITING_APPROVAL' && status !== 'STARTING' && !extendMode;
+    && !atHumanGate && status !== 'STARTING' && !extendMode;
   const extendEnabled = !busy && hasMission && !live && !awaitingRun
-    && status !== 'AWAITING_APPROVAL' && status !== 'STARTING';
+    && !atHumanGate && status !== 'STARTING';
   const reportEnabled = !busy && hasMission && !awaitingRun;
-  const abortEnabled = !busy && hasMission && runningLike && !awaitingRun;
+  const abortEnabled = !busy && hasMission && runningLike && !awaitingRun && !atHumanGate;
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -196,11 +200,40 @@ export function MissionControls({
         Controls
       </span>
 
+      {status && status !== 'IDLE' && (
+        <span
+          title="Mission status used for Approve / Resume / Abort"
+          style={{
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: '0.04em',
+            textTransform: 'uppercase',
+            color: atHumanGate
+              ? (darkMode ? '#e3b341' : '#9a6700')
+              : mutedColor,
+            background: atHumanGate
+              ? (darkMode ? '#3d2e0a' : '#fff8c5')
+              : 'transparent',
+            border: atHumanGate
+              ? `1px solid ${darkMode ? '#d2992266' : '#bf8700aa'}`
+              : '1px solid transparent',
+            borderRadius: 6,
+            padding: '3px 7px',
+            maxWidth: 160,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {status}
+        </span>
+      )}
+
       <button
         type="button"
         disabled={!approveEnabled}
         title={
-          status === 'AWAITING_APPROVAL'
+          atHumanGate
             ? 'Approve mission (absoloop approve)'
             : 'Available when status is AWAITING_APPROVAL'
         }
@@ -226,7 +259,7 @@ export function MissionControls({
               ? 'Finish or cancel the extend objective below'
               : live
                 ? 'Loop is already running'
-                : status === 'AWAITING_APPROVAL'
+                : atHumanGate
                   ? 'Decide the gate first (Approve), then resume'
                   : 'Continue the loop (absoloop resume)'
           }

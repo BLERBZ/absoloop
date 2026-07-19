@@ -1992,13 +1992,44 @@ def gate_command(action: str, argv: list[str]) -> int:
     status = state.get("status")
     if action == "approve":
         if status != "AWAITING_APPROVAL":
-            print(f"error: mission status is {status!r}, not AWAITING_APPROVAL — "
-                  "nothing to approve.", file=sys.stderr)
-            return 1
+            # Codex stop()/report can leave monitor at the gate a moment before
+            # state.json is re-read by a concurrent UI; accept either signal so
+            # ZComb Approve and CLI stay aligned.
+            monitor = load_monitor(target)
+            if str(monitor.get("status") or "").strip() != "AWAITING_APPROVAL":
+                print(f"error: mission status is {status!r}, not AWAITING_APPROVAL — "
+                      "nothing to approve.", file=sys.stderr)
+                return 1
+            state["status"] = "AWAITING_APPROVAL"
+            state.setdefault("stop_reason",
+                             monitor.get("stop_reason")
+                             or "accepted_pending_human_gate")
         state["status"] = "COMPLETED"
         state["stop_reason"] = "human_approved"
         state["human_feedback"] = None
         save()
+        # Freeze monitor so ZComb immediately drops Approve / live telemetry
+        # instead of keeping a stale AWAITING_APPROVAL snapshot (common after
+        # long Codex critic/report windows).
+        try:
+            tmp = abs_dir / "tmp"
+            tmp.mkdir(parents=True, exist_ok=True)
+            mon_path = tmp / "monitor.json"
+            snapshot = load_monitor(target) if mon_path.is_file() else {"schema": 1}
+            now = time.time()
+            snapshot.update({
+                "status": "COMPLETED",
+                "phase": "stopped",
+                "stop_reason": "human_approved",
+                "live": False,
+                "ended_at": now,
+                "heartbeat_ts": now - HEARTBEAT_STALE_SECONDS - 1,
+            })
+            mon_path.write_text(
+                json.dumps(snapshot, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: could not update monitor.json: {exc}", file=sys.stderr)
         record({"type": "human_gate", "decision": "approved", "note": args.message,
                 "iteration": state.get("iteration")})
         cost_text = with_tokens(f"${float(state.get('cost_usd', 0)):.2f}",

@@ -53,8 +53,55 @@ export interface Metrics {
   status?: string;
   live?: boolean;
   awaitingRun?: boolean;
+  /** True when state/monitor is at the human gate (enables Approve). */
+  awaitingApproval?: boolean;
   runKey?: string;
   projectName?: string;
+}
+
+export interface RunResultsCritic {
+  wallSeconds: number;
+  costUsd: number;
+  tokens?: number | null;
+  turns?: number | null;
+  outcome: 'finished' | 'FAILED' | string;
+  limitReached?: string | null;
+  ts?: number | null;
+  engine?: string;
+}
+
+export interface RunResultsVerdict {
+  recommendation: string;
+  summary: string;
+  blockingFindings: string[];
+  ts?: number | null;
+}
+
+export interface RunResultsSpend {
+  costUsd: number;
+  tokensTotal: number;
+  maxCostUsd: number;
+  pctUsed: number;
+  remainingUsd: number;
+}
+
+export interface RunResultsMission {
+  status: string;
+  stopReason?: string | null;
+  iteration: number;
+  costUsd: number;
+  tokensTotal: number;
+}
+
+/** CLI-parity critic / spend / stop snapshot for the Run Results panel. */
+export interface RunResults {
+  available: boolean;
+  updatedAt?: string | null;
+  clock?: string | null;
+  critic?: RunResultsCritic | null;
+  verdict?: RunResultsVerdict | null;
+  spend?: RunResultsSpend | null;
+  mission?: RunResultsMission | null;
 }
 
 export interface AppState {
@@ -63,6 +110,7 @@ export interface AppState {
   metrics: Metrics;
   activity: Activity[];
   riskAnalysis: any;
+  runResults?: RunResults | null;
   timestamp: string;
   project?: string;
   stateDir?: string;

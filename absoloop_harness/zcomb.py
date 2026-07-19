@@ -94,6 +94,19 @@ PHASE_PIPELINE = [
     (5, "Deliver"),
 ]
 
+# Mission-file statuses that win over live monitor.json telemetry. Codex critic
+# / report steps can leave monitor at FINAL_REVIEW with a fresh heartbeat after
+# state.json has already advanced to AWAITING_APPROVAL — CLI approve works, but
+# the Kanban Approve button stays dark if we keep trusting the monitor.
+_GATE_OR_TERMINAL_STATUSES = frozenset({
+    "AWAITING_APPROVAL",
+    "COMPLETED",
+    "BLOCKED",
+    "BUDGET_EXHAUSTED",
+    "REJECTED",
+    "STOPPED",
+})
+
 
 def zcomb_home() -> pathlib.Path:
     env = os.environ.get("ABSOLOOP_HOME")
@@ -270,6 +283,297 @@ def _read_live_events(path: pathlib.Path, limit: int = 200) -> list[dict]:
         if isinstance(event, dict):
             events.append(event)
     return events
+
+
+def _read_jsonl_dicts(path: pathlib.Path) -> list[dict]:
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    rows: list[dict] = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            rows.append(event)
+    return rows
+
+
+def _clock_label(ts: Any) -> str:
+    """Local HH:MM:SS matching the Absoloop CLI progress prefix."""
+    if isinstance(ts, (int, float)) and ts > 0:
+        return time.strftime("%H:%M:%S", time.localtime(ts))
+    return time.strftime("%H:%M:%S", time.localtime())
+
+
+def _parse_json_maybe(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text or text[0] not in "{[":
+        return value
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value
+
+
+def _load_critic_structured(project: pathlib.Path, result_rel: str) -> dict:
+    """Pull critic recommendation / summary / turns from an agent result file."""
+    if not result_rel:
+        return {}
+    path = project / result_rel
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    structured = _parse_json_maybe(payload.get("structured_output"))
+    if not isinstance(structured, dict):
+        structured = {}
+    if not structured:
+        nested = _parse_json_maybe(payload.get("result"))
+        if isinstance(nested, dict) and (
+            "recommendation" in nested or "summary" in nested
+        ):
+            structured = nested
+    # Codex / Grok often write the schema object as the whole file.
+    if not structured and payload.get("recommendation"):
+        structured = payload
+
+    recommendation = str(structured.get("recommendation") or "").strip().upper()
+    summary = " ".join(str(structured.get("summary") or "").split())
+    findings_raw = structured.get("blocking_findings") or []
+    findings: list[str] = []
+    if isinstance(findings_raw, list):
+        findings = [str(f).strip() for f in findings_raw if str(f).strip()]
+
+    turns = payload.get("num_turns")
+    if not isinstance(turns, int):
+        turns = structured.get("num_turns")
+    if not isinstance(turns, int):
+        turns = None
+
+    return {
+        "recommendation": recommendation,
+        "summary": summary,
+        "blockingFindings": findings[:8],
+        "turns": turns,
+    }
+
+
+def _latest_critic_ledger_run(abs_dir: pathlib.Path) -> dict:
+    """Most recent ledger agent_run whose result path names the critic."""
+    latest: dict = {}
+    for event in _read_jsonl_dicts(abs_dir / "ledger.jsonl"):
+        if event.get("type") != "agent_run":
+            continue
+        result = str(event.get("result") or "")
+        if "critic" not in result.lower():
+            continue
+        latest = event
+    return latest
+
+
+def _latest_critic_result_rel(project: pathlib.Path, abs_dir: pathlib.Path,
+                              iteration: int) -> str:
+    """Prefer ledger path; fall back to iteration-NNNN-critic.json on disk."""
+    run = _latest_critic_ledger_run(abs_dir)
+    result = str(run.get("result") or "").strip()
+    if result:
+        return result
+    if iteration > 0:
+        candidate = abs_dir / "tmp" / f"iteration-{iteration:04d}-critic.json"
+        if candidate.is_file():
+            return str(candidate.relative_to(project))
+    tmp = abs_dir / "tmp"
+    if tmp.is_dir():
+        matches = sorted(tmp.glob("iteration-*-critic.json"))
+        if matches:
+            return str(matches[-1].relative_to(project))
+    return ""
+
+
+def _verdict_from_live(live_events: list[dict]) -> dict:
+    for event in reversed(live_events):
+        if str(event.get("kind") or "") != "verdict":
+            continue
+        detail = str(event.get("detail") or "").strip()
+        if not detail:
+            continue
+        recommendation = ""
+        summary = detail
+        if ":" in detail:
+            head, tail = detail.split(":", 1)
+            recommendation = head.strip().upper()
+            summary = tail.strip()
+        return {
+            "recommendation": recommendation,
+            "summary": summary,
+            "ts": event.get("ts"),
+        }
+    return {}
+
+
+def _build_run_results(
+    project: pathlib.Path,
+    *,
+    abs_dir: pathlib.Path,
+    state: dict,
+    runtime: dict,
+    source: dict,
+    status: str,
+    iteration: int,
+    awaiting: bool,
+    live_events: list[dict],
+) -> dict:
+    """CLI-parity critic / spend / stop snapshot for the Kanban Run Results panel."""
+    empty = {
+        "available": False,
+        "updatedAt": None,
+        "clock": None,
+        "critic": None,
+        "verdict": None,
+        "spend": None,
+        "mission": None,
+    }
+    if awaiting or not (abs_dir / "runtime.json").is_file():
+        return empty
+
+    cost_usd = float(source.get("cost_usd") or state.get("cost_usd") or 0)
+    tokens_total = source.get("tokens_total")
+    if tokens_total is None:
+        tokens_total = state.get("tokens_total") or 0
+    try:
+        tokens_total = int(tokens_total or 0)
+    except (TypeError, ValueError):
+        tokens_total = 0
+    max_cost = float(runtime.get("max_cost_usd") or 0)
+    pct_used = int(round(100 * cost_usd / max_cost)) if max_cost > 0 else 0
+    remaining = max(0.0, max_cost - cost_usd) if max_cost > 0 else 0.0
+    stop_reason = str(
+        state.get("stop_reason") or source.get("stop_reason") or ""
+    ).strip() or None
+
+    spend = {
+        "costUsd": round(cost_usd, 4),
+        "tokensTotal": tokens_total,
+        "maxCostUsd": max_cost,
+        "pctUsed": pct_used,
+        "remainingUsd": round(remaining, 4),
+    }
+
+    mission = None
+    status_u = str(status or "").upper()
+    if status_u in _GATE_OR_TERMINAL_STATUSES or stop_reason:
+        mission = {
+            "status": status_u or str(state.get("status") or ""),
+            "stopReason": stop_reason,
+            "iteration": iteration,
+            "costUsd": round(cost_usd, 4),
+            "tokensTotal": tokens_total,
+        }
+
+    ledger_run = _latest_critic_ledger_run(abs_dir)
+    result_rel = _latest_critic_result_rel(project, abs_dir, iteration)
+    structured = _load_critic_structured(project, result_rel) if result_rel else {}
+    live_verdict = _verdict_from_live(live_events)
+
+    critic = None
+    if ledger_run:
+        wall = float(ledger_run.get("wall_seconds") or 0)
+        run_cost = float(ledger_run.get("cost_usd") or 0)
+        run_tokens = ledger_run.get("tokens")
+        try:
+            run_tokens = int(run_tokens) if run_tokens is not None else None
+        except (TypeError, ValueError):
+            run_tokens = None
+        limit = ledger_run.get("limit_reached") or None
+        exit_code = ledger_run.get("exit_code")
+        outcome = (
+            "finished"
+            if exit_code in (0, None) and not limit
+            else "FAILED"
+        )
+        turns = structured.get("turns")
+        critic = {
+            "wallSeconds": int(round(wall)) if wall else 0,
+            "costUsd": round(run_cost, 4),
+            "tokens": run_tokens,
+            "turns": turns if isinstance(turns, int) else None,
+            "outcome": outcome,
+            "limitReached": str(limit) if limit else None,
+            "ts": ledger_run.get("ts"),
+            "engine": str(ledger_run.get("engine") or ""),
+        }
+
+    recommendation = (
+        structured.get("recommendation")
+        or live_verdict.get("recommendation")
+        or ""
+    )
+    summary = structured.get("summary") or live_verdict.get("summary") or ""
+    # Findings file from HOLD/REJECT path when structured payload is thin.
+    findings_rel = str(state.get("latest_critic_findings") or "").strip()
+    if findings_rel and not structured.get("blockingFindings"):
+        findings_payload = _read_json(project / findings_rel)
+        if findings_payload:
+            if not recommendation:
+                recommendation = str(
+                    findings_payload.get("recommendation") or ""
+                ).strip().upper()
+            if not summary:
+                summary = " ".join(
+                    str(findings_payload.get("summary") or "").split())
+            raw_findings = findings_payload.get("blocking_findings") or []
+            if isinstance(raw_findings, list):
+                structured = {
+                    **structured,
+                    "blockingFindings": [
+                        str(f).strip() for f in raw_findings if str(f).strip()
+                    ][:8],
+                }
+
+    verdict = None
+    if recommendation or summary:
+        verdict = {
+            "recommendation": recommendation or "UNREADABLE",
+            "summary": summary,
+            "blockingFindings": list(structured.get("blockingFindings") or []),
+            "ts": live_verdict.get("ts") or (ledger_run.get("ts") if ledger_run else None),
+        }
+
+    # Show the panel once we have spend with activity, a critic, a verdict,
+    # or a terminal/gate mission status — mirrors when the CLI prints these lines.
+    available = bool(
+        critic
+        or verdict
+        or mission
+        or (cost_usd > 0 and iteration > 0)
+    )
+    anchor_ts = (
+        (critic or {}).get("ts")
+        or (verdict or {}).get("ts")
+        or state.get("updated_at")
+        or source.get("heartbeat_ts")
+        or source.get("ended_at")
+        or time.time()
+    )
+    return {
+        "available": available,
+        "updatedAt": _iso(anchor_ts),
+        "clock": _clock_label(anchor_ts),
+        "critic": critic,
+        "verdict": verdict,
+        "spend": spend if available else None,
+        "mission": mission,
+    }
 
 
 def _teammate_focus(detail: str) -> str:
@@ -540,8 +844,25 @@ def build_bridge_state(project: pathlib.Path) -> dict:
 
     source = monitor if live and monitor else state
     status = str(source.get("status") or state.get("status") or "READY")
-    if awaiting:
+    state_status = str(state.get("status") or "").strip()
+    monitor_status = str(monitor.get("status") or "").strip() if monitor else ""
+    # Human gate: any AWAITING_APPROVAL signal wins. Codex critic/report can
+    # leave monitor at FINAL_REVIEW (or keep a live heartbeat) after state.json
+    # already advanced — CLI approve reads state.json, so Kanban must too.
+    # Never let the awaiting-run "STARTING" override clobber a real gate.
+    if (state_status.upper() == "AWAITING_APPROVAL"
+            or monitor_status.upper() == "AWAITING_APPROVAL"):
+        status = "AWAITING_APPROVAL"
+        awaiting = False
+        if state_status.upper() == "AWAITING_APPROVAL":
+            live = False
+    elif state_status.upper() in _GATE_OR_TERMINAL_STATUSES:
+        status = state_status
+        live = False
+        awaiting = False
+    elif awaiting:
         status = "STARTING"
+    awaiting_approval = status.upper() == "AWAITING_APPROVAL"
     phase = str(monitor.get("phase") or "")
     iteration = int(source.get("iteration") or state.get("iteration") or 0)
     max_iter = int(runtime.get("max_iterations") or 0)
@@ -688,6 +1009,7 @@ def build_bridge_state(project: pathlib.Path) -> dict:
              "metrics": {"tasksCompleted": 0, "errors": 0}},
         ]
         awaiting = True
+        awaiting_approval = False
         run_key = _run_key("", awaiting=True)
         objective = ""
         objective_history = []
@@ -811,6 +1133,18 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             for phase_n, name in PHASE_PIPELINE
         ]
 
+    run_results = _build_run_results(
+        project,
+        abs_dir=abs_dir,
+        state=state,
+        runtime=runtime,
+        source=source,
+        status=status,
+        iteration=0 if awaiting else iteration,
+        awaiting=awaiting,
+        live_events=live_events,
+    )
+
     return {
         "agents": {"agents": agents},
         "tasks": {"tasks": tasks},
@@ -827,6 +1161,7 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "status": status,
             "live": live,
             "awaitingRun": awaiting,
+            "awaitingApproval": bool(awaiting_approval),
             "runKey": run_key,
             "projectName": project_name,
         },
@@ -846,6 +1181,7 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "costUsd": 0.0 if awaiting else float(source.get("cost_usd") or 0),
             "tokensTotal": 0 if awaiting else (source.get("tokens_total") or 0),
         },
+        "runResults": run_results,
     }
 
 
@@ -858,6 +1194,9 @@ def sync_state(project: pathlib.Path, state_dir: Optional[pathlib.Path] = None) 
     _atomic_write(out / "tasks.json", bridged["tasks"])
     _atomic_write(out / "metrics.json", bridged["metrics"])
     _atomic_write(out / "risk-analysis.json", bridged["riskAnalysis"])
+    _atomic_write(out / "run-results.json", bridged.get("runResults") or {
+        "available": False,
+    })
     # activity.jsonl — rewrite from the bridged snapshot (source of truth is live.jsonl)
     activity_path = out / "activity.jsonl"
     tmp = activity_path.with_suffix(".jsonl.tmp")

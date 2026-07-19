@@ -137,6 +137,7 @@ app.get('/api/state', (_req, res) => {
     metrics: readStateFile('metrics.json') || { completionPct: 0, errorRate: 0, tasksPerHour: 0, phases: [] },
     activity: readActivityLog().slice(-200),  // Last 200 entries
     riskAnalysis: readStateFile('risk-analysis.json') || null,
+    runResults: readStateFile('run-results.json') || { available: false },
     timestamp: new Date().toISOString(),
     project: PROJECT_ROOT,
     stateDir: STATE_DIR,

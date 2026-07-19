@@ -7,6 +7,7 @@ import { MetricsPanel } from './components/MetricsPanel';
 import { Timeline } from './components/Timeline';
 import { MissionControls, triggerAction } from './components/MissionControls';
 import { ObjectiveDropdown } from './components/ObjectiveDropdown';
+import { RunResultsPanel } from './components/RunResultsPanel';
 import { matchesActivityFilter } from './components/ActivityFeed';
 
 function formatElapsed(startTime: number): string {
@@ -785,7 +786,7 @@ export default function App() {
           />
         )}
 
-        {/* Center: Task Board + Timeline — independent scroll */}
+        {/* Center: Run Results + Task Board + Timeline — independent scroll */}
         <div style={{
           overflow: 'hidden',
           display: 'flex',
@@ -793,6 +794,14 @@ export default function App() {
           minHeight: 0,
           minWidth: 0,
         }}>
+          <div style={{ flexShrink: 0, paddingTop: 10, minWidth: 0 }}>
+            <RunResultsPanel
+              key={`run-results-${runEpoch}`}
+              runResults={state?.runResults}
+              darkMode={darkMode}
+              runEpoch={runEpoch}
+            />
+          </div>
           <KanbanBoard key={runEpoch} tasks={tasks} agents={agents} darkMode={darkMode} />
           <div style={{ flexShrink: 0, padding: '2px 14px 8px', minWidth: 0 }}>
             <Timeline tasks={tasks} metrics={metrics} darkMode={darkMode} />
