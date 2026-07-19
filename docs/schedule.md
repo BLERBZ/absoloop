@@ -2,7 +2,8 @@
 
 Absoloop schedules fire `resume`, `extend`, or `start` actions on a
 calendar without weakening the integrity → critic → **human gate**.
-Schedules **never** auto-approve.
+Schedules **never** auto-approve — if the mission is awaiting your decision,
+the tick skips until you `approve` or `reject`.
 
 ## Why
 

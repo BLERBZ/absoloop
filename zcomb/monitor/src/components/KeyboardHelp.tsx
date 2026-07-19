@@ -9,6 +9,8 @@ interface KeyboardHelpProps {
 const shortcuts = [
   { key: '?', description: 'Toggle this help overlay' },
   { key: 'f', description: 'Focus search on task board' },
+  { key: '+ / =', description: 'Zoom task board in (2 levels)' },
+  { key: '− / -', description: 'Zoom task board out (2 levels)' },
   { key: 'd', description: 'Toggle dark / light mode' },
   { key: '1-6', description: 'Filter kanban by phase number' },
   { key: '0', description: 'Clear phase filter (show all)' },

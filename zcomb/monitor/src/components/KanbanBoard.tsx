@@ -1,5 +1,29 @@
-import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
+import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react';
 import type { Task, Agent } from '../hooks/usePolling';
+
+/** Zoom steps relative to the responsive baseline: −2 … 0 … +2. */
+const ZOOM_MIN = -2;
+const ZOOM_MAX = 2;
+const ZOOM_FACTORS: Record<number, number> = {
+  [-2]: 0.82,
+  [-1]: 0.91,
+  [0]: 1,
+  [1]: 1.14,
+  [2]: 1.28,
+};
+const ZOOM_STORAGE_KEY = 'zc-kanban-zoom';
+
+function readStoredZoom(): number {
+  try {
+    const raw = localStorage.getItem(ZOOM_STORAGE_KEY);
+    if (raw == null) return 0;
+    const n = Number(raw);
+    if (Number.isInteger(n) && n >= ZOOM_MIN && n <= ZOOM_MAX) return n;
+  } catch {
+    /* ignore */
+  }
+  return 0;
+}
 
 const columns = [
   { key: 'inbox', label: 'Inbox', icon: '○', color: '#7d8590', glow: '#7d859020' },
@@ -85,9 +109,60 @@ function HighlightText({ text, query, color }: { text: string; query: string; co
   );
 }
 
+function ZoomButton({
+  label,
+  title,
+  disabled,
+  onClick,
+  darkMode,
+  borderColor,
+  mutedColor,
+  textColor,
+  size,
+}: {
+  label: ReactNode;
+  title: string;
+  disabled: boolean;
+  onClick: () => void;
+  darkMode: boolean;
+  borderColor: string;
+  mutedColor: string;
+  textColor: string;
+  size: number;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      aria-label={title}
+      disabled={disabled}
+      onClick={onClick}
+      style={{
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        width: size,
+        height: size,
+        padding: 0,
+        borderRadius: Math.max(4, Math.round(size * 0.28)),
+        border: `1px solid ${borderColor}`,
+        background: darkMode ? '#0d1117' : '#ffffff',
+        color: disabled ? mutedColor : textColor,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: disabled ? 0.45 : 1,
+        flexShrink: 0,
+        lineHeight: 1,
+      }}
+    >
+      {label}
+    </button>
+  );
+}
+
 export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents: Agent[]; darkMode: boolean }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [phaseFilter, setPhaseFilter] = useState<string>('all');
+  const [zoomLevel, setZoomLevel] = useState(readStoredZoom);
   const searchRef = useRef<HTMLInputElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const [containerW, setContainerW] = useState(1200);
@@ -98,6 +173,14 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
   const subText = darkMode ? '#8b949e' : '#57606a';
 
   const agentMap = new Map(agents.map(a => [a.id, a.name]));
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ZOOM_STORAGE_KEY, String(zoomLevel));
+    } catch {
+      /* ignore */
+    }
+  }, [zoomLevel]);
 
   // Measure container width for proportional scaling
   useEffect(() => {
@@ -111,27 +194,44 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
     return () => ro.disconnect();
   }, []);
 
-  // Scale factor: 1.0 at >=1100px, gently smaller below. Floor is high (0.85)
-  // because below the minimum column width the board scrolls horizontally
-  // instead of shrinking text further.
-  const s = Math.min(1, Math.max(0.85, containerW / 1100));
+  // Larger baseline than before (1.12 at ≥1000px, floor 0.95) × operator zoom.
+  // Narrow viewports scroll horizontally instead of crushing card type.
+  const responsive = Math.min(1.12, Math.max(0.95, containerW / 1000));
+  const s = responsive * (ZOOM_FACTORS[zoomLevel] ?? 1);
 
   // Scaled pixel helper — all sizes go through this
   const px = useCallback((base: number, min = 1) => Math.max(min, Math.round(base * s)), [s]);
 
-  // Keyboard shortcut
+  const zoomIn = useCallback(() => {
+    setZoomLevel(z => Math.min(ZOOM_MAX, z + 1));
+  }, []);
+  const zoomOut = useCallback(() => {
+    setZoomLevel(z => Math.max(ZOOM_MIN, z - 1));
+  }, []);
+
+  // Keyboard: f = search, =/+ = zoom in, - = zoom out
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
       if (e.key === 'f' || e.key === 'F') {
-        const tag = (e.target as HTMLElement)?.tagName;
-        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
         e.preventDefault();
         searchRef.current?.focus();
+        return;
+      }
+      if (e.key === '=' || e.key === '+') {
+        e.preventDefault();
+        zoomIn();
+        return;
+      }
+      if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        zoomOut();
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, []);
+  }, [zoomIn, zoomOut]);
 
   const uniquePhases = Array.from(new Set(tasks.map(t => t.phase))).sort((a, b) => a - b);
 
@@ -139,7 +239,9 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
     const q = searchQuery.toLowerCase();
     const matchesSearch = q === ''
       || t.title.toLowerCase().includes(q)
-      || (t.description || '').toLowerCase().includes(q);
+      || (t.description || '').toLowerCase().includes(q)
+      || (t.kind || '').toLowerCase().includes(q)
+      || t.id.toLowerCase().includes(q);
     const matchesPhase = phaseFilter === 'all' || t.phase === Number(phaseFilter);
     return matchesSearch && matchesPhase;
   });
@@ -217,7 +319,7 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                 color: textColor,
                 fontSize: px(11),
                 outline: 'none',
-                width: px(120),
+                width: px(140),
                 transition: 'border-color 0.2s ease, box-shadow 0.2s ease',
               }}
               onFocus={e => {
@@ -228,6 +330,63 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                 e.currentTarget.style.borderColor = borderColor;
                 e.currentTarget.style.boxShadow = 'none';
               }}
+            />
+          </div>
+          {/* Zoom −2 … +2 around the enlarged board baseline */}
+          <div
+            role="group"
+            aria-label="Task board zoom"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: px(3) }}
+          >
+            <ZoomButton
+              title={zoomLevel <= ZOOM_MIN ? 'Zoom out (minimum)' : 'Zoom out'}
+              disabled={zoomLevel <= ZOOM_MIN}
+              onClick={zoomOut}
+              darkMode={darkMode}
+              borderColor={borderColor}
+              mutedColor={mutedColor}
+              textColor={textColor}
+              size={px(26, 22)}
+              label={
+                <svg width={px(14)} height={px(14)} viewBox="0 0 16 16" aria-hidden>
+                  <path
+                    fill="currentColor"
+                    d="M6.5 1a5.5 5.5 0 0 1 4.23 9.02l3.62 3.63a.75.75 0 1 1-1.06 1.06l-3.63-3.62A5.5 5.5 0 1 1 6.5 1Zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM4.75 6a.75.75 0 0 0 0 1.5h3.5a.75.75 0 0 0 0-1.5h-3.5Z"
+                  />
+                </svg>
+              }
+            />
+            <span
+              title={`Zoom level ${zoomLevel >= 0 ? `+${zoomLevel}` : zoomLevel}`}
+              style={{
+                fontSize: px(10),
+                fontWeight: 700,
+                fontVariantNumeric: 'tabular-nums',
+                color: zoomLevel === 0 ? mutedColor : '#58a6ff',
+                minWidth: px(22),
+                textAlign: 'center',
+                userSelect: 'none',
+              }}
+            >
+              {zoomLevel === 0 ? '100%' : `${Math.round((ZOOM_FACTORS[zoomLevel] ?? 1) * 100)}%`}
+            </span>
+            <ZoomButton
+              title={zoomLevel >= ZOOM_MAX ? 'Zoom in (maximum)' : 'Zoom in'}
+              disabled={zoomLevel >= ZOOM_MAX}
+              onClick={zoomIn}
+              darkMode={darkMode}
+              borderColor={borderColor}
+              mutedColor={mutedColor}
+              textColor={textColor}
+              size={px(26, 22)}
+              label={
+                <svg width={px(14)} height={px(14)} viewBox="0 0 16 16" aria-hidden>
+                  <path
+                    fill="currentColor"
+                    d="M6.5 1a5.5 5.5 0 0 1 4.23 9.02l3.62 3.63a.75.75 0 1 1-1.06 1.06l-3.63-3.62A5.5 5.5 0 1 1 6.5 1Zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8ZM6.5 3.75a.75.75 0 0 1 .75.75v1.25H8.5a.75.75 0 0 1 0 1.5H7.25V8.5a.75.75 0 0 1-1.5 0V7.25H4.5a.75.75 0 0 1 0-1.5h1.25V4.5a.75.75 0 0 1 .75-.75Z"
+                  />
+                </svg>
+              }
             />
           </div>
           <select
@@ -256,13 +415,13 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
           container is narrower than 6 columns the board scrolls horizontally */}
       <div ref={gridRef} className="kanban-board-scroll" style={{
         display: 'grid',
-        gridTemplateColumns: 'repeat(6, minmax(172px, 1fr))',
-        gap: px(6),
+        gridTemplateColumns: `repeat(6, minmax(${px(196, 172)}px, 1fr))`,
+        gap: px(8),
         flex: 1,
         minHeight: 0,
         overflowX: 'auto',
         overflowY: 'hidden',
-        padding: `0 ${px(10)}px ${px(10)}px`,
+        padding: `0 ${px(12)}px ${px(12)}px`,
       }}>
         {columns.map(col => {
           const colTasks = filteredTasks.filter(t => t.status === col.key);
@@ -429,8 +588,8 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                           fontWeight: 600,
                           lineHeight: 1.35,
                           color: textColor,
-                          fontSize: px(10, 7),
-                          marginBottom: px(5),
+                          fontSize: px(12, 8),
+                          marginBottom: px(6),
                           wordBreak: 'break-word',
                         }}>
                           <HighlightText
@@ -443,11 +602,11 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                         {/* Contextual description */}
                         {task.description && (
                           <div style={{
-                            fontSize: px(8.5, 6),
+                            fontSize: px(10, 7),
                             color: subText,
                             lineHeight: 1.4,
                             marginTop: -px(2),
-                            marginBottom: px(5),
+                            marginBottom: px(6),
                             wordBreak: 'break-word',
                             display: '-webkit-box',
                             WebkitLineClamp: 3,

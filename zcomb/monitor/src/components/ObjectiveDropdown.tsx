@@ -14,6 +14,26 @@ function kindLabel(kind: ObjectiveHistoryEntry['kind']): string {
   return kind === 'continuation' ? 'Continuation' : 'Original objective';
 }
 
+function formatElapsedSeconds(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+}
+
+/** Live or frozen wall time for one history row. */
+function entryElapsedSeconds(entry: ObjectiveHistoryEntry, nowSec: number): number | null {
+  const started = Number(entry.startedAt);
+  if (started > 0) {
+    const ended = Number(entry.endedAt);
+    const endSec = ended > started ? ended : nowSec;
+    return Math.max(0, endSec - started);
+  }
+  const snap = Number(entry.elapsedSeconds);
+  return snap >= 0 && Number.isFinite(snap) ? snap : null;
+}
+
 export function ObjectiveDropdown({
   displayedText,
   history,
@@ -23,6 +43,7 @@ export function ObjectiveDropdown({
   mutedColor,
 }: ObjectiveDropdownProps) {
   const [open, setOpen] = useState(false);
+  const [nowSec, setNowSec] = useState(() => Date.now() / 1000);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const canOpen = history.length > 1;
 
@@ -43,6 +64,18 @@ export function ObjectiveDropdown({
       document.removeEventListener('keydown', onKey);
     };
   }, [open]);
+
+  // Tick while open so the current loop's elapsed stays live.
+  useEffect(() => {
+    if (!open) return;
+    const needsTick = history.some(
+      e => Number(e.startedAt) > 0 && !(Number(e.endedAt) > Number(e.startedAt)),
+    );
+    if (!needsTick) return;
+    setNowSec(Date.now() / 1000);
+    const id = window.setInterval(() => setNowSec(Date.now() / 1000), 1000);
+    return () => window.clearInterval(id);
+  }, [open, history]);
 
   // Newest first in the menu so the active note sits at the top.
   const menuItems = [...history].reverse();
@@ -167,6 +200,7 @@ export function ObjectiveDropdown({
           {menuItems.map((entry, index) => {
             const isActive = entry.text.trim() === activeText;
             const key = `${entry.kind}-${entry.loopId || 'none'}-${index}`;
+            const elapsed = entryElapsedSeconds(entry, nowSec);
             return (
               <div
                 key={key}
@@ -185,6 +219,7 @@ export function ObjectiveDropdown({
                   alignItems: 'center',
                   gap: 8,
                   marginBottom: 3,
+                  flexWrap: 'wrap',
                 }}>
                   <span style={{
                     fontSize: 10,
@@ -208,6 +243,24 @@ export function ObjectiveDropdown({
                       whiteSpace: 'nowrap',
                     }}>
                       {entry.loopId}
+                    </span>
+                  )}
+                  {elapsed != null && (
+                    <span
+                      title="Total time elapsed for this loop"
+                      style={{
+                        fontSize: 10,
+                        fontFamily: 'monospace',
+                        fontVariantNumeric: 'tabular-nums',
+                        fontWeight: 600,
+                        color: isActive
+                          ? (darkMode ? '#58a6ff' : '#0969da')
+                          : mutedColor,
+                        whiteSpace: 'nowrap',
+                        flexShrink: 0,
+                      }}
+                    >
+                      {formatElapsedSeconds(elapsed)}
                     </span>
                   )}
                 </div>

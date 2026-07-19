@@ -49,6 +49,10 @@ class SetupCommandFlags(unittest.TestCase):
             (home / "absoloop_harness").mkdir()
             state = home / "setup.json"
             user_cfg_dir = home / "userconfig"
+            # Run inside the temp dir so gitignore step cannot touch the repo.
+            project = home / "proj"
+            project.mkdir()
+            (project / ".git").mkdir()
             with mock.patch.object(sw, "SETUP_STATE", state), \
                  mock.patch.object(sw, "tooling_home", return_value=home), \
                  mock.patch.object(sw, "_probe_providers",
@@ -59,9 +63,20 @@ class SetupCommandFlags(unittest.TestCase):
                 # Avoid real symlink into the developer's ~/.local/bin
                 with mock.patch.object(sw, "_ensure_path_link",
                                        return_value=(True, "linked (test)")):
-                    code = sw.setup_command(["-y", "--force"])
+                    old = pathlib.Path.cwd()
+                    try:
+                        import os
+                        os.chdir(project)
+                        code = sw.setup_command(["-y", "--force"])
+                    finally:
+                        os.chdir(old)
             self.assertIn(code, (0, 2))
             self.assertTrue(state.is_file())
+            self.assertTrue((project / ".gitignore").is_file())
+            self.assertIn(
+                ".absoloop/",
+                (project / ".gitignore").read_text(encoding="utf-8"),
+            )
 
 
 class WizardSteps(unittest.TestCase):

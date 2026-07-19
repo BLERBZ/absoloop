@@ -1,8 +1,12 @@
 """Absoloop Mission Briefing UX — unique, fast, review-before-launch.
 
 The interactive path collapses to: say what you want → glance at the
-briefing card → hit Enter. Editing is optional single-key tweaks, never
-a gauntlet of confirmations.
+briefing card → hit Enter. Editing is optional single-key tweaks
+(``o`` / ``e`` / ``m`` / ``d`` / ``n`` / ``g``), never a gauntlet of
+confirmations. Color respects ``NO_COLOR`` and non-TTY stdout.
+
+Consumed by ``bin/absoloop`` after scaffolding arguments are resolved;
+``-y`` / ``--yes`` skips the card entirely.
 """
 from __future__ import annotations
 
@@ -74,7 +78,7 @@ FLAVOR: Dict[str, Tuple[str, str]] = {
     ),
     "general": (
         "Open mission",
-        "Bounded loop. Evidence wins. The critic does not take your word.",
+        "Synergetic Loops. Evidence wins. The critic does not take your word.",
     ),
 }
 
@@ -328,10 +332,10 @@ def opening_line(engines_available: Sequence[str]) -> str:
     if engines_available:
         lane = ", ".join(engines_available)
         return (tint("bold", "Absoloop")
-                + tint("dim", " — bounded AI repair loops. ")
+                + tint("dim", " — Synergetic Loops. ")
                 + tint("dim", f"Engines online: {lane}."))
     return (tint("bold", "Absoloop")
-            + tint("dim", " — bounded AI repair loops. ")
+            + tint("dim", " — Synergetic Loops. ")
             + tint("warn", "No engines on PATH yet (claude / codex / grok)."))
 
 

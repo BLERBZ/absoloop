@@ -1,10 +1,16 @@
 # Absoloop multi-provider harness — user guide
 
-The harness runs **Grok Build, Claude Code, and Codex** as first-class
-backends behind one Absoloop UX. Each provider keeps its native
-authentication, tools, sessions, permissions, and sandboxing; Absoloop owns
-worktree isolation, event normalization, deterministic quality gates, and
-run artifacts. Design details: `docs/architecture/multi-provider-harness.md`.
+Part of Absoloop’s **Synergetic Loops** model: multiple local agent CLIs
+compound under one UX. The harness runs **Grok Build, Claude Code, and Codex**
+as first-class backends. Use it for one-shot tasks, parallel races,
+cross-provider review, and council workflows — complementary to the
+checkpointed [mission loop](mission-loop.md).
+
+Each provider keeps its native authentication, tools, sessions, permissions,
+and sandboxing. Absoloop owns worktree isolation, event normalization,
+deterministic quality gates, and run artifacts.
+
+Design details: [architecture/multi-provider-harness.md](architecture/multi-provider-harness.md).
 
 ## Setup
 

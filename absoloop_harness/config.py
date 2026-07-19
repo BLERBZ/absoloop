@@ -1,5 +1,9 @@
-"""Harness configuration: absoloop.toml with project / user / CLI override
-precedence and per-value source tracking for `absoloop config`.
+"""Harness configuration: ``absoloop.toml`` with layered precedence.
+
+Precedence: CLI flags > project ``absoloop.toml`` > user
+``~/.absoloop/absoloop.toml`` > built-in defaults. Every resolved value
+tracks its source for ``absoloop config``. Schema example:
+``absoloop.toml.example``.
 """
 from __future__ import annotations
 

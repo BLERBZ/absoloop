@@ -44,8 +44,11 @@
 
 ## Flagship · Absoloop
 
-**Absoloop** orchestrates local agent CLIs into auditable repair missions.
-A run is not “done” until the builder’s evidence survives an independent
+**Motto:** Synergetic Loops
+
+**AbsoLoop** is Synergetic Loops — bounded cycles where builder, critic, human,
+and local agent CLIs compound so the outcome is stronger than any single agent
+alone. A run is not “done” until the builder’s evidence survives an independent
 critic **and** a human gate — under hard budgets you can resume or extend.
 
 ```text

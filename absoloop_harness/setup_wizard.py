@@ -1,8 +1,12 @@
 """Absoloop Setup Wizard — guided first-run onboarding.
 
-`absoloop setup` walks a new user through PATH, providers, preferences, and
+``absoloop setup`` walks a new user through PATH, providers, preferences, and
 the first recommended command. Designed to feel like a short product tour,
 not a config dump.
+
+State persists in ``~/.absoloop/setup.json`` (override with
+``ABSOLOOP_SETUP_STATE``). Bare ``absoloop`` on a TTY offers this wizard when
+setup has not completed. Flags: ``-y``, ``--force``, ``--check``, ``--reset``.
 """
 from __future__ import annotations
 
@@ -37,7 +41,7 @@ PROVIDER_INSTALL: Dict[str, Tuple[str, str]] = {
     ),
 }
 
-TOTAL_STEPS = 5
+TOTAL_STEPS = 6
 
 
 @dataclass
@@ -47,6 +51,7 @@ class SetupResult:
     providers_ready: List[str] = field(default_factory=list)
     user_config_written: bool = False
     micro_tip_shown: bool = False
+    gitignore_status: str = ""
     next_hint: str = ""
     aborted: bool = False
 
@@ -141,14 +146,15 @@ def _dim(text: str) -> None:
 
 def _step_welcome(yes: bool) -> bool:
     _step_header(1, "Welcome")
-    print("  Absoloop runs bounded AI repair loops on your machine.")
-    print("  Evidence → critic → you approve. Hard budgets. Local CLIs.")
+    print("  Absoloop is Synergetic Loops — on your machine.")
+    print("  Builder + critic + you. Hard budgets. Local CLIs.")
     print()
     print("  This wizard will:")
     _dim("1. Put Absoloop on your PATH (if needed)")
     _dim("2. Find Grok / Claude Code / Codex")
     _dim("3. Save sensible defaults")
-    _dim("4. Show your first command")
+    _dim("4. Recommend ignoring `.absoloop/` in git")
+    _dim("5. Show your first command")
     print()
     print(tint("dim", "  Needs: Python 3.9+ and at least one provider CLI."))
     return _pause(yes, "Ready? Enter")
@@ -374,8 +380,47 @@ def _step_preferences(yes: bool, result: SetupResult) -> bool:
     return _pause(yes)
 
 
+def _step_gitignore(yes: bool, result: SetupResult) -> bool:
+    """Offer to ignore `.absoloop/` in the current project's `.gitignore`."""
+    _step_header(5, "Gitignore (recommended)")
+    from .gitignore_util import ensure_absoloop_gitignore
+
+    cwd = pathlib.Path.cwd().resolve()
+    print("  Absoloop stores mission state under "
+          + tint("bold", ".absoloop/")
+          + " (runtime, reports, ledgers, telemetry).")
+    print(tint("dim", "  Recommended: add `.absoloop/` to this project's "
+                       ".gitignore so that state is never committed."))
+    print()
+    _dim(f"Project: {cwd}")
+
+    looks_like_project = (cwd / ".git").exists() or (cwd / ".gitignore").is_file()
+    if not looks_like_project:
+        _dim("No git repo / .gitignore in this directory.")
+        if yes:
+            _dim("Skipping auto-edit in non-interactive mode "
+                 "(re-run setup inside a project, or start a mission).")
+            result.gitignore_status = "skipped"
+            return True
+        print()
+        _dim("You can still create .gitignore here, or skip.")
+
+    print()
+    status = ensure_absoloop_gitignore(cwd, yes=yes, ask_user=not yes)
+    result.gitignore_status = status
+    if status == "added":
+        _ok(f"added `.absoloop/` → {cwd / '.gitignore'}")
+    elif status == "exists":
+        _ok("`.absoloop/` already ignored")
+    elif status == "declined":
+        _warn("left .gitignore unchanged (you can add `.absoloop/` later)")
+    else:
+        _dim(f"gitignore: {status}")
+    return _pause(yes)
+
+
 def _step_finish(yes: bool, result: SetupResult) -> bool:
-    _step_header(5, "You're ready")
+    _step_header(6, "You're ready")
     mark_setup_complete(result)
     _ok(f"setup saved → {setup_state_path()}")
     print()
@@ -482,6 +527,9 @@ def run_wizard(*, yes: bool = False, force: bool = False) -> SetupResult:
         result.aborted = True
         return result
     if not _step_preferences(yes, result):
+        result.aborted = True
+        return result
+    if not _step_gitignore(yes, result):
         result.aborted = True
         return result
     _step_finish(yes, result)

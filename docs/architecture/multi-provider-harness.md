@@ -1,11 +1,14 @@
 # Absoloop Multi-Provider Harness
 
-Absoloop's mission loop and multi-provider harness both run
-**Grok Build, Claude Code, and Codex** as first-class backends — preserving
-each agent's native authentication, tools, sessions, permissions, sandboxing,
-and streaming. The mission runner lives in `templates/absoloop-run`; the
-harness generalizes one-shot / race / council flows into a provider-neutral
-local agent OS.
+Architecture reference for the provider-neutral harness in `absoloop_harness/`.
+Operator guide: [multi-provider.md](../multi-provider.md). Mission loop
+contract: [mission-loop.md](../mission-loop.md).
+
+Absoloop's mission loop and harness both run **Grok Build, Claude Code, and
+Codex** as first-class backends — preserving each agent's native
+authentication, tools, sessions, permissions, sandboxing, and streaming. The
+mission runner lives in `templates/absoloop-run`; the harness generalizes
+one-shot / race / council flows into a provider-neutral local agent OS.
 
 **Two-layer teams:** Absoloop owns outer orchestration (builder/critic, or
 race/council lanes). Each provider process is configured and prompted to use

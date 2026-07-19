@@ -4,7 +4,6 @@ import { AgentCards } from './components/AgentCards';
 import { KanbanBoard } from './components/KanbanBoard';
 import { ActivityFeed } from './components/ActivityFeed';
 import { MetricsPanel } from './components/MetricsPanel';
-import { Timeline } from './components/Timeline';
 import { MissionControls, triggerAction } from './components/MissionControls';
 import { ObjectiveDropdown } from './components/ObjectiveDropdown';
 import { RunResultsPanel } from './components/RunResultsPanel';
@@ -780,7 +779,7 @@ export default function App() {
       {/* Main Layout — collapsible sidebars, center fills remainder */}
       <div style={{
         display: 'grid',
-        gridTemplateColumns: `${agentsOpen ? 'clamp(160px, 16vw, 260px)' : '34px'} minmax(0, 1fr) ${feedOpen ? 'clamp(180px, 18vw, 300px)' : '34px'}`,
+        gridTemplateColumns: `${agentsOpen ? 'clamp(140px, 13vw, 220px)' : '34px'} minmax(0, 1fr) ${feedOpen ? 'clamp(160px, 15vw, 260px)' : '34px'}`,
         flex: 1,
         overflow: 'hidden',
         minHeight: 0,
@@ -856,7 +855,7 @@ export default function App() {
           />
         )}
 
-        {/* Center: Run Results + Task Board + Timeline — independent scroll */}
+        {/* Center: Run Results + Task Board (footer MetricsPanel owns the mini-timeline) */}
         <div style={{
           overflow: 'hidden',
           display: 'flex',
@@ -875,9 +874,6 @@ export default function App() {
             />
           </div>
           <KanbanBoard key={runEpoch} tasks={tasks} agents={agents} darkMode={darkMode} />
-          <div style={{ flexShrink: 0, padding: '2px 14px 8px', minWidth: 0 }}>
-            <Timeline tasks={tasks} metrics={metrics} darkMode={darkMode} />
-          </div>
         </div>
 
         {/* Right: Activity Feed — collapsible, independent scroll */}

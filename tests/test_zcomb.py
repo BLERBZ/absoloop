@@ -641,6 +641,154 @@ class BridgeStateTests(unittest.TestCase):
             self.assertEqual(texts[1], "First continuation — add tests")
             self.assertEqual(texts[2], "Second continuation — polish the UI")
 
+    def test_objective_history_includes_loop_elapsed(self):
+        """Dropdown rows expose wall-clock elapsed next to each loop id."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship the original mission",
+                "max_iterations": 8,
+                "loop_id": "loop-3",
+                "continuation": {
+                    "previous_loop_id": "loop-2",
+                    "note": "Second continuation — polish the UI",
+                },
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 1,
+                "mission_id": "ABS-7",
+                "started_at": now - 45,
+            })
+            _write(abs_dir / "runs" / "loop-1" / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 2,
+                "started_at": now - 400,
+                "ended_at": now - 280,
+            })
+            _write(abs_dir / "runs" / "loop-2" / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 3,
+                "started_at": now - 250,
+                "ended_at": now - 100,
+            })
+            _write(abs_dir / "ledger.jsonl", "\n".join([
+                json.dumps({
+                    "ts": now - 200,
+                    "type": "extension",
+                    "previous_loop_id": "loop-1",
+                    "loop_id": "loop-2",
+                    "note": "First continuation — add tests",
+                }),
+                json.dumps({
+                    "ts": now - 100,
+                    "type": "extension",
+                    "previous_loop_id": "loop-2",
+                    "loop_id": "loop-3",
+                    "note": "Second continuation — polish the UI",
+                }),
+            ]) + "\n")
+            bridged = zcomb.build_bridge_state(project)
+            history = bridged["metrics"]["objectiveHistory"]
+            by_loop = {entry.get("loopId"): entry for entry in history}
+            self.assertEqual(by_loop["loop-1"]["elapsedSeconds"], 120)
+            self.assertEqual(by_loop["loop-2"]["elapsedSeconds"], 150)
+            self.assertGreaterEqual(by_loop["loop-3"]["elapsedSeconds"], 40)
+            self.assertLessEqual(by_loop["loop-3"]["elapsedSeconds"], 50)
+
+            # Archived loops without ended_at still get elapsed via extension ts.
+            _write(abs_dir / "runs" / "loop-1" / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 2,
+                "started_at": now - 400,
+            })
+            bridged2 = zcomb.build_bridge_state(project)
+            hist2 = {
+                entry.get("loopId"): entry
+                for entry in bridged2["metrics"]["objectiveHistory"]
+            }
+            # extension for loop-1 → loop-2 is at now-200; start was now-400.
+            self.assertEqual(hist2["loop-1"]["elapsedSeconds"], 200)
+
+    def test_archived_reports_are_searchable_on_kanban(self):
+        """Report archives surface as Done cards with searchable body text."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship searchable reports",
+                "max_iterations": 4,
+                "loop_id": "loop-live",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 1,
+                "mission_id": "ABS-RPT",
+                "started_at": now - 20,
+            })
+            report_body = (
+                "# Absoloop Report\n\n"
+                "UniqueNeedlePhrase in the archived report body.\n"
+            )
+            _write(abs_dir / "reports" / "loop-old" / "report.md", report_body)
+            _write(abs_dir / "reports" / "loop-old" / "meta.json", {
+                "loopId": "loop-old",
+                "status": "COMPLETED",
+                "objective": "Prior loop focus",
+            })
+            bridged = zcomb.build_bridge_state(project)
+            tasks = bridged["tasks"]["tasks"]
+            reports = [t for t in tasks if t.get("kind") == "report"]
+            self.assertTrue(reports)
+            blob = " ".join(
+                f"{t.get('title')} {t.get('description')}" for t in reports)
+            self.assertIn("UniqueNeedlePhrase", blob)
+            self.assertIn("loop-old", blob)
+
+    def test_objectives_archive_document_matches_dropdown(self):
+        """sync_state writes OBJECTIVES.md with dropdown labels + statements."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Original mission statement for archive",
+                "max_iterations": 4,
+                "loop_id": "loop-2",
+                "continuation": {
+                    "previous_loop_id": "loop-1",
+                    "note": "Continuation note for wave two",
+                },
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 1,
+                "mission_id": "ABS-OBJ",
+                "started_at": now - 30,
+            })
+            _write(abs_dir / "ledger.jsonl", "\n".join([
+                json.dumps({
+                    "ts": now - 100,
+                    "type": "extension",
+                    "previous_loop_id": "loop-1",
+                    "loop_id": "loop-2",
+                    "note": "Continuation note for wave two",
+                }),
+            ]) + "\n")
+            zcomb.sync_state(project)
+            md_path = abs_dir / "reports" / "OBJECTIVES.md"
+            self.assertTrue(md_path.is_file())
+            body = md_path.read_text(encoding="utf-8")
+            self.assertIn("CONTINUATION · CURRENT", body)
+            self.assertIn("ORIGINAL OBJECTIVE", body)
+            self.assertIn("Continuation note for wave two", body)
+            self.assertIn("Original mission statement for archive", body)
+            self.assertIn("loop-2", body)
+            self.assertTrue((abs_dir / "reports" / "OBJECTIVES.json").is_file())
+
     def test_run_results_mirrors_cli_critic_spend_and_stop(self):
         """Kanban Run Results panel gets critic finish, verdict, spend, stop."""
         with tempfile.TemporaryDirectory() as tmp:

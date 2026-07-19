@@ -1,4 +1,10 @@
-"""Helpers to assert Absoloop outer spawn (and best-effort inner team) evidence."""
+"""Evidence helpers for two-layer team observability.
+
+Outer spawn: harness recorded a provider process start (RUN_STARTED /
+``_absoloop_spawn``). Inner teams: best-effort markers in streams or text
+(``spawn_subagent``, Agent Teams, teammate tools). Used by characterization
+tests and the ZComb bridge — never required for acceptance.
+"""
 from __future__ import annotations
 
 import json

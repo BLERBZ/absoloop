@@ -1,8 +1,12 @@
 """AbsoLoop mission report — Markdown document + lite HTML viewer.
 
-`absoloop report` regenerates `.absoloop/report.md` (source of truth) and
-`.absoloop/report.html` (infographic-style lite viewer), then opens the
-viewer in the default browser.
+``absoloop report`` regenerates ``.absoloop/report.md`` (source of truth) and
+``.absoloop/report.html`` (infographic-style lite viewer), then opens the
+viewer in the default browser unless ``--no-open`` / ``--md-only`` /
+``--terminal`` is set.
+
+Reads ledger, state, runtime, and iteration artifacts under ``.absoloop/``.
+Brand assets come from ``docs/assets/`` (see ``docs/assets/BRAND.md``).
 """
 from __future__ import annotations
 
@@ -13,6 +17,7 @@ import math
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -1133,11 +1138,46 @@ body {
   display: flex; align-items: flex-start; justify-content: space-between;
   gap: 20px; margin-bottom: 8px; flex-wrap: wrap;
 }
+.hero-actions {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin-top: 14px;
+}
+.btn-pdf {
+  appearance: none; cursor: pointer;
+  border: 1px solid rgba(0,205,225,0.45);
+  background: linear-gradient(135deg, rgba(0,205,225,0.18), rgba(40,205,120,0.12));
+  color: var(--ink);
+  font: inherit; font-size: 13px; font-weight: 700;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 9px 14px; border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(0,0,0,0.22);
+}
+.btn-pdf:hover {
+  border-color: rgba(0,205,225,0.8);
+  background: linear-gradient(135deg, rgba(0,205,225,0.28), rgba(40,205,120,0.18));
+}
+.btn-pdf:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px;
+}
 @media (max-width: 520px) {
   .hero-top { flex-direction: column-reverse; align-items: flex-start; }
   .brand { align-items: flex-start; text-align: left; }
   .brand-logo { height: 58px; }
   .report-mark { letter-spacing: 0.32em; }
+}
+@media print {
+  body {
+    background: #fff !important;
+    color: #111 !important;
+  }
+  .wrap { max-width: none; padding: 0; }
+  .hero, .card, .section, .ops-details {
+    box-shadow: none !important;
+    break-inside: avoid;
+  }
+  .no-print, .btn-pdf { display: none !important; }
+  .ops-details[open] .ops-body, .ops-details .ops-body { display: block !important; }
+  a { color: inherit; text-decoration: none; }
 }
 .report-mark {
   font-size: clamp(1.35rem, 3.2vw, 1.85rem);
@@ -2379,6 +2419,7 @@ def render_html(report: MissionReport) -> str:
             "</div>"
         )
 
+    pdf_name = f"absoloop-report-{report.loop_id or report.mission_id}"
     body = f"""
 <div class="wrap">
   <header class="hero">
@@ -2392,6 +2433,12 @@ def render_html(report: MissionReport) -> str:
       · {_esc(gen)}{stop}
     </div>
     <div class="objective">{_esc(objective)}</div>
+    <div class="hero-actions no-print">
+      <button type="button" class="btn-pdf" id="download-pdf"
+              title="Save this report as a PDF via your browser print dialog">
+        Download PDF
+      </button>
+    </div>
   </header>
 
   {outcome_html}
@@ -2463,8 +2510,20 @@ def render_html(report: MissionReport) -> str:
     <div class="next">{_esc(report.next_step)}</div>
   </section>
 
-  <p class="footer">{_esc(BRAND_NAME)} report · source <code>report.md</code> · viewer <code>report.html</code></p>
+  <p class="footer">{_esc(BRAND_NAME)} report · source <code>report.md</code> · viewer <code>report.html</code> · use <strong>Download PDF</strong> to export</p>
 </div>
+<script>
+(function () {{
+  var btn = document.getElementById("download-pdf");
+  if (!btn) return;
+  btn.addEventListener("click", function () {{
+    var prev = document.title;
+    document.title = {json.dumps(pdf_name)};
+    window.print();
+    document.title = prev;
+  }});
+}})();
+</script>
 """
     return (
         "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
@@ -2560,6 +2619,70 @@ class WrittenReport:
     report: MissionReport
 
 
+def archive_loop_report(
+    project: pathlib.Path,
+    *,
+    loop_id: str = "",
+    status: str = "",
+    mission_id: str = "",
+    objective: str = "",
+) -> Optional[pathlib.Path]:
+    """Copy live report artifacts into ``.absoloop/reports/<loop_id>/``.
+
+    Also mirrors into ``.absoloop/runs/<loop_id>/`` when that archive exists
+    or can be created — so extend/history and ZComb search share one store.
+    Returns the reports/ archive directory, or None when nothing to copy.
+    """
+    abs_dir = pathlib.Path(project).resolve() / ".absoloop"
+    md_src = abs_dir / "report.md"
+    html_src = abs_dir / "report.html"
+    if not md_src.is_file() and not html_src.is_file():
+        return None
+
+    lid = (loop_id or "").strip()
+    if not lid:
+        try:
+            runtime = json.loads(
+                (abs_dir / "runtime.json").read_text(encoding="utf-8"))
+            lid = str(runtime.get("loop_id") or "").strip()
+        except (OSError, json.JSONDecodeError, TypeError):
+            lid = ""
+    if not lid:
+        lid = time.strftime("loop-%Y%m%d-%H%M%S")
+
+    reports_dir = abs_dir / "reports" / lid
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    for src in (md_src, html_src):
+        if src.is_file():
+            shutil.copy2(src, reports_dir / src.name)
+
+    meta = {
+        "loopId": lid,
+        "missionId": mission_id or None,
+        "status": status or None,
+        "objective": (objective or "")[:500] or None,
+        "archivedAt": time.time(),
+        "hasMarkdown": (reports_dir / "report.md").is_file(),
+        "hasHtml": (reports_dir / "report.html").is_file(),
+    }
+    try:
+        (reports_dir / "meta.json").write_text(
+            json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    runs_dir = abs_dir / "runs" / lid
+    try:
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("report.md", "report.html"):
+            src = reports_dir / name
+            if src.is_file():
+                shutil.copy2(src, runs_dir / name)
+    except OSError:
+        pass
+    return reports_dir
+
+
 def write_report_docs(
     project: pathlib.Path,
     *,
@@ -2576,6 +2699,13 @@ def write_report_docs(
     md_path.write_text(render_markdown(report), encoding="utf-8")
     if write_html:
         html_path.write_text(render_html(report), encoding="utf-8")
+    archive_loop_report(
+        report.project,
+        loop_id=report.loop_id,
+        status=report.status,
+        mission_id=report.mission_id,
+        objective=report.objective,
+    )
     return WrittenReport(md_path, html_path, report)
 
 

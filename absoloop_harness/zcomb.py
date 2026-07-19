@@ -1,11 +1,16 @@
 """Optional ZComb Kanban UI for Absoloop mission monitoring.
 
-Vendors the ZCombinator dashboard (zcomb/monitor) and bridges Absoloop
-telemetry (.absoloop/tmp/monitor.json + live.jsonl + state/runtime) into
-ZComb's agents/tasks/activity/metrics state files.
+Vendors the ZCombinator dashboard (``zcomb/monitor``) and bridges Absoloop
+telemetry (``.absoloop/tmp/monitor.json`` + ``live.jsonl`` + state/runtime)
+into ZComb's agents/tasks/activity/metrics state files under
+``.absoloop/zcomb/state/``.
 
-CLI:  absoloop --zcomb  → same briefing/launch as absoloop + Kanban UI
-      absoloop zcomb [-C project] [--port N] [--no-browser]  → dashboard only
+CLI:
+  ``absoloop --zcomb`` — same briefing/launch as ``absoloop``, then Kanban
+  ``absoloop zcomb [-C project] [--port N] [--no-browser]`` — dashboard only
+
+Requires Node.js 18+. First run installs and builds ``monitor/``. Default
+URL: http://localhost:3141. See ``zcomb/README.md``.
 """
 from __future__ import annotations
 
@@ -264,6 +269,286 @@ def _displayed_objective(history: list[dict], objective: str) -> str:
         if entry.get("kind") == "continuation" and entry.get("text"):
             return str(entry["text"])
     return objective
+
+
+def _extension_end_ts(abs_dir: pathlib.Path, loop_id: str) -> Optional[float]:
+    """Timestamp when ``loop_id`` was superseded (next extension event)."""
+    lid = (loop_id or "").strip()
+    if not lid:
+        return None
+    ledger_path = abs_dir / "ledger.jsonl"
+    if not ledger_path.is_file():
+        return None
+    try:
+        lines = ledger_path.read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "extension":
+            continue
+        prev = str(event.get("previous_loop_id") or "").strip()
+        if prev != lid:
+            continue
+        ts = event.get("ts")
+        if isinstance(ts, (int, float)) and ts > 0:
+            return float(ts)
+    return None
+
+
+def _loop_clock_bounds(
+    abs_dir: pathlib.Path,
+    loop_id: str,
+    *,
+    current_loop_id: str,
+    current_started: float,
+    current_ended: float,
+) -> tuple[Optional[float], Optional[float]]:
+    """Return ``(started_at, ended_at)`` for a loop id.
+
+    Archived Absoloop states often omit ``ended_at``; fall back to the next
+    extension timestamp, then the next archived loop's ``started_at``.
+    """
+    lid = (loop_id or "").strip()
+    if not lid:
+        return None, None
+    current = (current_loop_id or "").strip()
+    if lid == current and current_started > 0:
+        ended = (current_ended if current_ended > current_started else None)
+        return float(current_started), ended
+
+    state = _read_json(abs_dir / "runs" / lid / "state.json")
+    if not state:
+        return None, None
+    started = state.get("started_at")
+    if not isinstance(started, (int, float)) or started <= 0:
+        return None, None
+    started_f = float(started)
+    ended: Optional[float] = None
+    for candidate in (state.get("ended_at"), state.get("updated_at")):
+        if isinstance(candidate, (int, float)) and candidate > started_f:
+            ended = float(candidate)
+            break
+    if ended is None:
+        ext_ts = _extension_end_ts(abs_dir, lid)
+        if ext_ts is not None and ext_ts > started_f:
+            ended = ext_ts
+    if ended is None:
+        # Next archive by start time after this loop.
+        runs_dir = abs_dir / "runs"
+        if runs_dir.is_dir():
+            next_starts: list[float] = []
+            for entry in runs_dir.iterdir():
+                if not entry.is_dir() or entry.name == lid:
+                    continue
+                other = _read_json(entry / "state.json")
+                other_start = other.get("started_at") if other else None
+                if (isinstance(other_start, (int, float))
+                        and other_start > started_f):
+                    next_starts.append(float(other_start))
+            if current_started > started_f:
+                next_starts.append(float(current_started))
+            if next_starts:
+                ended = min(next_starts)
+    return started_f, ended
+
+
+def _loop_wall_seconds(
+    abs_dir: pathlib.Path,
+    loop_id: str,
+    *,
+    current_loop_id: str,
+    current_started: float,
+    current_ended: float,
+) -> Optional[float]:
+    """Wall-clock seconds for a loop id — live metrics or archived state."""
+    started, ended = _loop_clock_bounds(
+        abs_dir, loop_id,
+        current_loop_id=current_loop_id,
+        current_started=current_started,
+        current_ended=current_ended,
+    )
+    if started is None:
+        return None
+    lid = (loop_id or "").strip()
+    current = (current_loop_id or "").strip()
+    if lid == current and ended is None:
+        ended = time.time()
+    if ended is None or ended < started:
+        return None
+    return max(0.0, float(ended) - float(started))
+
+
+def _enrich_objective_history_elapsed(
+    history: list[dict],
+    abs_dir: pathlib.Path,
+    *,
+    current_loop_id: str,
+    current_started: float,
+    current_ended: float,
+) -> list[dict]:
+    """Attach elapsedSeconds / clock anchors next to each history loop id.
+
+    The original-objective row often lacks a loopId; fill it from the first
+    continuation's previousLoopId (or the current loop) so the dropdown can
+    show that segment's wall time too.
+    """
+    if not history:
+        return history
+    enriched: list[dict] = [dict(entry) for entry in history]
+    current = (current_loop_id or "").strip()
+
+    for index, entry in enumerate(enriched):
+        if entry.get("kind") == "objective" and not entry.get("loopId"):
+            prior = None
+            for later in enriched[index + 1:]:
+                if later.get("kind") == "continuation":
+                    prior = (str(later.get("previousLoopId") or "").strip()
+                             or None)
+                    if prior:
+                        break
+            entry["loopId"] = prior or (current or None)
+
+    for entry in enriched:
+        lid = str(entry.get("loopId") or "").strip()
+        if not lid:
+            entry["elapsedSeconds"] = None
+            entry["startedAt"] = None
+            entry["endedAt"] = None
+            continue
+        started, ended = _loop_clock_bounds(
+            abs_dir, lid,
+            current_loop_id=current,
+            current_started=current_started,
+            current_ended=current_ended,
+        )
+        entry["startedAt"] = started
+        entry["endedAt"] = ended
+        entry["elapsedSeconds"] = _loop_wall_seconds(
+            abs_dir, lid,
+            current_loop_id=current,
+            current_started=current_started,
+            current_ended=current_ended,
+        )
+    return enriched
+
+
+def _format_elapsed_hms(seconds: Optional[float]) -> str:
+    """Match the ZComb dropdown clock: ``HH:MM:SS``."""
+    if seconds is None:
+        return ""
+    try:
+        total = max(0, int(float(seconds)))
+    except (TypeError, ValueError):
+        return ""
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _kind_label(kind: str) -> str:
+    return "Continuation" if kind == "continuation" else "Original objective"
+
+
+def render_objectives_archive_markdown(
+    history: list[dict],
+    *,
+    displayed_text: str = "",
+    project_name: str = "",
+) -> str:
+    """Markdown twin of the ZComb objective dropdown (newest first).
+
+    Each entry: kind label (+ ``· current``), loop id, elapsed, then full text.
+    """
+    active = (displayed_text or "").strip()
+    # Dropdown reverses oldest→newest so the active note sits at the top.
+    items = list(reversed(history or []))
+    gen = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime()).strip()
+    lines = [
+        "# Absoloop · Objectives & Continuations",
+        "",
+        "Archive of the ZComb objective dropdown — same labels, loop ids, "
+        "elapsed times, and full statement text.",
+        "",
+        f"- **Project:** {project_name or '—'}",
+        f"- **Generated:** {gen}",
+        f"- **Entries:** {len(items)}",
+        f"- **Current (displayed):** "
+        + (active[:120] + ("…" if len(active) > 120 else "") if active else "—"),
+        "",
+        "---",
+        "",
+    ]
+    if not items:
+        lines += ["_No objective / continuation history recorded yet._", ""]
+        return "\n".join(lines)
+
+    for entry in items:
+        kind = str(entry.get("kind") or "objective")
+        text = str(entry.get("text") or "").strip()
+        loop_id = str(entry.get("loopId") or "").strip()
+        elapsed = _format_elapsed_hms(entry.get("elapsedSeconds"))
+        is_current = bool(active) and text == active
+        label = _kind_label(kind).upper()
+        if is_current:
+            label = f"{label} · CURRENT"
+        lines.append(f"## {label}")
+        lines.append("")
+        meta_bits = []
+        if loop_id:
+            meta_bits.append(f"`{loop_id}`")
+        if elapsed:
+            meta_bits.append(f"`{elapsed}`")
+        if meta_bits:
+            lines.append(" · ".join(meta_bits))
+            lines.append("")
+        lines.append(text or "_(empty)_")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def write_objectives_archive(
+    project: pathlib.Path,
+    history: list[dict],
+    *,
+    displayed_text: str = "",
+    project_name: str = "",
+) -> Optional[pathlib.Path]:
+    """Write ``.absoloop/reports/OBJECTIVES.md`` (+ JSON) for the mission."""
+    abs_dir = pathlib.Path(project).resolve() / ".absoloop"
+    reports = abs_dir / "reports"
+    try:
+        reports.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    md_path = reports / "OBJECTIVES.md"
+    json_path = reports / "OBJECTIVES.json"
+    markdown = render_objectives_archive_markdown(
+        history,
+        displayed_text=displayed_text,
+        project_name=project_name or pathlib.Path(project).name,
+    )
+    payload = {
+        "project": project_name or pathlib.Path(project).name,
+        "generatedAt": time.time(),
+        "displayedText": (displayed_text or "").strip(),
+        "history": history,
+    }
+    try:
+        md_path.write_text(markdown, encoding="utf-8")
+        json_path.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
+    return md_path
 
 
 def _read_live_events(path: pathlib.Path, limit: int = 200) -> list[dict]:
@@ -1406,6 +1691,135 @@ def _archived_loop_summaries(
     return rows
 
 
+def _report_excerpt(path: pathlib.Path, limit: int = 700) -> str:
+    """Plain-text excerpt from an archived report.md for Kanban search."""
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    # Drop markdown chrome for denser search hits.
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or stripped == "---":
+            continue
+        if stripped.startswith("|") and stripped.endswith("|"):
+            continue
+        lines.append(stripped.lstrip("> ").lstrip("- ").lstrip("* "))
+    blob = " ".join(lines)
+    blob = re.sub(r"`+", "", blob)
+    blob = re.sub(r"\s+", " ", blob).strip()
+    if len(blob) > limit:
+        return blob[: limit - 1] + "…"
+    return blob
+
+
+def _discover_report_archives(abs_dir: pathlib.Path) -> list[dict]:
+    """Loop report archives from ``reports/`` and ``runs/*/report.md``."""
+    found: dict[str, dict] = {}
+
+    reports_root = abs_dir / "reports"
+    if reports_root.is_dir():
+        for entry in sorted(reports_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            md = entry / "report.md"
+            if not md.is_file():
+                continue
+            meta = _read_json(entry / "meta.json")
+            lid = str(meta.get("loopId") or entry.name).strip() or entry.name
+            found[lid] = {
+                "loopId": lid,
+                "path": md,
+                "html": entry / "report.html",
+                "status": str(meta.get("status") or ""),
+                "objective": str(meta.get("objective") or ""),
+                "missionId": str(meta.get("missionId") or ""),
+            }
+
+    runs_root = abs_dir / "runs"
+    if runs_root.is_dir():
+        for entry in sorted(runs_root.iterdir()):
+            if not entry.is_dir():
+                continue
+            md = entry / "report.md"
+            if not md.is_file():
+                continue
+            lid = entry.name
+            state = _read_json(entry / "state.json")
+            row = found.get(lid, {
+                "loopId": lid,
+                "path": md,
+                "html": entry / "report.html",
+                "status": "",
+                "objective": "",
+                "missionId": "",
+            })
+            row["path"] = md
+            if (entry / "report.html").is_file():
+                row["html"] = entry / "report.html"
+            if state:
+                row["status"] = row["status"] or str(state.get("status") or "")
+                row["missionId"] = (
+                    row["missionId"] or str(state.get("mission_id") or ""))
+            found[lid] = row
+
+    # Live report for the current loop (searchable while the mission is open).
+    live_md = abs_dir / "report.md"
+    if live_md.is_file():
+        runtime = _read_json(abs_dir / "runtime.json")
+        state = _read_json(abs_dir / "state.json")
+        lid = str((runtime or {}).get("loop_id")
+                  or (state or {}).get("mission_id")
+                  or "current").strip()
+        if lid and lid not in found:
+            found[lid] = {
+                "loopId": lid,
+                "path": live_md,
+                "html": abs_dir / "report.html",
+                "status": str((state or {}).get("status") or "LIVE"),
+                "objective": str((runtime or {}).get("objective") or ""),
+                "missionId": str((state or {}).get("mission_id") or ""),
+            }
+    return list(found.values())
+
+
+def _report_archive_tasks(
+    abs_dir: pathlib.Path,
+    *,
+    now: str,
+) -> list[dict]:
+    """Searchable Done cards for archived (and live) mission reports."""
+    cards: list[dict] = []
+    for index, row in enumerate(_discover_report_archives(abs_dir), start=1):
+        loop_id = row["loopId"]
+        excerpt = _report_excerpt(row["path"])
+        status = (row.get("status") or "Report").replace("_", " ").title()
+        objective = " ".join(str(row.get("objective") or "").split())
+        title = f"Report · {loop_id}"
+        bits = [f"#{index}", status, "report"]
+        if objective:
+            bits.append(objective[:80] + ("…" if len(objective) > 80 else ""))
+        desc_parts = [" · ".join(bits)]
+        if excerpt:
+            desc_parts.append(excerpt)
+        cards.append(_task(
+            f"report-{loop_id}",
+            title,
+            "done",
+            None,
+            "low",
+            6,
+            now,
+            now,
+            description="\n".join(desc_parts),
+            kind="report",
+        ))
+    return cards
+
+
 def _past_run_tasks(
     abs_dir: pathlib.Path,
     *,
@@ -1439,7 +1853,13 @@ def _past_run_tasks(
         focus = " ".join(str(row.get("focus") or "").split())
         if focus:
             bits.append(focus[:48] + ("…" if len(focus) > 48 else ""))
+        # Fold report body into description so Task Board search finds it.
+        excerpt = _report_excerpt(abs_dir / "runs" / loop_id / "report.md")
+        if not excerpt:
+            excerpt = _report_excerpt(abs_dir / "reports" / loop_id / "report.md")
         desc = " · ".join(bits)
+        if excerpt:
+            desc = f"{desc}\n{excerpt}"
         created = _iso(row.get("startedAt")) if row.get("startedAt") else now
         cards.append(_task(
             f"run-{loop_id}",
@@ -1726,6 +2146,15 @@ def build_bridge_state(project: pathlib.Path) -> dict:
                 ended_at = float(candidate)
                 break
 
+    # Per-loop wall times for the objective-history dropdown (next to loop id).
+    if not awaiting:
+        objective_history = _enrich_objective_history_elapsed(
+            objective_history, abs_dir,
+            current_loop_id=loop_id,
+            current_started=started,
+            current_ended=ended_at,
+        )
+
     builder_id = "builder-01"
     critic_id = "critic-01"
     activity_detail = ""
@@ -1843,6 +2272,13 @@ def build_bridge_state(project: pathlib.Path) -> dict:
     # on Extend). Current loop keeps its live pipeline / waiting cards.
     past_run_tasks = _past_run_tasks(
         abs_dir, current_loop_id=loop_id, now=now)
+    report_tasks = _report_archive_tasks(abs_dir, now=now)
+    # Avoid duplicate cards when a past_run already covers the same loop.
+    past_ids = {t["id"] for t in past_run_tasks}
+    report_tasks = [
+        t for t in report_tasks
+        if f"run-{t['id'].removeprefix('report-')}" not in past_ids
+    ]
 
     if not (abs_dir / "runtime.json").is_file():
         # Empty project — idle placeholder so the UI isn't blank
@@ -1867,6 +2303,7 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         loop_id = ""
         status = "IDLE"
         past_run_tasks = []
+        report_tasks = []
     elif awaiting:
         # New / extended run activated — clear prior *current* pipeline and
         # wait for the runner, but keep archived loops as Done cards.
@@ -1880,6 +2317,7 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         )
         tasks = [
             *past_run_tasks,
+            *report_tasks,
             _task("task-waiting", wait_title, "inbox", None, "high", 0,
                   now, now, description=wait_desc),
             _task("task-objective",
@@ -1899,8 +2337,11 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         ]
         teammates = {}
         live_events = []
-    elif past_run_tasks:
-        tasks = [*past_run_tasks, *tasks]
+    else:
+        # Live / settled mission: keep archives + report cards above the pipeline.
+        prefix = [*past_run_tasks, *report_tasks]
+        if prefix:
+            tasks = [*prefix, *tasks]
 
     # Spawned teammates get first-class agent cards with quirky names.
     for record in teammates.values():
@@ -2062,6 +2503,15 @@ def sync_state(project: pathlib.Path, state_dir: Optional[pathlib.Path] = None) 
         body += "\n"
     tmp.write_text(body, encoding="utf-8")
     tmp.replace(activity_path)
+
+    # Keep a durable twin of the objective dropdown under .absoloop/reports/.
+    metrics = bridged.get("metrics") or {}
+    write_objectives_archive(
+        project,
+        metrics.get("objectiveHistory") or [],
+        displayed_text=str(metrics.get("displayedObjective") or ""),
+        project_name=str(metrics.get("projectName") or project.name),
+    )
     return out
 
 

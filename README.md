@@ -5,17 +5,18 @@
 <h1 align="center">Absoloop</h1>
 
 <p align="center">
-  <strong>Bounded, auditable AI repair loops</strong><br/>
+  <strong>Synergetic Loops</strong><br/>
   Evidence wins. Budgets bind. The critic does not take your word.
 </p>
 
 <p align="center">
   <a href="#quick-start">Quick start</a> ·
-  <a href="docs/getting-started.md">Setup wizard</a> ·
-  <a href="#how-the-loop-closes">How it works</a> ·
+  <a href="docs/getting-started.md">Setup</a> ·
+  <a href="#two-surfaces">Surfaces</a> ·
+  <a href="#how-the-loop-closes">Mission loop</a> ·
   <a href="#multi-provider-harness">Harness</a> ·
-  <a href="CONTRIBUTING.md">Contribute</a> ·
-  <a href="docs/">Docs</a>
+  <a href="docs/">Docs</a> ·
+  <a href="CONTRIBUTING.md">Contribute</a>
 </p>
 
 <p align="center">
@@ -28,7 +29,13 @@
 
 ---
 
-Absoloop is an open-source orchestrator for **local agent CLIs**. You state an
+## Synergetic Loops
+
+**AbsoLoop** is *Synergetic Loops* — bounded cycles where builder, critic,
+human, and local agent CLIs compound so the mission outcome is stronger than
+any single agent alone.
+
+It is an open-source orchestrator for **local agent CLIs**. You state an
 objective; Absoloop runs a checkpointed repair loop until three things agree:
 
 1. the **builder** claims done with evidence  
@@ -54,12 +61,25 @@ your ledger.
 | **Adversarial critic** | A read-only reviewer tries to *disprove* the result. |
 | **Hard budgets** | Iterations, wall clock, and dollars — resume or extend anytime. |
 | **Provider-native** | Grok Build, Claude Code, and Codex keep their own auth, tools, and sessions. |
+| **Two-layer teams** | Absoloop owns outer orchestration; each builder fans out with native Agent Teams / subagents. |
 | **Observable** | Live stream + `watch` + optional ZComb Kanban (`--zcomb`) + Markdown report. |
 | **Stdlib-first** | Core CLI + runner: Python 3.9+, zero pip deps to install. |
 
 <p align="center">
   <img src="docs/assets/absoloop-logo-pixel.png" alt="Absoloop pixel mark" width="280" />
 </p>
+
+## Two surfaces
+
+Absoloop ships one CLI with two complementary workflows:
+
+| Surface | When to use | Entry points |
+|---|---|---|
+| **Mission loop** | Long-running, checkpointed repair toward a `/goal` contract with a human gate | `absoloop "…"`, `status`, `watch`, `approve` / `reject`, `resume` / `extend` |
+| **Multi-provider harness** | One-shot / race / council / cross-provider review in isolated git worktrees | `absoloop run`, `build`, `review`, `inspect`, `apply`, `cancel` |
+
+Both preserve provider-native auth and tooling. The mission loop is the default
+day-to-day path; the harness is for competitive or multi-agent one-shots.
 
 ## Quick start
 
@@ -84,7 +104,8 @@ absoloop "Make all tests pass"     # Mission Briefing → review card → Enter
 ```
 
 **Mission Briefing keys:** `Enter` launch · `o` objective · `e` engine ·
-`d` delivery · `n` rename · `g` preview `/goal` · `q` abort · `-y` skip review.
+`m` model · `d` delivery · `n` rename · `g` preview `/goal` · `q` abort ·
+`-y` skip review.
 
 ```bash
 absoloop status · watch · report   # see, stream, then open the report viewer
@@ -95,10 +116,12 @@ absoloop reject "use the v2 API"   # steer the next iteration
 absoloop resume · extend
 absoloop abort                     # stop a live loop
 absoloop restart                   # factory reset: wipe runs/objectives (asks first)
-absoloop schedule add|tick|daemon   # cron / interval triggers (never auto-approves)
+absoloop schedule add|tick|daemon  # cron / interval triggers (never auto-approves)
 ```
 
 Runner exit codes: `0` completed · `3` awaiting your approval · `2` stopped safely.
+
+Full walkthrough: [`docs/getting-started.md`](docs/getting-started.md).
 
 ## Multi-provider harness
 
@@ -111,6 +134,13 @@ absoloop build --strategy race --providers grok,claude,codex "Implement #123"
 absoloop review --implementer claude --reviewer codex "Harden this change"
 absoloop inspect <run-id> · cancel <run-id> · apply <run-id>
 ```
+
+| Strategy | Behavior |
+|---|---|
+| `single` | One provider, one worktree, gates, patch |
+| `review` | Implementer works; another provider reviews read-only; fix pass; gates |
+| `race` | Parallel implementers; gates rank; winner re-verified |
+| `council` | Planner → parallel implementers → reviewer → integrator + gates |
 
 Guides: [`docs/multi-provider.md`](docs/multi-provider.md) ·
 architecture: [`docs/architecture/multi-provider-harness.md`](docs/architecture/multi-provider-harness.md) ·
@@ -195,20 +225,36 @@ Telemetry lives under `.absoloop/tmp/` while running; the ledger and
 ## Repo layout
 
 ```text
-bin/absoloop                 Public CLI
+bin/absoloop                 Public CLI (mission briefing + harness entry)
 bin/absoloop_logo.py         Terminal infinity mark
-absoloop_harness/            Multi-provider harness + report viewer + ZComb bridge
+absoloop_harness/            Multi-provider harness, briefing UX, report viewer,
+                             shortcuts, schedules, ZComb bridge
 zcomb/                       Optional Kanban UI (vendored from BLERBZ/zcomb)
 templates/absoloop-run       Reference loop runner (copied into projects)
-templates/skills/            Loopers-toolbox
+templates/skills/            Loopers-toolbox skill pack
 tests/                       Characterization + harness suites
 docs/                        Guides, architecture, brand assets
 .github/                     CI, issue/PR templates
 ```
 
+## Documentation
+
+| Doc | Contents |
+|---|---|
+| [`docs/getting-started.md`](docs/getting-started.md) | Wizard, PATH, providers, first mission |
+| [`docs/mission-loop.md`](docs/mission-loop.md) | Briefing, `/goal`, skills, delivery, watch/report, ZComb |
+| [`docs/multi-provider.md`](docs/multi-provider.md) | Harness user guide |
+| [`docs/architecture/multi-provider-harness.md`](docs/architecture/multi-provider-harness.md) | Adapter contract, events, security |
+| [`docs/schedule.md`](docs/schedule.md) | Cron / interval mission triggers |
+| [`docs/shortcuts.md`](docs/shortcuts.md) | Keyboard + Codex Micro |
+| [`docs/assets/BRAND.md`](docs/assets/BRAND.md) | Logos and palette |
+
+Index: [`docs/README.md`](docs/README.md).
+
 ## Contributing
 
-Absoloop is built for people who want **honest loops** — patches welcome.
+Absoloop is built for people who want **Synergetic Loops** — honest,
+compounding cycles with receipts. Patches welcome.
 
 1. Read [`CONTRIBUTING.md`](CONTRIBUTING.md)  
 2. Keep `bin/` + `templates/absoloop-run` **stdlib-only**  

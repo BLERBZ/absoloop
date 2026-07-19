@@ -21,7 +21,16 @@ timeline.
 ## Scope notes for Absoloop
 
 Absoloop shells out to provider CLIs (`claude`, `codex`, `grok`) and may run
-agent-proposed commands inside missions. When reporting, call out anything that:
+agent-proposed commands inside missions. Design intent (see
+[docs/multi-provider.md](docs/multi-provider.md)):
+
+- Provider CLIs spawn as argv arrays (no shell interpolation of task text)
+- Child environments are allowlisted; credentials are never copied or persisted
+- Secrets are redacted from events, logs, and manifests
+- Permission profiles fail closed when no safe native mapping exists
+- Schedules never auto-approve the human gate
+
+When reporting, call out anything that:
 
 - Escapes intended permission / sandbox profiles
 - Leaks secrets into `.absoloop/` logs, events, or reports despite redaction

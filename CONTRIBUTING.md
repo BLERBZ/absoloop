@@ -1,7 +1,10 @@
 # Contributing to Absoloop
 
-Thanks for helping build a bounded, auditable AI repair loop. This guide gets
+Thanks for helping build **Synergetic Loops** — bounded cycles where builder,
+critic, human, and local agent CLIs compound with receipts. This guide gets
 you from clone → useful PR without tribal knowledge.
+
+Product overview and operator docs live under [`docs/`](docs/README.md).
 
 ## Quick start for contributors
 
@@ -33,8 +36,9 @@ ABSOLOOP_LIVE_SMOKE=1 ABSOLOOP_SMOKE_CLAUDE=1 \
 |---|---|
 | `bin/absoloop` | Public CLI (mission briefing, status/watch/report, harness entry) |
 | `templates/absoloop-run` | Loop runner copied into mission projects |
-| `absoloop_harness/` | Multi-provider harness (Grok / Claude / Codex) |
+| `absoloop_harness/` | Multi-provider harness, briefing UX, report viewer, ZComb bridge |
 | `templates/skills/` | Loopers-toolbox skills seeded into projects |
+| `zcomb/` | Optional Kanban UI (vendored; prefer `absoloop zcomb`) |
 | `tests/` | Characterization + harness tests (stdlib unittest / pytest) |
 | `docs/` | User guides + architecture |
 

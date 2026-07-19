@@ -37,6 +37,12 @@ export interface ObjectiveHistoryEntry {
   loopId?: string | null;
   previousLoopId?: string | null;
   ts?: number | null;
+  /** Wall-clock seconds for this entry's loop (bridge snapshot). */
+  elapsedSeconds?: number | null;
+  /** Unix seconds — loop start, for live ticking in the dropdown. */
+  startedAt?: number | null;
+  /** Unix seconds — terminal end; absent while the loop is still running. */
+  endedAt?: number | null;
 }
 
 export interface Metrics {

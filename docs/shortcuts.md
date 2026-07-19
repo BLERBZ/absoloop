@@ -1,7 +1,8 @@
 # Absoloop shortcuts — keyboard & Codex Micro
 
 Absoloop exposes a single **action catalog** that works the same on
-**Linux, macOS, and Windows**, with Grok / Claude Code / Codex missions.
+**Linux, macOS, and Windows**, across mission-loop and harness workflows
+(Grok / Claude Code / Codex).
 
 Fire actions two ways:
 

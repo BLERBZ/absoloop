@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""Absoloop mission runner — checkpointed builder ↔ critic repair loop.
+
+Copied into projects as ``scripts/absoloop-run`` by ``bin/absoloop``. This file
+is the authority for acceptance order and must stay Python 3.9+ stdlib-only.
+
+Loop contract (do not weaken):
+  1. Builder iterates under hard budgets (iterations / wall / dollars)
+  2. On a "done" claim → optional integrity command
+  3. Independent critic (PASS / HOLD / REJECT); unreadable ≠ pass
+  4. Human gate (AWAITING_APPROVAL) before delivery externalization
+
+Supporting concerns:
+  - Thinking escalation via ``runtime.json.thinking_ladder``
+  - Two-layer teams: this process is outer; the builder CLI is team lead
+  - Live telemetry in ``.absoloop/tmp/`` for ``absoloop watch`` / ZComb
+  - Durable ledger + state for resume / extend / abort
+"""
 from __future__ import annotations
 
 import argparse
@@ -31,7 +48,7 @@ MONITOR_PATH = TMP / "monitor.json"
 LIVE_PATH = TMP / "live.jsonl"
 # Mission skills: reusable capabilities the loop compounds across iterations.
 # 'absoloop' seeds the loopers-toolbox into each engine's native project-skill
-# discovery path (both CLIs scan theirs at session startup); the builder
+# discovery path (CLIs scan theirs at session startup); the builder
 # creates/enhances further skills there via skill-creator.
 ENGINE_SKILL_DIRS = {
     "claude": ".claude/skills",
@@ -1435,13 +1452,17 @@ def run_critic(engine: str, runtime: dict[str, Any], state: State,
 def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
                      check_timeout: int,
                      model: str = "") -> tuple[str, str] | None:
-    """Layered acceptance: optional integrity check, independent critic, then
-    the human gate. Returns (stop_reason, terminal_status) when the mission
-    should stop, or None when the repair loop should continue."""
+    """Layered acceptance — the non-negotiable gate sequence.
+
+    Order is fixed: integrity → critic → human gate. Returns
+    ``(stop_reason, terminal_status)`` when the mission should stop, or
+    ``None`` when the repair loop should continue (e.g. critic HOLD).
+    """
     state.status = "FINAL_REVIEW"
     say("builder reports done — entering final acceptance (integrity, critic)", "bold")
     MONITOR.update(phase="final acceptance", status="FINAL_REVIEW")
 
+    # --- 1. Integrity (optional command; fail closed on non-zero) ----------
     integrity_command = runtime.get("integrity_command")
     if integrity_command:
         MONITOR.update(phase="integrity check")
@@ -1453,6 +1474,7 @@ def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
             # Weakened tests or edited checks are an automatic failure (14.3).
             return "integrity_violation", "REJECTED"
 
+    # --- 2. Independent critic (PASS / HOLD / REJECT; unreadable → ERROR) --
     verdict, run = run_critic(engine, runtime, state, model=model)
     state.cost_usd += run.cost_usd
     state.tokens_total += run.tokens or 0
@@ -1482,6 +1504,7 @@ def final_acceptance(runtime: dict[str, Any], state: State, engine: str,
             return "critic_findings_not_converging", "BLOCKED"
         return None  # findings feed the next repair iteration
 
+    # --- 3. Human gate (default on; delivery happens only after approve) ---
     state.latest_critic_findings = None
     if runtime.get("require_human_approval", True):
         # Externalization stays behind the human gate (Section 16).
@@ -1514,12 +1537,61 @@ def git_changed_files() -> list[str]:
     return sorted(set(paths))
 
 
+def archive_report(runtime: dict[str, Any], state: State) -> pathlib.Path | None:
+    """Persist report.md (+ html if present) under ``.absoloop/reports/<loop>/``.
+
+    Also mirrors into ``.absoloop/runs/<loop>/`` so extend archives and ZComb
+    search share the same history. Stdlib-only — no harness import.
+    """
+    md = ABS / "report.md"
+    html = ABS / "report.html"
+    if not md.is_file() and not html.is_file():
+        return None
+    loop_id = str(runtime.get("loop_id") or state.mission_id or "loop").strip()
+    dest = ABS / "reports" / loop_id
+    dest.mkdir(parents=True, exist_ok=True)
+    for src in (md, html):
+        if src.is_file():
+            shutil.copy2(src, dest / src.name)
+    meta = {
+        "loopId": loop_id,
+        "missionId": state.mission_id,
+        "status": state.status,
+        "stopReason": state.stop_reason,
+        "iteration": state.iteration,
+        "costUsd": state.cost_usd,
+        "objective": str(runtime.get("objective") or "")[:500],
+        "archivedAt": time.time(),
+        "hasMarkdown": (dest / "report.md").is_file(),
+        "hasHtml": (dest / "report.html").is_file(),
+    }
+    try:
+        (dest / "meta.json").write_text(
+            json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+    run_dest = ABS / "runs" / loop_id
+    try:
+        run_dest.mkdir(parents=True, exist_ok=True)
+        for name in ("report.md", "report.html"):
+            src = dest / name
+            if src.is_file():
+                shutil.copy2(src, run_dest / name)
+        # Keep a state snapshot alongside the report for past-loop cards.
+        if STATE_PATH.is_file():
+            shutil.copy2(STATE_PATH, run_dest / "state.json")
+    except OSError:
+        pass
+    return dest
+
+
 def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
     """Human-readable mission report Markdown, regenerated at every stop.
 
     Structure matches the infographic document that `absoloop report` regenerates
     and opens in the lite HTML viewer. The runner stays stdlib-standalone, so
     this writes Markdown only; the CLI adds the viewer on demand.
+    Archives a copy under ``.absoloop/reports/<loop_id>/`` after writing.
     """
     report_path = ABS / "report.md"
     changed = [p for p in git_changed_files() if not p.startswith(".absoloop/")]
@@ -1637,6 +1709,12 @@ def write_report(runtime: dict[str, Any], state: State) -> pathlib.Path:
         "",
     ]
     report_path.write_text("\n".join(lines), encoding="utf-8")
+    archived = archive_report(runtime, state)
+    if archived is not None:
+        try:
+            say(f"report archived: {archived.relative_to(ROOT)}", "dim")
+        except ValueError:
+            say(f"report archived: {archived}", "dim")
     return report_path
 
 
@@ -1760,6 +1838,12 @@ def stop(state: State, reason: str, status: str, runtime: dict[str, Any]) -> int
 
 
 def main() -> int:
+    """Entry point for ``scripts/absoloop-run``.
+
+    Normal path: load runtime/state, honor terminal-status guards, then iterate
+    builder → (done? → final_acceptance). ``--deliver-only`` skips the loop and
+    applies delivery (used by ``absoloop approve``).
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--engine", choices=["claude", "codex", "grok"])
     parser.add_argument("--model", default="",

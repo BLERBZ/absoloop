@@ -64,6 +64,13 @@ class Candidate:
 
 
 class Orchestrator:
+    """Owns harness workflows: single, review, race, and council.
+
+    Each workflow creates a ``RunStore``, drives one or more adapters via
+    ``_drive``, runs deterministic gates, ranks candidates, and finalizes
+    ``live.json`` / the manifest. Callers never share worktrees across writers.
+    """
+
     def __init__(self, root: pathlib.Path, cfg: Config,
                  on_event=None, keep_worktrees: Optional[bool] = None):
         self.root = root.resolve()
@@ -75,6 +82,7 @@ class Orchestrator:
     # -- provider plumbing -----------------------------------------------------
 
     def adapter(self, provider: str) -> ProviderAdapter:
+        """Construct a configured adapter; probe/start happen at call sites."""
         return make_adapter(provider, self.cfg.get("providers", provider, default={}))
 
     def _drive(self, adapter: ProviderAdapter, request: AgentRequest,

@@ -112,7 +112,10 @@ with open(".absoloop/goal.md", "w", encoding="utf-8") as handle:
     handle.write(goal)
 EOF
 
-grep -qxF '.absoloop/tmp/' .gitignore 2>/dev/null || echo '.absoloop/tmp/' >> .gitignore
+# Recommended: ignore the whole Absoloop mission folder (runtime, reports, ledgers).
+if ! grep -Eq '^[[:space:]]*\.absoloop/?[[:space:]]*$' .gitignore 2>/dev/null; then
+  printf '\n# Absoloop mission state — runtime, reports, ledgers, live telemetry\n.absoloop/\n' >> .gitignore
+fi
 
 [ -x scripts/absoloop-run ] || echo "Reminder: save the Section 22 runner as scripts/absoloop-run and chmod +x it."
 echo "Mission ready. Run:  ./scripts/absoloop-run --engine claude"

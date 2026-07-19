@@ -16,3 +16,6 @@ zcomb/monitor/state/activity.jsonl
 # macOS
 .DS_Store
 .grok-build-ref/
+
+# Absoloop mission state — runtime, reports, ledgers, live telemetry
+.absoloop/

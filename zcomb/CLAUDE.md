@@ -1,10 +1,13 @@
-# ZCombinator
+# ZCombinator (vendored as Absoloop ZComb UI)
 
-An open source multi-agent orchestration project.
+Open-source multi-agent monitoring dashboard. Inside Absoloop, prefer
+``absoloop zcomb`` / ``absoloop --zcomb`` — those wire the telemetry bridge
+in ``absoloop_harness/zcomb.py``. See [README.md](README.md).
 
-## Project Structure
+## Project structure
 
-- **monitor/** -- Dashboard application built with Express (backend) and React (frontend). Provides a web UI for observing agent activity, task status, and system metrics.
-- **setup.sh** -- Installation walkthrough script. Guides users through initial project setup and dependency installation.
-- **zcomb.sh** -- Launch script. Starts the ZCombinator system and its supporting services.
-- **ZCombinator-Flow.md** -- The original prompt template that defines the multi-agent workflow and orchestration logic.
+- **monitor/** — Express API + React dashboard (agent cards, Kanban, activity)
+- **setup.sh** — Upstream-style local dependency install
+- **zcomb.sh** — Upstream-style launcher (Absoloop CLI is preferred in-mission)
+- **ZCombinator-Flow.md** — Original multi-agent workflow prompt template
+- **examples/** — Sample objectives / demo material

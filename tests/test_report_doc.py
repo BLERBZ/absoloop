@@ -233,6 +233,12 @@ class ReportDocTests(unittest.TestCase):
             self.assertIn("report.md", html)
             self.assertIn("hl-card", html)
             self.assertIn("evidence-grid", html)
+            self.assertIn("Download PDF", html)
+            self.assertIn("download-pdf", html)
+            self.assertIn("@media print", html)
+            # Archived under .absoloop/reports/<loop_id>/
+            archives = list((root / ".absoloop" / "reports").glob("*/report.md"))
+            self.assertTrue(archives, "expected archived report.md")
 
     def test_write_md_only_skips_html(self):
         with tempfile.TemporaryDirectory() as tmp:
