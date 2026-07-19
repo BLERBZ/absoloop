@@ -6,6 +6,7 @@ import { ActivityFeed } from './components/ActivityFeed';
 import { MetricsPanel } from './components/MetricsPanel';
 import { Timeline } from './components/Timeline';
 import { MissionControls, triggerAction } from './components/MissionControls';
+import { ObjectiveDropdown } from './components/ObjectiveDropdown';
 import { matchesActivityFilter } from './components/ActivityFeed';
 
 function formatElapsed(startTime: number): string {
@@ -181,6 +182,13 @@ export default function App() {
   const metrics = state?.metrics;
   const awaitingRun = Boolean(metrics?.awaitingRun);
   const objective = (metrics?.objective || '').trim();
+  const objectiveHistory = metrics?.objectiveHistory || [];
+  const latestContinuation = [...objectiveHistory]
+    .reverse()
+    .find(e => e.kind === 'continuation')?.text;
+  const displayedObjective = (
+    metrics?.displayedObjective || latestContinuation || objective
+  ).trim();
   const projectName = (metrics?.projectName || '').trim();
   const totalTasks = tasks.length;
   const doneTasks = tasks.filter(t => t.status === 'done').length;
@@ -193,7 +201,8 @@ export default function App() {
   const textColor = darkMode ? '#e6edf3' : '#1f2328';
   const mutedColor = darkMode ? '#7d8590' : '#656d76';
   const headerBg = darkMode ? '#010409' : '#f6f8fa';
-  const showObjectiveRow = extendMode || awaitingRun || Boolean(objective || projectName);
+  const showObjectiveRow = extendMode || awaitingRun
+    || Boolean(displayedObjective || objective || projectName);
 
   const openExtendEditor = () => {
     setExtendMode(true);
@@ -419,20 +428,20 @@ export default function App() {
               : undefined,
           }}
         >
-          {!extendMode && objective && (
+          {!extendMode && displayedObjective && (
             <button
               type="button"
               onClick={async () => {
                 try {
-                  await navigator.clipboard.writeText(objective);
+                  await navigator.clipboard.writeText(displayedObjective);
                   setObjectiveCopied(true);
                   window.setTimeout(() => setObjectiveCopied(false), 1500);
                 } catch {
                   // Clipboard may be unavailable in insecure contexts
                 }
               }}
-              title={objectiveCopied ? 'Copied!' : 'Copy objective'}
-              aria-label={objectiveCopied ? 'Copied!' : 'Copy objective'}
+              title={objectiveCopied ? 'Copied!' : 'Copy displayed objective'}
+              aria-label={objectiveCopied ? 'Copied!' : 'Copy displayed objective'}
               style={{
                 background: 'none',
                 border: 'none',
@@ -521,7 +530,7 @@ export default function App() {
                     {projectName}
                   </span>
                 )}
-                {objective && (
+                {displayedObjective && (
                   <span style={{
                     fontSize: 11,
                     color: mutedColor,
@@ -531,9 +540,9 @@ export default function App() {
                     minWidth: 0,
                     flex: 1,
                   }}
-                    title={`Current: ${objective}`}
+                    title={`Current: ${displayedObjective}`}
                   >
-                    current: {objective}
+                    current: {displayedObjective}
                   </span>
                 )}
               </div>
@@ -669,20 +678,18 @@ export default function App() {
                   {projectName}
                 </span>
               )}
-              {objective && (
-                <span style={{
-                  fontSize: 12,
-                  color: mutedColor,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  minWidth: 0,
-                  flex: 1,
-                }}
-                  title={objective}
-                >
-                  {objective}
-                </span>
+              {displayedObjective && (
+                <ObjectiveDropdown
+                  key={runEpoch}
+                  displayedText={displayedObjective}
+                  history={objectiveHistory.length > 0
+                    ? objectiveHistory
+                    : [{ kind: 'objective', text: displayedObjective }]}
+                  darkMode={darkMode}
+                  borderColor={borderColor}
+                  textColor={textColor}
+                  mutedColor={mutedColor}
+                />
               )}
               {metrics?.loopId && (
                 <span style={{

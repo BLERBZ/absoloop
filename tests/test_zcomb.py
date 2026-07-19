@@ -273,6 +273,58 @@ class BridgeStateTests(unittest.TestCase):
             self.assertEqual(metrics["runKey"], f"loop-1:{int(started)}")
             self.assertEqual(metrics["loopId"], "loop-1")
 
+    def test_objective_history_prefers_latest_continuation(self):
+        """Kanban bar shows latest extend note; history keeps the original."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship the original mission",
+                "max_iterations": 8,
+                "loop_id": "loop-3",
+                "continuation": {
+                    "previous_loop_id": "loop-2",
+                    "note": "Second continuation — polish the UI",
+                },
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 1,
+                "mission_id": "ABS-7",
+                "started_at": now - 30,
+            })
+            _write(abs_dir / "ledger.jsonl", "\n".join([
+                json.dumps({
+                    "ts": now - 200,
+                    "type": "extension",
+                    "previous_loop_id": "loop-1",
+                    "loop_id": "loop-2",
+                    "note": "First continuation — add tests",
+                }),
+                json.dumps({
+                    "ts": now - 100,
+                    "type": "extension",
+                    "previous_loop_id": "loop-2",
+                    "loop_id": "loop-3",
+                    "note": "Second continuation — polish the UI",
+                }),
+            ]) + "\n")
+            bridged = zcomb.build_bridge_state(project)
+            metrics = bridged["metrics"]
+            self.assertEqual(metrics["objective"], "Ship the original mission")
+            self.assertEqual(
+                metrics["displayedObjective"],
+                "Second continuation — polish the UI",
+            )
+            kinds = [entry["kind"] for entry in metrics["objectiveHistory"]]
+            texts = [entry["text"] for entry in metrics["objectiveHistory"]]
+            self.assertEqual(
+                kinds, ["objective", "continuation", "continuation"])
+            self.assertEqual(texts[0], "Ship the original mission")
+            self.assertEqual(texts[1], "First continuation — add tests")
+            self.assertEqual(texts[2], "Second continuation — polish the UI")
+
 
 class CliDispatchTests(unittest.TestCase):
     def test_extract_zcomb_flag(self):

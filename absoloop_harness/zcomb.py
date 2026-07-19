@@ -179,6 +179,80 @@ def _agent_status(live: bool, role: str, monitor: dict, state: dict) -> str:
     return "idle"
 
 
+def _objective_history(runtime: dict, abs_dir: pathlib.Path) -> list[dict]:
+    """Original objective plus each extend continuation note (oldest first).
+
+    The Kanban objective bar shows the latest continuation by default and
+    exposes the full chain in a dropdown. History is rebuilt from the
+    append-only ledger (type=extension) with runtime.continuation as a
+    fallback when the ledger has not caught up yet.
+    """
+    history: list[dict] = []
+    objective = str(runtime.get("objective") or "").strip()
+    if objective:
+        history.append({
+            "kind": "objective",
+            "text": objective,
+            "loopId": None,
+            "previousLoopId": None,
+            "ts": None,
+        })
+
+    ledger_path = abs_dir / "ledger.jsonl"
+    if ledger_path.is_file():
+        try:
+            lines = ledger_path.read_text(
+                encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "extension":
+                continue
+            note = str(event.get("note") or "").strip()
+            if not note:
+                continue
+            history.append({
+                "kind": "continuation",
+                "text": note,
+                "loopId": str(event.get("loop_id") or "").strip() or None,
+                "previousLoopId": (
+                    str(event.get("previous_loop_id") or "").strip() or None),
+                "ts": event.get("ts") if isinstance(event.get("ts"),
+                                                    (int, float)) else None,
+            })
+
+    cont = runtime.get("continuation")
+    if isinstance(cont, dict):
+        note = str(cont.get("note") or "").strip()
+        if note:
+            already = any(
+                entry.get("kind") == "continuation" and entry.get("text") == note
+                for entry in history
+            )
+            if not already:
+                history.append({
+                    "kind": "continuation",
+                    "text": note,
+                    "loopId": str(runtime.get("loop_id") or "").strip() or None,
+                    "previousLoopId": (
+                        str(cont.get("previous_loop_id") or "").strip() or None),
+                    "ts": None,
+                })
+    return history
+
+
+def _displayed_objective(history: list[dict], objective: str) -> str:
+    """Latest continuation note, else the original objective."""
+    for entry in reversed(history):
+        if entry.get("kind") == "continuation" and entry.get("text"):
+            return str(entry["text"])
+    return objective
+
+
 def _read_live_events(path: pathlib.Path, limit: int = 200) -> list[dict]:
     """Last `limit` parsed events from live.jsonl (oldest first)."""
     if not path.is_file():
@@ -474,6 +548,8 @@ def build_bridge_state(project: pathlib.Path) -> dict:
     engine = str(monitor.get("engine") or runtime.get("engine")
                  or (runtime.get("builder") or {}).get("engine") or "builder")
     objective = str(runtime.get("objective") or "Absoloop mission").strip()
+    objective_history = _objective_history(runtime, abs_dir)
+    displayed_objective = _displayed_objective(objective_history, objective)
     mission_id = str(state.get("mission_id") or monitor.get("mission_id")
                      or runtime.get("mission_id") or loop_id or "mission")
     started = (monitor.get("started_at") if live else state.get("started_at"))
@@ -614,6 +690,8 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         awaiting = True
         run_key = _run_key("", awaiting=True)
         objective = ""
+        objective_history = []
+        displayed_objective = ""
         mission_id = ""
         loop_id = ""
         status = "IDLE"
@@ -621,17 +699,18 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         # New / extended run activated — clear prior pipeline and wait for
         # the runner to publish live telemetry for this objective.
         wait_title = "Waiting for new Absoloop run to start"
+        wait_focus = displayed_objective or objective
         wait_desc = (
             f"Project {project_name}"
             + (f" · {loop_id}" if loop_id else "")
-            + (f" · {objective[:140]}" if objective else "")
+            + (f" · {wait_focus[:140]}" if wait_focus else "")
             + " — Kanban refreshes when the runner becomes live."
         )
         tasks = [
             _task("task-waiting", wait_title, "inbox", None, "high", 0,
                   now, now, description=wait_desc),
             _task("task-objective",
-                  (f"Objective: {objective[:120]}" if objective
+                  (f"Objective: {wait_focus[:120]}" if wait_focus
                    else "Objective pending"),
                   "assigned", builder_id, "high", 0, now, now,
                   ["task-waiting"],
@@ -743,6 +822,8 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "missionId": mission_id,
             "loopId": loop_id,
             "objective": objective,
+            "displayedObjective": displayed_objective,
+            "objectiveHistory": objective_history,
             "status": status,
             "live": live,
             "awaitingRun": awaiting,
@@ -754,7 +835,8 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "summary": (
                 (f"Awaiting new run · {project_name}"
                  + (f" · {loop_id}" if loop_id else "")
-                 + (f" · {objective[:80]}" if objective else ""))
+                 + (f" · {displayed_objective[:80]}"
+                    if displayed_objective else ""))
                 if awaiting else
                 (f"Mission {mission_id} · status {status}"
                  + (f" · phase {phase}" if phase else ""))

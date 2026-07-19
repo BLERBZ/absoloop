@@ -29,6 +29,14 @@ export interface Activity {
   message: string;
 }
 
+export interface ObjectiveHistoryEntry {
+  kind: 'objective' | 'continuation';
+  text: string;
+  loopId?: string | null;
+  previousLoopId?: string | null;
+  ts?: number | null;
+}
+
 export interface Metrics {
   completionPct: number;
   errorRate: number;
@@ -36,7 +44,12 @@ export interface Metrics {
   phases: { phase: number; name: string; progress: number }[];
   missionId?: string;
   loopId?: string;
+  /** Original mission objective (unchanged across extends). */
   objective?: string;
+  /** Latest continuation note, else the original objective. */
+  displayedObjective?: string;
+  /** Original objective + each extend note (oldest first). */
+  objectiveHistory?: ObjectiveHistoryEntry[];
   status?: string;
   live?: boolean;
   awaitingRun?: boolean;
