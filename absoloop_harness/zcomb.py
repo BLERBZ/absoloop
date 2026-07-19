@@ -870,6 +870,44 @@ def sync_state(project: pathlib.Path, state_dir: Optional[pathlib.Path] = None) 
     return out
 
 
+def _dashboard_sources_newer_than_dist(mon: pathlib.Path,
+                                       dist_index: pathlib.Path) -> bool:
+    """True when monitor source is newer than the last vite build."""
+    if not dist_index.is_file():
+        return True
+    try:
+        dist_mtime = dist_index.stat().st_mtime
+    except OSError:
+        return True
+    watch_roots = (
+        mon / "src",
+        mon / "index.html",
+        mon / "package.json",
+        mon / "vite.config.ts",
+        mon / "vite.config.js",
+        mon / "tsconfig.json",
+    )
+    for root in watch_roots:
+        if not root.exists():
+            continue
+        if root.is_file():
+            try:
+                if root.stat().st_mtime > dist_mtime:
+                    return True
+            except OSError:
+                return True
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime > dist_mtime:
+                    return True
+            except OSError:
+                return True
+    return False
+
+
 def ensure_dashboard_built(*, force: bool = False) -> None:
     """npm install + vite build under zcomb/monitor when needed."""
     mon = monitor_dir()
@@ -885,7 +923,12 @@ def ensure_dashboard_built(*, force: bool = False) -> None:
     if force or not node_modules.is_dir():
         print("  Installing ZComb dashboard dependencies…")
         subprocess.run(["npm", "install"], cwd=mon, check=True)
-    if force or not dist_index.is_file():
+    needs_build = (
+        force
+        or not dist_index.is_file()
+        or _dashboard_sources_newer_than_dist(mon, dist_index)
+    )
+    if needs_build:
         print("  Building ZComb dashboard…")
         subprocess.run(["npm", "run", "build"], cwd=mon, check=True)
 
