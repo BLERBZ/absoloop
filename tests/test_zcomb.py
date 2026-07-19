@@ -250,6 +250,47 @@ class BridgeStateTests(unittest.TestCase):
             self.assertTrue(metrics["awaitingApproval"])
             self.assertFalse(metrics["awaitingRun"])
 
+    def test_completed_state_wins_over_stale_monitor_awaiting_approval(self):
+        """After approve, stale monitor must not keep Approve green.
+
+        UI was enabling Approve from monitor AWAITING_APPROVAL while
+        state.json was already COMPLETED — click then failed with
+        \"mission status is 'COMPLETED'\".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship via Codex",
+                "max_iterations": 8,
+                "engine": "codex",
+                "loop_id": "loop-codex-3",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 3,
+                "mission_id": "ABS-CODEX-3",
+                "started_at": now - 600,
+                "stop_reason": "human_approved",
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "AWAITING_APPROVAL",
+                "phase": "stopped",
+                "iteration": 3,
+                "loop_id": "loop-codex-3",
+                "engine": "codex",
+                "pid": os.getpid(),
+                "heartbeat_ts": now,
+                "started_at": now - 600,
+                "stop_reason": "accepted_pending_human_gate",
+            })
+            metrics = zcomb.build_bridge_state(project)["metrics"]
+            self.assertEqual(metrics["status"], "COMPLETED")
+            self.assertFalse(metrics["awaitingApproval"])
+            self.assertFalse(metrics["live"])
+            self.assertFalse(metrics["awaitingRun"])
+
     def test_sync_state_writes_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = pathlib.Path(tmp)
@@ -318,6 +359,146 @@ class BridgeStateTests(unittest.TestCase):
             self.assertIn("task-waiting", task_ids)
             self.assertNotIn("task-execute", task_ids)
 
+    def test_past_loops_only_session_archives_not_full_history(self):
+        """Done past-run cards are session-scoped — not every archive on disk."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship the original mission",
+                "max_iterations": 8,
+                "loop_id": "loop-3",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 1,
+                "mission_id": "ABS-PAST",
+                "started_at": now - 30,
+                "cost_usd": 1.5,
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "EXECUTING",
+                "phase": "builder",
+                "iteration": 1,
+                "loop_id": "loop-3",
+                "mission_id": "ABS-PAST",
+                "pid": os.getpid(),
+                "heartbeat_ts": now,
+                "started_at": now - 30,
+            })
+            _write(abs_dir / "runs" / "loop-1" / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 3,
+                "mission_id": "ABS-PAST",
+                "started_at": now - 3600,
+                "stop_reason": "human_approved",
+                "cost_usd": 12.4,
+            })
+            _write(abs_dir / "runs" / "loop-2" / "state.json", {
+                "status": "BUDGET_EXHAUSTED",
+                "iteration": 2,
+                "mission_id": "ABS-PAST",
+                "started_at": now - 1800,
+                "stop_reason": "cost_budget",
+                "cost_usd": 50.0,
+            })
+            # Session opened when only loop-1 was archived → hide loop-1,
+            # surface loop-2 which was archived during this session.
+            _write(abs_dir / "zcomb" / "kanban-session.json", {
+                "startedAt": now - 100,
+                "baselineArchiveIds": ["loop-1"],
+            })
+
+            bridged = zcomb.build_bridge_state(project)
+            tasks = bridged["tasks"]["tasks"]
+            past = [t for t in tasks if str(t.get("kind") or "") == "past_run"
+                    or str(t["id"]).startswith("run-")]
+            self.assertEqual(len(past), 1)
+            self.assertEqual(past[0]["id"], "run-loop-2")
+            self.assertEqual(past[0]["status"], "done")
+            self.assertEqual(past[0].get("kind"), "past_run")
+            self.assertEqual(past[0]["title"], "Loop 1 · Budget exhausted")
+            self.assertIn("2 iters", past[0]["description"])
+            self.assertIn("$50", past[0]["description"])
+            # Clean summarized title — no raw long loop id dump.
+            self.assertNotIn("loop-2", past[0]["title"])
+            self.assertLessEqual(len(past[0]["title"]), 40)
+            self.assertIn("task-execute", {t["id"] for t in tasks})
+
+    def test_preexisting_archives_hidden_until_session_extend(self):
+        """Opening Kanban with old archives must not flood Done."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship",
+                "max_iterations": 4,
+                "loop_id": "loop-now",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 1,
+                "mission_id": "ABS-1",
+                "started_at": now - 60,
+                "stop_reason": "human_approved",
+                "cost_usd": 2.0,
+            })
+            _write(abs_dir / "runs" / "loop-old" / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 5,
+                "started_at": now - 10_000,
+                "cost_usd": 40.0,
+            })
+            # First bridge call establishes baseline = existing archives.
+            bridged = zcomb.build_bridge_state(project)
+            past = [t for t in bridged["tasks"]["tasks"]
+                    if str(t["id"]).startswith("run-")]
+            self.assertEqual(past, [])
+            session = json.loads(
+                (abs_dir / "zcomb" / "kanban-session.json").read_text(
+                    encoding="utf-8"))
+            self.assertIn("loop-old", session.get("baselineArchiveIds") or [])
+
+    def test_awaiting_keeps_session_past_run_done_cards(self):
+        """During post-extend STARTING, session-archived loops stay as Done."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship the original mission",
+                "max_iterations": 8,
+                "loop_id": "loop-2",
+                "continuation": {
+                    "previous_loop_id": "loop-1",
+                    "note": "Keep going",
+                },
+            })
+            _write(abs_dir / "runs" / "loop-1" / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 3,
+                "mission_id": "ABS-1",
+                "started_at": now - 600,
+                "stop_reason": "human_approved",
+                "cost_usd": 8.0,
+            })
+            # Empty baseline → this archive counts as session history.
+            _write(abs_dir / "zcomb" / "kanban-session.json", {
+                "startedAt": now - 10,
+                "baselineArchiveIds": [],
+            })
+            bridged = zcomb.build_bridge_state(project)
+            tasks = bridged["tasks"]["tasks"]
+            ids = {t["id"] for t in tasks}
+            self.assertIn("task-waiting", ids)
+            self.assertIn("run-loop-1", ids)
+            past = next(t for t in tasks if t["id"] == "run-loop-1")
+            self.assertEqual(past["status"], "done")
+            self.assertEqual(past.get("kind"), "past_run")
+            self.assertRegex(past["title"], r"^Loop \d+ · ")
+
     def test_live_run_emits_stable_run_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = pathlib.Path(tmp)
@@ -351,6 +532,62 @@ class BridgeStateTests(unittest.TestCase):
             self.assertTrue(metrics["live"])
             self.assertEqual(metrics["runKey"], f"loop-1:{int(started)}")
             self.assertEqual(metrics["loopId"], "loop-1")
+            self.assertEqual(metrics["startedAt"], started)
+            self.assertIsNone(metrics.get("endedAt"))
+
+    def test_elapsed_anchors_stable_across_resync_without_started_at(self):
+        """Missing started_at must not invent a new timestamp every sync."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "stable clock",
+                "max_iterations": 3,
+                "loop_id": "loop-clock",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 1,
+                "mission_id": "ABS-CLOCK",
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "EXECUTING",
+                "phase": "builder",
+                "iteration": 1,
+                "loop_id": "loop-clock",
+                "pid": os.getpid(),
+                "heartbeat_ts": now,
+            })
+            a = zcomb.build_bridge_state(project)["metrics"]
+            time.sleep(0.05)
+            b = zcomb.build_bridge_state(project)["metrics"]
+            self.assertEqual(a["runKey"], b["runKey"])
+            self.assertEqual(a.get("startedAt"), b.get("startedAt"))
+            self.assertIsNone(a.get("startedAt"))
+
+    def test_completed_run_exposes_ended_at_for_frozen_elapsed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            started = time.time() - 600
+            ended = started + 120
+            _write(abs_dir / "runtime.json", {
+                "objective": "done",
+                "loop_id": "loop-done",
+                "max_iterations": 2,
+            })
+            _write(abs_dir / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 1,
+                "mission_id": "ABS-D",
+                "started_at": started,
+                "ended_at": ended,
+                "stop_reason": "human_approved",
+            })
+            metrics = zcomb.build_bridge_state(project)["metrics"]
+            self.assertEqual(metrics["startedAt"], started)
+            self.assertEqual(metrics["endedAt"], ended)
 
     def test_objective_history_prefers_latest_continuation(self):
         """Kanban bar shows latest extend note; history keeps the original."""
@@ -496,6 +733,226 @@ class BridgeStateTests(unittest.TestCase):
                 (out / "run-results.json").read_text(encoding="utf-8"))
             self.assertTrue(written["available"])
             self.assertEqual(written["verdict"]["recommendation"], "PASS")
+
+    def test_proposed_extension_prompt_includes_run_context(self):
+        ctx = {
+            "objective": "Ship the Kanban Run Results panel",
+            "status": "COMPLETED",
+            "stopReason": "human_approved",
+            "recommendation": "PASS",
+            "summary": "All gates passed; panel mirrors CLI critic spend stop.",
+            "blockingFindings": [],
+            "iteration": 3,
+            "costUsd": 12.4,
+            "projectName": "absoloop",
+        }
+        prompt = zcomb._build_extension_prompt(ctx)
+        self.assertIn("Ship the Kanban Run Results panel", prompt)
+        self.assertIn("COMPLETED", prompt)
+        self.assertIn("PASS", prompt)
+        self.assertIn("All gates passed", prompt)
+        self.assertIn("continuation objective", prompt.lower())
+
+    def test_heuristic_extension_proposal_for_pass(self):
+        ctx = {
+            "objective": "Add Run Results panel",
+            "status": "COMPLETED",
+            "stopReason": "human_approved",
+            "recommendation": "PASS",
+            "summary": "Critic verified every documented gate.",
+            "blockingFindings": [],
+            "iteration": 2,
+            "costUsd": 5.0,
+            "projectName": "demo",
+        }
+        proposal = zcomb._heuristic_extension_proposal(ctx)
+        self.assertEqual(proposal["status"], "ready")
+        self.assertEqual(proposal["source"], "heuristic")
+        self.assertTrue(proposal["note"].strip())
+        self.assertIn("Add Run Results panel", proposal["note"])
+        chain_roles = [step["role"] for step in proposal["chain"]]
+        self.assertEqual(chain_roles[0], "prompt")
+        self.assertIn("response", chain_roles)
+
+    def test_heuristic_extension_addresses_blocking_findings(self):
+        ctx = {
+            "objective": "Harden approve for Codex",
+            "status": "BLOCKED",
+            "stopReason": "critic_reject",
+            "recommendation": "HOLD",
+            "summary": "Approve still dark at the gate.",
+            "blockingFindings": [
+                "Approve button ignores AWAITING_APPROVAL from state.json",
+            ],
+            "iteration": 1,
+            "costUsd": 3.2,
+            "projectName": "demo",
+        }
+        proposal = zcomb._heuristic_extension_proposal(ctx)
+        self.assertIn("Approve button", proposal["note"])
+        self.assertTrue(proposal["rationale"])
+
+    def test_parse_extension_llm_response_json(self):
+        raw = json.dumps({
+            "analysis": "Gates passed; next is polish.",
+            "note": "Polish Run Results typography and add Proposed Extension.",
+            "rationale": "Natural follow-on after the glanceable stance landed.",
+        })
+        parsed = zcomb._parse_extension_llm_response(raw)
+        self.assertEqual(
+            parsed["note"],
+            "Polish Run Results typography and add Proposed Extension.",
+        )
+        self.assertIn("Gates passed", parsed["analysis"])
+
+    def test_llm_login_failure_falls_back_to_heuristic(self):
+        ctx = {
+            "objective": "Ship Proposed Extension",
+            "status": "COMPLETED",
+            "stopReason": "human_approved",
+            "recommendation": "PASS",
+            "summary": "All good.",
+            "blockingFindings": [],
+            "iteration": 1,
+            "costUsd": 1.0,
+            "projectName": "demo",
+            "engine": "claude",
+        }
+        with mock.patch.object(
+            zcomb, "_call_extension_llm",
+            side_effect=RuntimeError("claude: engine auth/limit: Not logged in"),
+        ):
+            proposal = zcomb._generate_proposed_extension(ctx, "fp-login")
+        self.assertEqual(proposal["status"], "ready")
+        self.assertEqual(proposal["source"], "heuristic")
+        self.assertNotIn("not logged in", proposal["note"].lower())
+        self.assertIn("auth/limit", (proposal.get("error") or "").lower())
+
+    def test_run_results_includes_cached_proposed_extension(self):
+        """Terminal run surfaces a ready Proposed Extension from cache."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Ship via critic gate",
+                "max_iterations": 8,
+                "max_cost_usd": 50.0,
+                "loop_id": "loop-propose-1",
+                "engine": "claude",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "COMPLETED",
+                "iteration": 2,
+                "mission_id": "ABS-PROPOSE",
+                "started_at": now - 400,
+                "stop_reason": "human_approved",
+                "cost_usd": 8.5,
+                "tokens_total": 100_000,
+            })
+            _write(abs_dir / "tmp" / "iteration-0002-critic.json", {
+                "num_turns": 4,
+                "total_cost_usd": 0.4,
+                "structured_output": {
+                    "recommendation": "PASS",
+                    "blocking_findings": [],
+                    "summary": "Mission complete and approved.",
+                },
+            })
+            _write(abs_dir / "ledger.jsonl", json.dumps({
+                "ts": now - 80,
+                "type": "agent_run",
+                "engine": "claude",
+                "exit_code": 0,
+                "wall_seconds": 40,
+                "cost_usd": 0.4,
+                "tokens": 50_000,
+                "result": ".absoloop/tmp/iteration-0002-critic.json",
+            }) + "\n")
+
+            fingerprint = zcomb._extension_fingerprint(
+                loop_id="loop-propose-1",
+                iteration=2,
+                status="COMPLETED",
+                stop_reason="human_approved",
+                recommendation="PASS",
+                summary="Mission complete and approved.",
+            )
+            cached = {
+                "status": "ready",
+                "source": "llm",
+                "engine": "claude",
+                "fingerprint": fingerprint,
+                "note": "Add Proposed Extension one-click from Run Results.",
+                "rationale": "Extend the completed stance work into action.",
+                "chain": [
+                    {"role": "prompt", "content": "prompt body"},
+                    {"role": "analysis", "content": "analysis body"},
+                    {"role": "response", "content": "response body"},
+                ],
+                "generatedAt": "2026-07-19T12:00:00Z",
+            }
+            _write(abs_dir / "tmp" / "proposed-extension.json", cached)
+
+            with mock.patch.object(zcomb, "_kick_extension_worker"):
+                bridged = zcomb.build_bridge_state(project)
+            prop = bridged["runResults"]["proposedExtension"]
+            self.assertEqual(prop["status"], "ready")
+            self.assertEqual(prop["source"], "llm")
+            self.assertEqual(
+                prop["note"],
+                "Add Proposed Extension one-click from Run Results.",
+            )
+            self.assertEqual(prop["chain"][0]["role"], "prompt")
+
+    def test_ensure_proposed_extension_sync_uses_llm_then_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            abs_dir.mkdir(parents=True)
+            ctx = {
+                "objective": "Demo objective",
+                "status": "COMPLETED",
+                "stopReason": "human_approved",
+                "recommendation": "PASS",
+                "summary": "Done.",
+                "blockingFindings": [],
+                "iteration": 1,
+                "costUsd": 1.0,
+                "projectName": "demo",
+                "loopId": "loop-x",
+                "engine": "claude",
+            }
+            fingerprint = zcomb._extension_fingerprint(
+                loop_id="loop-x",
+                iteration=1,
+                status="COMPLETED",
+                stop_reason="human_approved",
+                recommendation="PASS",
+                summary="Done.",
+            )
+            llm_raw = json.dumps({
+                "analysis": "Objective landed cleanly.",
+                "note": "Document the Run Results extend affordance.",
+                "rationale": "Capture the new one-click path for operators.",
+            })
+            with mock.patch.object(
+                zcomb, "_call_extension_llm", return_value=(llm_raw, "claude")
+            ) as call_llm, mock.patch.dict(
+                os.environ, {"ABSOLOOP_EXTEND_PROPOSE": "sync"}
+            ):
+                first = zcomb._ensure_proposed_extension(
+                    project, abs_dir=abs_dir, ctx=ctx, fingerprint=fingerprint)
+                second = zcomb._ensure_proposed_extension(
+                    project, abs_dir=abs_dir, ctx=ctx, fingerprint=fingerprint)
+                self.assertEqual(call_llm.call_count, 1)
+            self.assertEqual(first["status"], "ready")
+            self.assertEqual(first["source"], "llm")
+            self.assertEqual(
+                first["note"],
+                "Document the Run Results extend affordance.",
+            )
+            self.assertEqual(second["note"], first["note"])
 
 
 class CliDispatchTests(unittest.TestCase):

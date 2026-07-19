@@ -20,6 +20,8 @@ export interface Task {
   createdAt: string;
   updatedAt: string;
   description?: string;
+  /** Compact session past-loop card in Done. */
+  kind?: 'past_run' | string;
 }
 
 export interface Activity {
@@ -57,6 +59,10 @@ export interface Metrics {
   awaitingApproval?: boolean;
   runKey?: string;
   projectName?: string;
+  /** Unix seconds — mission wall-clock start (stable across polls). */
+  startedAt?: number | null;
+  /** Unix seconds — when terminal; freezes the header elapsed timer. */
+  endedAt?: number | null;
 }
 
 export interface RunResultsCritic {
@@ -93,6 +99,25 @@ export interface RunResultsMission {
   tokensTotal: number;
 }
 
+export interface ProposedExtensionStep {
+  role: 'prompt' | 'analysis' | 'response' | string;
+  content: string;
+}
+
+/** LLM (or heuristic) continuation proposal for one-click extend. */
+export interface ProposedExtension {
+  status: 'ready' | 'generating' | 'unavailable' | 'error' | string;
+  source?: 'llm' | 'heuristic' | string;
+  engine?: string;
+  fingerprint?: string;
+  note: string;
+  rationale?: string;
+  chain?: ProposedExtensionStep[];
+  generatedAt?: string;
+  preview?: boolean;
+  error?: string;
+}
+
 /** CLI-parity critic / spend / stop snapshot for the Run Results panel. */
 export interface RunResults {
   available: boolean;
@@ -102,6 +127,7 @@ export interface RunResults {
   verdict?: RunResultsVerdict | null;
   spend?: RunResultsSpend | null;
   mission?: RunResultsMission | null;
+  proposedExtension?: ProposedExtension | null;
 }
 
 export interface AppState {
@@ -116,38 +142,177 @@ export interface AppState {
   stateDir?: string;
 }
 
+const TERMINAL_STATUSES = new Set([
+  'COMPLETED',
+  'BLOCKED',
+  'BUDGET_EXHAUSTED',
+  'REJECTED',
+  'STOPPED',
+  'AWAITING_APPROVAL',
+]);
+
+const RESTART_HOLD_MS = 45_000;
+const BURST_POLL_MS = [
+  150, 350, 600, 900, 1200, 1600, 2200, 3000, 4000, 5500, 7000, 9000, 12000,
+];
+
+interface RestartHold {
+  until: number;
+  prevLoopId: string;
+  prevRunKey: string;
+  prevStatus: string;
+}
+
+/** Identity for Kanban remounts — loop/project only (not flaky runKey clocks). */
 function runIdentity(metrics?: Metrics | null): string {
   if (!metrics) return '';
-  if (metrics.runKey) return metrics.runKey;
-  const parts = [
-    metrics.projectName || '',
-    metrics.loopId || '',
-    metrics.missionId || '',
-    metrics.awaitingRun ? 'pending' : (metrics.status || ''),
-  ];
-  return parts.join('|');
+  const loop = metrics.loopId || metrics.missionId || '';
+  const project = metrics.projectName || '';
+  if (metrics.awaitingRun) return `${project}|${loop}|pending`;
+  return `${project}|${loop}`;
+}
+
+function isStaleDuringRestart(hold: RestartHold, metrics?: Metrics | null): boolean {
+  if (!metrics) return true;
+  if (metrics.awaitingRun || metrics.live) return false;
+  const status = String(metrics.status || '').toUpperCase();
+  if (status === 'STARTING' || status === 'EXECUTING' || status === 'RUNNING') {
+    return false;
+  }
+  const loopId = String(metrics.loopId || '');
+  const runKey = String(metrics.runKey || '');
+  // Same loop + still terminal → old paint; ignore until bridge catches up.
+  if (
+    hold.prevLoopId
+    && loopId
+    && loopId === hold.prevLoopId
+    && TERMINAL_STATUSES.has(status)
+  ) {
+    return true;
+  }
+  if (hold.prevRunKey && runKey && runKey === hold.prevRunKey) {
+    return true;
+  }
+  if (
+    !loopId
+    && TERMINAL_STATUSES.has(status)
+    && status === hold.prevStatus
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function waitingOverlay(prev: AppState, note?: string): AppState {
+  const nowIso = new Date().toISOString();
+  const prevLoop = prev.metrics?.loopId || prev.metrics?.missionId || 'run';
+  const metrics: Metrics = {
+    ...(prev.metrics || {
+      completionPct: 0,
+      errorRate: 0,
+      tasksPerHour: 0,
+      phases: [],
+    }),
+    awaitingRun: true,
+    live: false,
+    awaitingApproval: false,
+    status: 'STARTING',
+    runKey: `${prevLoop}:restarting`,
+    startedAt: null,
+    endedAt: null,
+    completionPct: 0,
+    tasksPerHour: 0,
+    displayedObjective: note?.trim()
+      || prev.metrics?.displayedObjective
+      || prev.metrics?.objective
+      || '',
+  };
+  return {
+    ...prev,
+    metrics,
+    runResults: { available: false },
+    tasks: {
+      tasks: [{
+        id: 'task-waiting',
+        title: 'Waiting for new Absoloop run to start',
+        status: 'inbox',
+        assignee: null,
+        priority: 'high',
+        dependencies: [],
+        phase: 0,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        description: note?.trim()
+          ? `Extend starting — ${note.trim().slice(0, 160)}`
+          : 'Refreshing for the new objective / project / run…',
+      }],
+    },
+    activity: [{
+      timestamp: nowIso,
+      agentId: 'builder-01',
+      type: 'session_start',
+      message: note?.trim()
+        ? `New extend starting — ${note.trim().slice(0, 120)}`
+        : 'New run starting — waiting for objective and runner…',
+    }],
+  };
 }
 
 export function usePolling(intervalMs: number = 3000) {
   const [state, setState] = useState<AppState | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [startTime, setStartTime] = useState(Date.now());
   const [lastUpdate, setLastUpdate] = useState<number | null>(null);
   const [consecutiveErrors, setConsecutiveErrors] = useState(0);
   const [runEpoch, setRunEpoch] = useState(0);
   const prevRunKey = useRef<string>('');
+  const restartHold = useRef<RestartHold | null>(null);
+  const burstTimers = useRef<number[]>([]);
+
+  const clearBurstTimers = useCallback(() => {
+    for (const id of burstTimers.current) window.clearTimeout(id);
+    burstTimers.current = [];
+  }, []);
 
   const fetchState = useCallback(async () => {
     try {
       const res = await fetch('/api/state');
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: AppState = await res.json();
-      const nextKey = runIdentity(data.metrics);
+      const hold = restartHold.current;
+      const now = Date.now();
 
+      if (hold && now > hold.until) {
+        restartHold.current = null;
+        clearBurstTimers();
+      }
+
+      const activeHold = restartHold.current;
+      if (activeHold && isStaleDuringRestart(activeHold, data.metrics)) {
+        // Keep optimistic STARTING surface; don't flash old COMPLETED results.
+        setLastUpdate(Date.now());
+        setConsecutiveErrors(0);
+        setError(null);
+        return;
+      }
+
+      if (activeHold) {
+        const m = data.metrics;
+        if (
+          m?.awaitingRun
+          || m?.live
+          || String(m?.status || '').toUpperCase() === 'STARTING'
+          || (activeHold.prevLoopId
+            && m?.loopId
+            && m.loopId !== activeHold.prevLoopId)
+          || (m?.runKey && m.runKey !== activeHold.prevRunKey)
+        ) {
+          restartHold.current = null;
+          clearBurstTimers();
+        }
+      }
+
+      const nextKey = runIdentity(data.metrics);
       if (nextKey && prevRunKey.current && nextKey !== prevRunKey.current) {
-        // New project / objective / run — reset session clock and epoch so
-        // the Kanban treats this as a fresh mission surface.
-        setStartTime(Date.now());
         setRunEpoch(epoch => epoch + 1);
       }
       if (nextKey) {
@@ -162,69 +327,54 @@ export function usePolling(intervalMs: number = 3000) {
       setError(e.message);
       setConsecutiveErrors(prev => prev + 1);
     }
-  }, []);
+  }, [clearBurstTimers]);
 
   useEffect(() => {
     fetchState();
     const id = setInterval(fetchState, intervalMs);
-    return () => clearInterval(id);
-  }, [fetchState, intervalMs]);
+    return () => {
+      clearInterval(id);
+      clearBurstTimers();
+    };
+  }, [fetchState, intervalMs, clearBurstTimers]);
 
   /** Force an immediate poll (e.g. after Resume starts a new run). */
   const refreshNow = useCallback(() => {
     void fetchState();
   }, [fetchState]);
 
+  const scheduleBurstPolls = useCallback(() => {
+    clearBurstTimers();
+    burstTimers.current = BURST_POLL_MS.map(ms => (
+      window.setTimeout(() => { void fetchState(); }, ms)
+    ));
+  }, [clearBurstTimers, fetchState]);
+
   /**
    * Optimistically treat the board as awaiting a new run (before bridge
-   * writes awaitingRun=true). Resets the elapsed timer.
+   * writes awaitingRun=true). Holds off stale COMPLETED polls and burst-
+   * polls until the new loop identity arrives.
    */
-  const markRunRestarting = useCallback(() => {
-    setStartTime(Date.now());
+  const markRunRestarting = useCallback((note?: string) => {
     setRunEpoch(epoch => epoch + 1);
     setState(prev => {
       if (!prev) return prev;
-      const metrics: Metrics = {
-        ...(prev.metrics || {
-          completionPct: 0,
-          errorRate: 0,
-          tasksPerHour: 0,
-          phases: [],
-        }),
-        awaitingRun: true,
-        live: false,
-        status: 'STARTING',
-        runKey: `${prev.metrics?.loopId || prev.metrics?.missionId || 'run'}:pending`,
+      const prevLoop = String(prev.metrics?.loopId || '');
+      const prevKey = runIdentity(prev.metrics);
+      const prevStatus = String(prev.metrics?.status || '').toUpperCase();
+      restartHold.current = {
+        until: Date.now() + RESTART_HOLD_MS,
+        prevLoopId: prevLoop,
+        prevRunKey: prevKey,
+        prevStatus,
       };
-      return {
-        ...prev,
-        metrics,
-        tasks: {
-          tasks: [{
-            id: 'task-waiting',
-            title: 'Waiting for new Absoloop run to start',
-            status: 'inbox',
-            assignee: null,
-            priority: 'high',
-            dependencies: [],
-            phase: 0,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            description: 'Refreshing for the new objective / project / run…',
-          }],
-        },
-        activity: [{
-          timestamp: new Date().toISOString(),
-          agentId: 'builder-01',
-          type: 'session_start',
-          message: 'New run starting — waiting for objective and runner…',
-        }],
-      };
+      const next = waitingOverlay(prev, note);
+      prevRunKey.current = runIdentity(next.metrics);
+      return next;
     });
-    // Poll soon so bridge awaiting/live state replaces the optimistic view.
-    window.setTimeout(() => { void fetchState(); }, 500);
-    window.setTimeout(() => { void fetchState(); }, 2000);
-  }, [fetchState]);
+    scheduleBurstPolls();
+    void fetchState();
+  }, [fetchState, scheduleBurstPolls]);
 
   const connectionHealth: 'connected' | 'degraded' | 'disconnected' =
     consecutiveErrors === 0 ? 'connected' :
@@ -233,7 +383,6 @@ export function usePolling(intervalMs: number = 3000) {
   return {
     state,
     error,
-    startTime,
     lastUpdate,
     connectionHealth,
     runEpoch,

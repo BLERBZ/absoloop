@@ -285,6 +285,27 @@ textarea:focus-visible {
   overflow: hidden;
 }
 
+.run-results-extend-btn:not(:disabled):hover {
+  background: #2ea043 !important;
+  border-color: #2ea043 !important;
+  filter: none;
+}
+
+.run-results-extend-btn:not(:disabled):active {
+  transform: translateY(1px);
+  background: #238636 !important;
+}
+
+.run-results-chain-body::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.run-results-chain-body::-webkit-scrollbar-thumb {
+  background: #484f58;
+  border-radius: 3px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .run-results-body {
     transition: none !important;

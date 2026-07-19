@@ -421,6 +421,510 @@ def _verdict_from_live(live_events: list[dict]) -> dict:
     return {}
 
 
+# -- Proposed Extension (LLM prompt/response chain for one-click extend) ------
+
+_PROPOSE_CACHE_NAME = "proposed-extension.json"
+_PROPOSE_LOCK_NAME = "proposed-extension.lock"
+_PROPOSE_LLM_TIMEOUT = 90.0
+
+
+def _extension_fingerprint(
+    *,
+    loop_id: str,
+    iteration: int,
+    status: str,
+    stop_reason: str,
+    recommendation: str,
+    summary: str,
+) -> str:
+    raw = "|".join([
+        str(loop_id or ""),
+        str(iteration or 0),
+        str(status or "").upper(),
+        str(stop_reason or ""),
+        str(recommendation or "").upper(),
+        " ".join(str(summary or "").split())[:240],
+    ])
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _proposed_extension_path(abs_dir: pathlib.Path) -> pathlib.Path:
+    return abs_dir / "tmp" / _PROPOSE_CACHE_NAME
+
+
+def _build_extension_prompt(ctx: dict) -> str:
+    """User prompt for the extension-proposal LLM chain."""
+    findings = ctx.get("blockingFindings") or []
+    findings_block = (
+        "\n".join(f"- {f}" for f in findings[:8])
+        if findings else "- (none)"
+    )
+    objective = str(ctx.get("objective") or "").strip() or "(unknown)"
+    summary = str(ctx.get("summary") or "").strip() or "(none)"
+    return (
+        "You are proposing the next Absoloop mission extension.\n"
+        "Absoloop `extend` starts a follow-on run with fresh budgets; the "
+        "`note` you write becomes the continuation objective (`-m`).\n\n"
+        "Loop run context:\n"
+        f"- Project: {ctx.get('projectName') or '(unknown)'}\n"
+        f"- Original / current objective: {objective}\n"
+        f"- Status: {ctx.get('status') or '—'}\n"
+        f"- Stop reason: {ctx.get('stopReason') or '—'}\n"
+        f"- Critic recommendation: {ctx.get('recommendation') or '—'}\n"
+        f"- Iteration: {ctx.get('iteration') or 0}\n"
+        f"- Spend (USD): {ctx.get('costUsd') or 0}\n"
+        f"- Critic summary: {summary}\n"
+        f"- Blocking findings:\n{findings_block}\n\n"
+        "Think in two steps:\n"
+        "1) analysis — what landed, what is still open, and the highest-leverage next slice\n"
+        "2) proposal — a concrete continuation objective an operator can one-click extend\n\n"
+        "Reply with ONLY valid JSON (no markdown fences) shaped as:\n"
+        "{\n"
+        '  "analysis": "2-4 sentences of situational analysis",\n'
+        '  "note": "imperative continuation objective for absoloop extend -m '
+        '(1-3 sentences, actionable, specific)",\n'
+        '  "rationale": "1-2 sentences why this is the right next extend"\n'
+        "}\n"
+        "Constraints for note:\n"
+        "- Do not repeat the original objective verbatim; advance it.\n"
+        "- If there are blocking findings, address the top ones first.\n"
+        "- If the run PASSED / COMPLETED, propose the natural next slice of work.\n"
+        "- Keep note under 400 characters.\n"
+    )
+
+
+def _parse_extension_llm_response(text: str) -> dict:
+    """Extract analysis/note/rationale from an LLM reply."""
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    # Prefer fenced JSON, then bare object, then whole string.
+    candidates: list[str] = []
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.DOTALL | re.I)
+    if fence:
+        candidates.append(fence.group(1))
+    brace = re.search(r"\{.*\}", raw, re.DOTALL)
+    if brace:
+        candidates.append(brace.group(0))
+    candidates.append(raw)
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        note = str(data.get("note") or data.get("objective") or "").strip()
+        if not note:
+            continue
+        return {
+            "analysis": str(data.get("analysis") or "").strip(),
+            "note": note[:800],
+            "rationale": str(data.get("rationale") or "").strip(),
+        }
+    # Free-text fallback: first non-empty paragraph as note.
+    for para in re.split(r"\n\s*\n", raw):
+        cleaned = " ".join(para.strip().split())
+        if cleaned and not cleaned.startswith("{"):
+            return {"analysis": "", "note": cleaned[:800], "rationale": ""}
+    return {}
+
+
+def _heuristic_extension_proposal(ctx: dict) -> dict:
+    """Deterministic proposal when LLM is unavailable — still chain-shaped."""
+    prompt = _build_extension_prompt(ctx)
+    objective_full = str(ctx.get("objective") or "").strip() or "the mission"
+    objective = objective_full if len(objective_full) <= 120 else (
+        objective_full[:117].rstrip() + "…"
+    )
+    summary = str(ctx.get("summary") or "").strip()
+    summary_short = summary if len(summary) <= 160 else summary[:157].rstrip() + "…"
+    findings = [str(f).strip() for f in (ctx.get("blockingFindings") or []) if str(f).strip()]
+    recommendation = str(ctx.get("recommendation") or "").upper()
+    status = str(ctx.get("status") or "").upper()
+
+    if findings:
+        top = findings[0]
+        note = (
+            f"Resolve: {top}. "
+            f"Then re-verify against the objective “{objective}” and clear "
+            f"remaining critic findings."
+        )
+        analysis = (
+            f"Run ended {status or 'with findings'} ({recommendation or 'n/a'}). "
+            f"Top blocker: {top}."
+        )
+        rationale = "Address the critic’s blocking finding before expanding scope."
+    elif recommendation in ("HOLD", "REJECT", "UNREADABLE") or status in (
+        "BLOCKED", "REJECTED",
+    ):
+        note = (
+            f"Investigate and fix why the last loop stalled on “{objective}”"
+            + (f" — critic: {summary_short}" if summary_short else "")
+            + ". Re-run gates until critic PASS."
+        )
+        analysis = (
+            f"Status {status or 'unknown'} with recommendation "
+            f"{recommendation or 'none'}; need a corrective follow-on."
+        )
+        rationale = "Unblock the failed/held loop before taking on new work."
+    elif status == "BUDGET_EXHAUSTED":
+        note = (
+            f"Continue “{objective}” from the last checkpoint with a tighter "
+            f"slice: finish the nearest incomplete deliverable, verify gates, "
+            f"and stop with a clear PASS."
+        )
+        analysis = "Budget stopped the loop before full closure; resume with a focused slice."
+        rationale = "Fresh extend budgets let the mission finish the unfinished slice."
+    else:
+        note = (
+            f"Building on the completed pass for “{objective}”, take the next "
+            f"highest-leverage polish or adjacent capability"
+            + (f" (critic: {summary_short})" if summary_short else "")
+            + ". Keep gates green and leave a crisp operator-facing summary."
+        )
+        analysis = (
+            f"Loop reached {status or 'a terminal state'} with "
+            f"{recommendation or 'no'} critic stance — ready for a forward extend."
+        )
+        rationale = "Capitalize on a clean landing with a concrete next slice."
+
+    note = " ".join(note.split())[:800]
+    chain = [
+        {"role": "prompt", "content": prompt},
+        {"role": "analysis", "content": analysis},
+        {"role": "response", "content": note},
+    ]
+    return {
+        "status": "ready",
+        "source": "heuristic",
+        "engine": "",
+        "note": note,
+        "rationale": rationale,
+        "chain": chain,
+        "generatedAt": _iso(time.time()),
+    }
+
+
+def _llm_output_looks_unusable(text: str) -> str:
+    """Return an error reason when CLI output is not a usable proposal."""
+    low = (text or "").strip().lower()
+    if not low:
+        return "empty output"
+    needles = (
+        "not logged in",
+        "please run /login",
+        "please login",
+        "authentication required",
+        "unauthorized",
+        "api key",
+        "invalid api key",
+        "credit balance",
+        "usage limit",
+    )
+    for needle in needles:
+        if needle in low:
+            return f"engine auth/limit: {text.strip()[:160]}"
+    return ""
+
+
+def _extension_engine_order(preferred: str = "") -> list[str]:
+    from shutil import which
+    order: list[str] = []
+    pref = (preferred or "").strip().lower()
+    if pref in ("claude", "codex", "grok"):
+        order.append(pref)
+    for name in ("claude", "codex", "grok"):
+        if name not in order:
+            order.append(name)
+    return [name for name in order if which(name)]
+
+
+def _run_extension_engine(chosen: str, prompt: str) -> str:
+    if chosen == "claude":
+        argv = [
+            "claude", "-p",
+            "--bare",
+            "--tools", "",
+            "--permission-mode", "plan",
+            "--output-format", "text",
+            "--effort", "low",
+            prompt,
+        ]
+        proc = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=_PROPOSE_LLM_TIMEOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    elif chosen == "codex":
+        argv = ["codex", "exec", "--skip-git-repo-check", "-"]
+        proc = subprocess.run(
+            argv,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=_PROPOSE_LLM_TIMEOUT,
+        )
+    else:
+        argv = ["grok", "--prompt-file", "-"]
+        proc = subprocess.run(
+            argv,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            timeout=_PROPOSE_LLM_TIMEOUT,
+        )
+
+    text = (proc.stdout or "").strip()
+    if proc.returncode != 0 and not text:
+        err = (proc.stderr or "").strip()[:300]
+        raise RuntimeError(f"{chosen} exited {proc.returncode}: {err or 'no output'}")
+    if not text:
+        text = (proc.stderr or "").strip()
+    if not text:
+        raise RuntimeError(f"{chosen} returned empty proposal")
+    bad = _llm_output_looks_unusable(text)
+    if bad:
+        raise RuntimeError(f"{chosen}: {bad}")
+    return text
+
+
+def _call_extension_llm(prompt: str, engine: str = "") -> tuple[str, str]:
+    """One-shot headless LLM call. Returns (raw_text, engine_used).
+
+    Tries preferred engine first, then other CLIs on PATH when auth/output fails.
+    """
+    engines = _extension_engine_order(engine)
+    if not engines:
+        raise RuntimeError("no LLM engine on PATH (claude/codex/grok)")
+
+    errors: list[str] = []
+    for chosen in engines:
+        try:
+            text = _run_extension_engine(chosen, prompt)
+            return text, chosen
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            errors.append(str(exc))
+            continue
+    raise RuntimeError("; ".join(errors[:3]))
+
+
+def _load_proposed_extension(abs_dir: pathlib.Path) -> dict:
+    return _read_json(_proposed_extension_path(abs_dir))
+
+
+def _write_proposed_extension(abs_dir: pathlib.Path, payload: dict) -> None:
+    _atomic_write(_proposed_extension_path(abs_dir), payload)
+
+
+def _compose_extension_proposal(
+    *,
+    ctx: dict,
+    fingerprint: str,
+    source: str,
+    engine: str,
+    note: str,
+    rationale: str,
+    analysis: str,
+    prompt: str,
+    raw_response: str = "",
+    status: str = "ready",
+    error: str = "",
+) -> dict:
+    chain = [
+        {"role": "prompt", "content": prompt},
+    ]
+    if analysis:
+        chain.append({"role": "analysis", "content": analysis})
+    response_body = raw_response.strip() if raw_response.strip() else note
+    if rationale and note and response_body == note:
+        response_body = f"{note}\n\nWhy: {rationale}"
+    chain.append({"role": "response", "content": response_body})
+    payload = {
+        "status": status,
+        "source": source,
+        "engine": engine or "",
+        "fingerprint": fingerprint,
+        "note": note,
+        "rationale": rationale,
+        "chain": chain,
+        "generatedAt": _iso(time.time()),
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _generate_proposed_extension(ctx: dict, fingerprint: str) -> dict:
+    """Run LLM chain; fall back to heuristic on any failure."""
+    prompt = _build_extension_prompt(ctx)
+    preferred = str(ctx.get("engine") or "")
+    try:
+        raw, engine = _call_extension_llm(prompt, preferred)
+        parsed = _parse_extension_llm_response(raw)
+        if not parsed.get("note"):
+            raise RuntimeError("LLM response missing note")
+        return _compose_extension_proposal(
+            ctx=ctx,
+            fingerprint=fingerprint,
+            source="llm",
+            engine=engine,
+            note=parsed["note"],
+            rationale=parsed.get("rationale") or "",
+            analysis=parsed.get("analysis") or "",
+            prompt=prompt,
+            raw_response=raw,
+        )
+    except Exception as exc:
+        fallback = _heuristic_extension_proposal(ctx)
+        return _compose_extension_proposal(
+            ctx=ctx,
+            fingerprint=fingerprint,
+            source="heuristic",
+            engine="",
+            note=fallback["note"],
+            rationale=fallback.get("rationale") or "",
+            analysis=next(
+                (s["content"] for s in fallback["chain"] if s["role"] == "analysis"),
+                "",
+            ),
+            prompt=prompt,
+            status="ready",
+            error=str(exc)[:240],
+        )
+
+
+def _kick_extension_worker(
+    project: pathlib.Path,
+    abs_dir: pathlib.Path,
+    fingerprint: str,
+) -> None:
+    """Detached worker so the bridge loop never blocks on the LLM."""
+    lock = abs_dir / "tmp" / _PROPOSE_LOCK_NAME
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if lock.is_file():
+            age = time.time() - lock.stat().st_mtime
+            if age < _PROPOSE_LLM_TIMEOUT + 30:
+                return
+        lock.write_text(f"{os.getpid()}:{fingerprint}:{time.time()}\n",
+                        encoding="utf-8")
+    except OSError:
+        return
+
+    ctx_path = abs_dir / "tmp" / "proposed-extension-ctx.json"
+    # Context file is written by caller before kick.
+    if not ctx_path.is_file():
+        return
+
+    repo_root = str(zcomb_home().parent)
+    stub = (
+        "from absoloop_harness.zcomb import generate_proposed_extension_main; "
+        f"generate_proposed_extension_main({str(project)!r}, {fingerprint!r})"
+    )
+    try:
+        subprocess.Popen(
+            [sys.executable, "-c", stub],
+            cwd=repo_root,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env={**os.environ, "ABSOLOOP_EXTEND_PROPOSE": "sync"},
+        )
+    except OSError:
+        try:
+            lock.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            if lock.exists():
+                lock.unlink()
+        except OSError:
+            pass
+
+
+def generate_proposed_extension_main(project: str, fingerprint: str) -> int:
+    """Worker entry: read ctx, generate, write cache, clear lock."""
+    proj = pathlib.Path(project)
+    abs_dir = proj / ".absoloop"
+    ctx_path = abs_dir / "tmp" / "proposed-extension-ctx.json"
+    lock = abs_dir / "tmp" / _PROPOSE_LOCK_NAME
+    try:
+        ctx = _read_json(ctx_path)
+        if not ctx:
+            return 1
+        fp = fingerprint or str(ctx.get("fingerprint") or "")
+        payload = _generate_proposed_extension(ctx, fp)
+        _write_proposed_extension(abs_dir, payload)
+        return 0
+    except Exception:
+        return 1
+    finally:
+        try:
+            lock.unlink(missing_ok=True)  # type: ignore[call-arg]
+        except TypeError:
+            if lock.exists():
+                try:
+                    lock.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+
+def _ensure_proposed_extension(
+    project: pathlib.Path,
+    *,
+    abs_dir: pathlib.Path,
+    ctx: dict,
+    fingerprint: str,
+) -> dict:
+    """Return cached / generating / freshly-built Proposed Extension payload."""
+    cached = _load_proposed_extension(abs_dir)
+    if (
+        cached.get("fingerprint") == fingerprint
+        and cached.get("status") == "ready"
+        and str(cached.get("note") or "").strip()
+    ):
+        return cached
+
+    mode = (os.environ.get("ABSOLOOP_EXTEND_PROPOSE") or "").strip().lower()
+    if mode in ("sync", "1", "true", "yes"):
+        payload = _generate_proposed_extension(ctx, fingerprint)
+        _write_proposed_extension(abs_dir, payload)
+        return payload
+
+    # Async path: seed a generating stub (heuristic preview) and kick worker.
+    if cached.get("fingerprint") == fingerprint and cached.get("status") == "generating":
+        return cached
+
+    prompt = _build_extension_prompt(ctx)
+    preview = _heuristic_extension_proposal(ctx)
+    generating = _compose_extension_proposal(
+        ctx=ctx,
+        fingerprint=fingerprint,
+        source="heuristic",
+        engine="",
+        note=preview["note"],
+        rationale=preview.get("rationale") or "",
+        analysis=next(
+            (s["content"] for s in preview["chain"] if s["role"] == "analysis"),
+            "",
+        ),
+        prompt=prompt,
+        status="generating",
+    )
+    generating["preview"] = True
+    ctx_out = {**ctx, "fingerprint": fingerprint}
+    try:
+        _atomic_write(abs_dir / "tmp" / "proposed-extension-ctx.json", ctx_out)
+        _write_proposed_extension(abs_dir, generating)
+        _kick_extension_worker(project, abs_dir, fingerprint)
+    except OSError:
+        pass
+    return generating
+
+
 def _build_run_results(
     project: pathlib.Path,
     *,
@@ -442,6 +946,7 @@ def _build_run_results(
         "verdict": None,
         "spend": None,
         "mission": None,
+        "proposedExtension": None,
     }
     if awaiting or not (abs_dir / "runtime.json").is_file():
         return empty
@@ -565,6 +1070,46 @@ def _build_run_results(
         or source.get("ended_at")
         or time.time()
     )
+
+    proposed_extension = None
+    if available and mission and status_u in _GATE_OR_TERMINAL_STATUSES:
+        objective = str(
+            runtime.get("objective")
+            or state.get("objective")
+            or ""
+        ).strip()
+        loop_id = str(runtime.get("loop_id") or state.get("loop_id") or "")
+        rec = str((verdict or {}).get("recommendation") or "").upper()
+        summary = str((verdict or {}).get("summary") or "").strip()
+        findings = list((verdict or {}).get("blockingFindings") or [])
+        fingerprint = _extension_fingerprint(
+            loop_id=loop_id,
+            iteration=iteration,
+            status=status_u,
+            stop_reason=stop_reason or "",
+            recommendation=rec,
+            summary=summary,
+        )
+        ctx = {
+            "objective": objective,
+            "status": status_u,
+            "stopReason": stop_reason or "",
+            "recommendation": rec,
+            "summary": summary,
+            "blockingFindings": findings,
+            "iteration": iteration,
+            "costUsd": round(cost_usd, 4),
+            "projectName": project.name,
+            "loopId": loop_id,
+            "engine": str(runtime.get("engine") or ""),
+        }
+        try:
+            proposed_extension = _ensure_proposed_extension(
+                project, abs_dir=abs_dir, ctx=ctx, fingerprint=fingerprint)
+        except Exception:
+            proposed_extension = _heuristic_extension_proposal(ctx)
+            proposed_extension["fingerprint"] = fingerprint
+
     return {
         "available": available,
         "updatedAt": _iso(anchor_ts),
@@ -573,6 +1118,7 @@ def _build_run_results(
         "verdict": verdict,
         "spend": spend if available else None,
         "mission": mission,
+        "proposedExtension": proposed_extension,
     }
 
 
@@ -724,8 +1270,9 @@ def _humanize_activity(kind: str, detail: str) -> str:
 def _task(tid: str, title: str, status: str, assignee: Optional[str],
           priority: str, phase: int, created: str, updated: str,
           deps: Optional[list[str]] = None,
-          description: str = "") -> dict:
-    return {
+          description: str = "",
+          kind: str = "") -> dict:
+    payload = {
         "id": tid,
         "title": title,
         "status": status,
@@ -737,6 +1284,176 @@ def _task(tid: str, title: str, status: str, assignee: Optional[str],
         "updatedAt": updated,
         "description": description or "",
     }
+    if kind:
+        payload["kind"] = kind
+    return payload
+
+
+_PAST_STATUS_LABELS = {
+    "COMPLETED": "Completed",
+    "AWAITING_APPROVAL": "Awaiting approval",
+    "BLOCKED": "Blocked",
+    "BUDGET_EXHAUSTED": "Budget exhausted",
+    "REJECTED": "Rejected",
+    "STOPPED": "Stopped",
+}
+
+_KANBAN_SESSION_NAME = "kanban-session.json"
+
+
+def _kanban_session_path(abs_dir: pathlib.Path) -> pathlib.Path:
+    return abs_dir / "zcomb" / _KANBAN_SESSION_NAME
+
+
+def _list_archive_ids(abs_dir: pathlib.Path) -> list[str]:
+    runs_dir = abs_dir / "runs"
+    if not runs_dir.is_dir():
+        return []
+    return sorted(
+        p.name for p in runs_dir.iterdir()
+        if p.is_dir() and (p / "state.json").is_file()
+    )
+
+
+def ensure_kanban_session(
+    abs_dir: pathlib.Path, *, reset: bool = False,
+) -> dict:
+    """Session baseline of archives already on disk when Kanban attached.
+
+    Past-run Done cards only include loops archived *after* this baseline
+    (i.e. Extend/Resume within this dashboard session).
+    """
+    path = _kanban_session_path(abs_dir)
+    if not reset and path.is_file():
+        data = _read_json(path)
+        if isinstance(data.get("baselineArchiveIds"), list):
+            return data
+    payload = {
+        "startedAt": time.time(),
+        "baselineArchiveIds": _list_archive_ids(abs_dir),
+    }
+    _atomic_write(path, payload)
+    return payload
+
+
+def reset_kanban_session(project: pathlib.Path) -> dict:
+    """Start a fresh Kanban session baseline (retarget / new dashboard bind)."""
+    return ensure_kanban_session(project / ".absoloop", reset=True)
+
+
+def _extension_notes_by_loop(abs_dir: pathlib.Path) -> dict[str, str]:
+    """Map new loop_id → continuation note from the ledger."""
+    notes: dict[str, str] = {}
+    ledger_path = abs_dir / "ledger.jsonl"
+    if not ledger_path.is_file():
+        return notes
+    try:
+        lines = ledger_path.read_text(
+            encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return notes
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("type") != "extension":
+            continue
+        loop_id = str(event.get("loop_id") or "").strip()
+        note = str(event.get("note") or "").strip()
+        if loop_id and note:
+            notes[loop_id] = note
+    return notes
+
+
+def _archived_loop_summaries(
+    abs_dir: pathlib.Path, current_loop_id: str,
+) -> list[dict]:
+    """Prior loops under .absoloop/runs/ (oldest first), excluding current."""
+    runs_dir = abs_dir / "runs"
+    if not runs_dir.is_dir():
+        return []
+    current = (current_loop_id or "").strip()
+    notes = _extension_notes_by_loop(abs_dir)
+    rows: list[dict] = []
+    for entry in sorted(
+        (p for p in runs_dir.iterdir() if p.is_dir()),
+        key=lambda p: p.name,
+    ):
+        if entry.name == current:
+            continue
+        state = _read_json(entry / "state.json")
+        if not state:
+            continue
+        status_u = str(state.get("status") or "").upper() or "UNKNOWN"
+        try:
+            iteration = int(state.get("iteration") or 0)
+        except (TypeError, ValueError):
+            iteration = 0
+        try:
+            cost = float(state.get("cost_usd") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        focus = notes.get(entry.name) or ""
+        rows.append({
+            "loopId": entry.name,
+            "status": status_u,
+            "iteration": iteration,
+            "costUsd": cost,
+            "startedAt": state.get("started_at"),
+            "focus": focus,
+        })
+    return rows
+
+
+def _past_run_tasks(
+    abs_dir: pathlib.Path,
+    *,
+    current_loop_id: str,
+    now: str,
+) -> list[dict]:
+    """One compact Done card per loop archived during this Kanban session."""
+    session = ensure_kanban_session(abs_dir)
+    baseline = {
+        str(x) for x in (session.get("baselineArchiveIds") or []) if str(x)
+    }
+    cards: list[dict] = []
+    session_rows = [
+        row for row in _archived_loop_summaries(abs_dir, current_loop_id)
+        if row["loopId"] not in baseline
+    ]
+    for index, row in enumerate(session_rows, start=1):
+        loop_id = row["loopId"]
+        status_u = row["status"]
+        if status_u in _PAST_STATUS_LABELS:
+            label = _PAST_STATUS_LABELS[status_u]
+        elif status_u in ("EXECUTING", "FINAL_REVIEW", "RUNNING", "READY", "STARTING"):
+            label = "Archived"
+        else:
+            label = status_u.replace("_", " ").title() or "Archived"
+        title = f"Loop {index} · {label}"
+        iters = int(row["iteration"] or 0)
+        bits = [f"{iters} iter" + ("s" if iters != 1 else "")]
+        if row["costUsd"]:
+            bits.append(f"${row['costUsd']:.2f}")
+        focus = " ".join(str(row.get("focus") or "").split())
+        if focus:
+            bits.append(focus[:48] + ("…" if len(focus) > 48 else ""))
+        desc = " · ".join(bits)
+        created = _iso(row.get("startedAt")) if row.get("startedAt") else now
+        cards.append(_task(
+            f"run-{loop_id}",
+            title,
+            "done",
+            None,
+            "low",
+            5,
+            created,
+            now,
+            description=desc,
+            kind="past_run",
+        ))
+    return cards
 
 
 def _pipeline_status(name: str, live: bool, status: str, phase: str,
@@ -787,13 +1504,71 @@ def _pipeline_status(name: str, live: bool, status: str, phase: str,
     return "inbox"
 
 
+_RESTART_MARKER_NAME = "restarting.json"
+_RESTART_MARKER_TTL_SECONDS = 120.0
+
+
+def _restart_marker_path(abs_dir: pathlib.Path) -> pathlib.Path:
+    return abs_dir / "zcomb" / _RESTART_MARKER_NAME
+
+
+def write_restart_marker(
+    project: pathlib.Path,
+    *,
+    action: str = "",
+    previous_loop_id: str = "",
+    note: str = "",
+) -> dict:
+    """Signal ZComb that Extend/Resume just launched — keep UI in STARTING."""
+    abs_dir = project / ".absoloop"
+    payload = {
+        "ts": time.time(),
+        "action": str(action or ""),
+        "previousLoopId": str(previous_loop_id or ""),
+        "note": str(note or "")[:500],
+    }
+    _atomic_write(_restart_marker_path(abs_dir), payload)
+    return payload
+
+
+def clear_restart_marker(abs_dir: pathlib.Path) -> None:
+    path = _restart_marker_path(abs_dir)
+    try:
+        path.unlink(missing_ok=True)  # type: ignore[call-arg]
+    except TypeError:
+        if path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _active_restart_marker(abs_dir: pathlib.Path) -> dict:
+    """Fresh Extend/Resume marker, else {}."""
+    data = _read_json(_restart_marker_path(abs_dir))
+    if not data:
+        return {}
+    try:
+        ts = float(data.get("ts") or 0)
+    except (TypeError, ValueError):
+        ts = 0.0
+    if ts <= 0 or (time.time() - ts) > _RESTART_MARKER_TTL_SECONDS:
+        clear_restart_marker(abs_dir)
+        return {}
+    return data
+
+
 def _awaiting_new_run(abs_dir: pathlib.Path, runtime: dict, state: dict,
-                      monitor: dict, live: bool) -> bool:
+                      monitor: dict, live: bool,
+                      restart_marker: Optional[dict] = None) -> bool:
     """True when a mission is scaffolded/extended but the runner has not
     produced a live heartbeat for this loop yet.
 
     Covers: fresh `absoloop` scaffold (runtime only), post-extend gap
-    (state.json archived), and stale monitor leftover from a prior loop_id.
+    (state.json archived), stale monitor leftover from a prior loop_id,
+    and the brief COMPLETED→extend window (restart marker).
     """
     if not (abs_dir / "runtime.json").is_file():
         return False
@@ -805,6 +1580,20 @@ def _awaiting_new_run(abs_dir: pathlib.Path, runtime: dict, state: dict,
     monitor_loop = str(monitor.get("loop_id") or "").strip()
     if loop_id and monitor_loop and monitor_loop != loop_id:
         return True
+    # Dashboard Extend/Resume just fired — keep awaiting even while the old
+    # COMPLETED state.json is briefly still on disk.
+    marker = restart_marker if restart_marker is not None else _active_restart_marker(abs_dir)
+    if marker:
+        prev = str(marker.get("previousLoopId") or "").strip()
+        status_m = str(state.get("status") or "").upper()
+        if prev and loop_id and loop_id != prev:
+            return True
+        if prev and (not loop_id or loop_id == prev) and (
+            status_m in _GATE_OR_TERMINAL_STATUSES or status_m in ("", "READY")
+        ):
+            return True
+        if not prev:
+            return True
     # State exists but run never started (READY with no iterations / no start).
     status = str(state.get("status") or "").upper()
     iteration = int(state.get("iteration") or 0)
@@ -840,29 +1629,65 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         monitor = {}
         live = False
 
-    awaiting = _awaiting_new_run(abs_dir, runtime, state, monitor, live)
+    restart_marker = _active_restart_marker(abs_dir)
+    awaiting = _awaiting_new_run(
+        abs_dir, runtime, state, monitor, live,
+        restart_marker=restart_marker,
+    )
 
     source = monitor if live and monitor else state
     status = str(source.get("status") or state.get("status") or "READY")
     state_status = str(state.get("status") or "").strip()
     monitor_status = str(monitor.get("status") or "").strip() if monitor else ""
-    # Human gate: any AWAITING_APPROVAL signal wins. Codex critic/report can
-    # leave monitor at FINAL_REVIEW (or keep a live heartbeat) after state.json
-    # already advanced — CLI approve reads state.json, so Kanban must too.
-    # Never let the awaiting-run "STARTING" override clobber a real gate.
-    if (state_status.upper() == "AWAITING_APPROVAL"
-            or monitor_status.upper() == "AWAITING_APPROVAL"):
-        status = "AWAITING_APPROVAL"
-        awaiting = False
-        if state_status.upper() == "AWAITING_APPROVAL":
-            live = False
-    elif state_status.upper() in _GATE_OR_TERMINAL_STATUSES:
-        status = state_status
+    # Status precedence (must match `absoloop approve`, which reads state.json):
+    # 1) Active Extend/Resume restart hold → STARTING
+    # 2) state.json terminal/gate (COMPLETED, AWAITING_APPROVAL, …) wins —
+    #    never let a stale monitor AWAITING_APPROVAL re-enable Approve after
+    #    the mission was already approved.
+    # 3) monitor-only AWAITING_APPROVAL while state is still FINAL_REVIEW /
+    #    EXECUTING (Codex wind-down) → enable Approve immediately.
+    # 4) awaiting-new-run → STARTING
+    if restart_marker and awaiting and not live:
+        status = "STARTING"
         live = False
-        awaiting = False
+    elif state_status.upper() in _GATE_OR_TERMINAL_STATUSES:
+        if restart_marker and not live:
+            status = "STARTING"
+            awaiting = True
+            live = False
+        else:
+            status = state_status
+            live = False
+            awaiting = False
+    elif monitor_status.upper() == "AWAITING_APPROVAL":
+        if restart_marker and not live:
+            status = "STARTING"
+            awaiting = True
+            live = False
+        else:
+            status = "AWAITING_APPROVAL"
+            awaiting = False
     elif awaiting:
         status = "STARTING"
     awaiting_approval = status.upper() == "AWAITING_APPROVAL"
+
+    # Drop the restart marker once the new/continued run has real telemetry.
+    if restart_marker:
+        prev_loop = str(restart_marker.get("previousLoopId") or "").strip()
+        advanced = (
+            live
+            or (
+                loop_id
+                and prev_loop
+                and loop_id != prev_loop
+                and (abs_dir / "state.json").is_file()
+                and state_status.upper() not in ("", "READY")
+                and state_status.upper() not in _GATE_OR_TERMINAL_STATUSES
+            )
+        )
+        if advanced:
+            clear_restart_marker(abs_dir)
+            restart_marker = {}
     phase = str(monitor.get("phase") or "")
     iteration = int(source.get("iteration") or state.get("iteration") or 0)
     max_iter = int(runtime.get("max_iterations") or 0)
@@ -873,14 +1698,33 @@ def build_bridge_state(project: pathlib.Path) -> dict:
     displayed_objective = _displayed_objective(objective_history, objective)
     mission_id = str(state.get("mission_id") or monitor.get("mission_id")
                      or runtime.get("mission_id") or loop_id or "mission")
-    started = (monitor.get("started_at") if live else state.get("started_at"))
-    if not isinstance(started, (int, float)) or started <= 0:
-        started = time.time() if not awaiting else 0
+    # Prefer durable started_at from state/monitor. Never invent time.time()
+    # here — that made runKey (and the Kanban elapsed clock) reset every sync.
+    started_raw = state.get("started_at")
+    if not isinstance(started_raw, (int, float)) or started_raw <= 0:
+        started_raw = monitor.get("started_at") if monitor else None
+    if isinstance(started_raw, (int, float)) and started_raw > 0:
+        started = float(started_raw)
+    else:
+        started = 0.0
     created = _iso(started) if started else _iso(time.time())
     updated = _iso(monitor.get("heartbeat_ts") or time.time())
     now = _iso(time.time())
     project_name = project.name or str(project)
     run_key = _run_key(loop_id or mission_id, awaiting=awaiting, started=started)
+
+    ended_at = 0.0
+    status_u_for_clock = str(status or "").upper()
+    if status_u_for_clock in _GATE_OR_TERMINAL_STATUSES and not awaiting:
+        for candidate in (
+            state.get("ended_at"),
+            state.get("updated_at"),
+            monitor.get("ended_at") if monitor else None,
+            monitor.get("heartbeat_ts") if monitor else None,
+        ):
+            if isinstance(candidate, (int, float)) and candidate > 0:
+                ended_at = float(candidate)
+                break
 
     builder_id = "builder-01"
     critic_id = "critic-01"
@@ -995,6 +1839,11 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             ["task-execute"] if i == 1 else [f"iter-{i - 1:04d}"],
             description=iter_desc))
 
+    # Prior loops stay visible: one consolidated Done card each (not wiped
+    # on Extend). Current loop keeps its live pipeline / waiting cards.
+    past_run_tasks = _past_run_tasks(
+        abs_dir, current_loop_id=loop_id, now=now)
+
     if not (abs_dir / "runtime.json").is_file():
         # Empty project — idle placeholder so the UI isn't blank
         tasks = [
@@ -1017,9 +1866,10 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         mission_id = ""
         loop_id = ""
         status = "IDLE"
+        past_run_tasks = []
     elif awaiting:
-        # New / extended run activated — clear prior pipeline and wait for
-        # the runner to publish live telemetry for this objective.
+        # New / extended run activated — clear prior *current* pipeline and
+        # wait for the runner, but keep archived loops as Done cards.
         wait_title = "Waiting for new Absoloop run to start"
         wait_focus = displayed_objective or objective
         wait_desc = (
@@ -1029,6 +1879,7 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             + " — Kanban refreshes when the runner becomes live."
         )
         tasks = [
+            *past_run_tasks,
             _task("task-waiting", wait_title, "inbox", None, "high", 0,
                   now, now, description=wait_desc),
             _task("task-objective",
@@ -1048,6 +1899,8 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         ]
         teammates = {}
         live_events = []
+    elif past_run_tasks:
+        tasks = [*past_run_tasks, *tasks]
 
     # Spawned teammates get first-class agent cards with quirky names.
     for record in teammates.values():
@@ -1164,6 +2017,9 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             "awaitingApproval": bool(awaiting_approval),
             "runKey": run_key,
             "projectName": project_name,
+            # Mission wall-clock anchors for the header elapsed timer.
+            "startedAt": started if started > 0 and not awaiting else None,
+            "endedAt": ended_at if ended_at > 0 and not awaiting else None,
         },
         "activity": activity,
         "riskAnalysis": {
@@ -1333,6 +2189,11 @@ def retarget_dashboard(project: pathlib.Path, port: int = DEFAULT_PORT,
     Returns True when the live dashboard acknowledged the retarget.
     """
     out = state_dir or project_state_dir(project)
+    # New dashboard bind → new Kanban session (hide pre-existing archives).
+    try:
+        reset_kanban_session(project)
+    except OSError:
+        pass
     payload = json.dumps({
         "project": str(project.resolve()),
         "stateDir": str(out.resolve()),
@@ -1364,6 +2225,10 @@ def ensure_dashboard(project: pathlib.Path, state_dir: pathlib.Path,
     Returns `(proc_or_None, status)` where status is one of:
     `started`, `retargeted`, `restarted`, `failed`.
     """
+    try:
+        reset_kanban_session(project)
+    except OSError:
+        pass
     if not _port_in_use(port):
         proc = start_server(state_dir, port, project=project)
         if wait_ready(port, timeout=20):
@@ -1439,7 +2304,10 @@ def _bridge_loop_main(project: str, state_dir: str, interval: float) -> None:
             sync_state(proj, out)
         except Exception:
             pass
-        time.sleep(max(0.5, interval))
+        # Poll faster while Extend/Resume is activating so the UI flips quickly.
+        abs_dir = proj / ".absoloop"
+        delay = 0.35 if _active_restart_marker(abs_dir) else max(0.5, interval)
+        time.sleep(delay)
 
 
 def spawn_background(project: pathlib.Path, *, port: int = DEFAULT_PORT,
@@ -1590,5 +2458,9 @@ __all__ = [
     "ensure_dashboard",
     "stop_dashboard",
     "ensure_dashboard_built",
+    "write_restart_marker",
+    "clear_restart_marker",
+    "ensure_kanban_session",
+    "reset_kanban_session",
     "DEFAULT_PORT",
 ]

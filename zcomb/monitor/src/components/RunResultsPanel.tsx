@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { RunResults } from '../hooks/usePolling';
+import type { ProposedExtension, RunResults } from '../hooks/usePolling';
+import { triggerAction } from './MissionControls';
 
 const STORAGE_KEY = 'zc-run-results-open';
 
@@ -49,12 +50,50 @@ function formatUsd(n?: number | null): string {
   return `$${n.toFixed(2)}`;
 }
 
+/** Cost with a short token tally — e.g. "$13.43 / 2.3M tok". */
+function formatCostWithTokens(
+  usd?: number | null,
+  tokens?: number | null,
+): string {
+  const money = formatUsd(usd);
+  if (typeof tokens !== 'number' || !(tokens > 0)) return money;
+  return `${money} / ${formatTokens(tokens)} tok`;
+}
+
 function formatDuration(seconds?: number | null): string {
   if (typeof seconds !== 'number' || !(seconds >= 0)) return '—';
   if (seconds < 60) return `${Math.round(seconds)}s`;
   const m = Math.floor(seconds / 60);
   const s = Math.round(seconds % 60);
   return s ? `${m}m ${s}s` : `${m}m`;
+}
+
+/** Local finished timestamp for Run Results (collapsed + expanded). */
+function formatFinishedAt(
+  updatedAt?: string | null,
+  clock?: string | null,
+): string {
+  if (updatedAt) {
+    const d = new Date(updatedAt);
+    if (!Number.isNaN(d.getTime())) {
+      const now = new Date();
+      const sameDay = d.getFullYear() === now.getFullYear()
+        && d.getMonth() === now.getMonth()
+        && d.getDate() === now.getDate();
+      const time = d.toLocaleTimeString([], {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      });
+      if (sameDay) return time;
+      return `${d.toLocaleDateString([], {
+        month: 'short',
+        day: 'numeric',
+      })} ${time}`;
+    }
+  }
+  return (clock || '').trim();
 }
 
 function humanStatus(status: string): { color: string; label: string } {
@@ -133,12 +172,13 @@ function Metric({
       </div>
       <div
         style={{
-          fontSize: 17,
+          fontSize: value.includes(' / ') ? 14 : 17,
           fontWeight: 700,
           fontVariantNumeric: 'tabular-nums',
           letterSpacing: '-0.02em',
           color: accent || textColor,
-          lineHeight: 1.1,
+          lineHeight: 1.2,
+          wordBreak: 'break-word',
         }}
       >
         {value}
@@ -162,14 +202,28 @@ function Metric({
   );
 }
 
+function chainRoleLabel(role: string): string {
+  const r = role.toLowerCase();
+  if (r === 'prompt') return 'Prompt';
+  if (r === 'analysis') return 'Analysis';
+  if (r === 'response') return 'Response';
+  return role.replace(/_/g, ' ');
+}
+
 export function RunResultsPanel({
   runResults,
   darkMode,
   runEpoch,
+  extendEnabled = false,
+  onExtended,
 }: {
   runResults?: RunResults | null;
   darkMode: boolean;
   runEpoch: number;
+  /** True when one-click extend is allowed (mission idle / not live). */
+  extendEnabled?: boolean;
+  /** Called after a successful one-click extend starts. */
+  onExtended?: () => void;
 }) {
   const available = Boolean(runResults?.available);
   const status = String(runResults?.mission?.status || '').toUpperCase();
@@ -188,11 +242,17 @@ export function RunResultsPanel({
     return shouldDefaultOpen;
   });
   const [summaryExpanded, setSummaryExpanded] = useState(false);
+  const [chainOpen, setChainOpen] = useState(false);
+  const [extendBusy, setExtendBusy] = useState(false);
+  const [extendError, setExtendError] = useState<string | null>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
     if (stored == null) setOpen(shouldDefaultOpen);
     setSummaryExpanded(false);
+    setChainOpen(false);
+    setExtendError(null);
+    setExtendBusy(false);
   }, [runEpoch, shouldDefaultOpen]);
 
   useEffect(() => {
@@ -226,16 +286,26 @@ export function RunResultsPanel({
   const stopReason = humanStopReason(runResults?.mission?.stopReason);
   const summary = (runResults?.verdict?.summary || '').trim();
   const summaryLong = summary.length > 180;
+  const finishedAt = formatFinishedAt(runResults?.updatedAt, runResults?.clock);
 
   const collapsedLine = useMemo(() => {
     const parts: string[] = [];
     if (recommendation) parts.push(verdictTone.label);
     if (status) parts.push(statusMeta.label);
     if (runResults?.spend) {
-      parts.push(`${formatUsd(runResults.spend.costUsd)} · ${spendPct}% budget`);
+      parts.push(
+        `${formatCostWithTokens(
+          runResults.spend.costUsd,
+          runResults.spend.tokensTotal,
+        )} · ${spendPct}% budget`,
+      );
     }
+    if (finishedAt) parts.push(`Finished ${finishedAt}`);
     return parts.join('  ·  ');
-  }, [recommendation, verdictTone.label, status, statusMeta.label, runResults?.spend, spendPct]);
+  }, [
+    recommendation, verdictTone.label, status, statusMeta.label,
+    runResults?.spend, spendPct, finishedAt,
+  ]);
 
   if (!available || !runResults) return null;
 
@@ -244,6 +314,29 @@ export function RunResultsPanel({
   const spend = runResults.spend;
   const mission = runResults.mission;
   const findings = verdict?.blockingFindings || [];
+  const proposal: ProposedExtension | null | undefined = runResults.proposedExtension;
+  const proposalNote = (proposal?.note || '').trim();
+  const proposalReady = Boolean(proposalNote);
+  const proposalGenerating = proposal?.status === 'generating';
+
+  const runExtend = async () => {
+    if (!proposalNote || extendBusy || !extendEnabled) return;
+    setExtendBusy(true);
+    setExtendError(null);
+    try {
+      const result = await triggerAction('extend', { note: proposalNote });
+      if (!result.ok) {
+        setExtendError(result.message);
+        return;
+      }
+      onExtended?.();
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to start extend';
+      setExtendError(message);
+    } finally {
+      setExtendBusy(false);
+    }
+  };
 
   return (
     <section
@@ -321,6 +414,24 @@ export function RunResultsPanel({
                 {statusMeta.label}
               </span>
             )}
+            {finishedAt && (
+              <span
+                className="run-results-pill"
+                title={`Finished ${finishedAt}`}
+                style={{
+                  color: mutedColor,
+                  background: darkMode ? '#21262d' : '#eaeef2',
+                  border: `1px solid ${borderColor}`,
+                  fontVariantNumeric: 'tabular-nums',
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                  letterSpacing: '0.02em',
+                  textTransform: 'none',
+                  fontWeight: 650,
+                }}
+              >
+                {finishedAt}
+              </span>
+            )}
           </div>
           {!open && (
             <div style={{
@@ -335,18 +446,43 @@ export function RunResultsPanel({
           )}
         </div>
 
-        {!open && spend && (
+        {!open && (
           <div style={{
             textAlign: 'right',
             flexShrink: 0,
             fontVariantNumeric: 'tabular-nums',
           }}>
-            <div style={{ fontSize: 14, fontWeight: 700, color: textColor }}>
-              {formatUsd(spend.costUsd)}
-            </div>
-            <div style={{ fontSize: 10, color: spendColor, fontWeight: 700 }}>
-              {spendPct}% used
-            </div>
+            {spend ? (
+              <>
+                <div style={{ fontSize: 14, fontWeight: 700, color: textColor }}>
+                  {formatCostWithTokens(spend.costUsd, spend.tokensTotal)}
+                </div>
+                <div style={{ fontSize: 10, color: spendColor, fontWeight: 700 }}>
+                  {spendPct}% used
+                </div>
+              </>
+            ) : finishedAt ? (
+              <>
+                <div style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  letterSpacing: '0.08em',
+                  textTransform: 'uppercase',
+                  color: mutedColor,
+                }}>
+                  Finished
+                </div>
+                <div style={{
+                  marginTop: 2,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: textColor,
+                }}>
+                  {finishedAt}
+                </div>
+              </>
+            ) : null}
           </div>
         )}
       </button>
@@ -408,7 +544,7 @@ export function RunResultsPanel({
                   </div>
                 )}
               </div>
-              {runResults.clock && (
+              {finishedAt && (
                 <div style={{
                   marginLeft: 'auto',
                   textAlign: 'right',
@@ -421,7 +557,7 @@ export function RunResultsPanel({
                     textTransform: 'uppercase',
                     color: mutedColor,
                   }}>
-                    Updated
+                    Finished
                   </div>
                   <div style={{
                     marginTop: 2,
@@ -431,18 +567,232 @@ export function RunResultsPanel({
                     color: textColor,
                     fontVariantNumeric: 'tabular-nums',
                   }}>
-                    {runResults.clock}
+                    {finishedAt}
                   </div>
                 </div>
               )}
             </div>
+
+            {/* Proposed Extension — LLM chain + one-click extend */}
+            {proposalReady && (
+              <div
+                className="run-results-propose"
+                style={{
+                  borderRadius: 8,
+                  border: `1px solid ${darkMode ? '#388bfd55' : '#0969da44'}`,
+                  background: darkMode
+                    ? 'linear-gradient(135deg, #0d2140 0%, #0d1117 65%)'
+                    : 'linear-gradient(135deg, #ddf4ff 0%, #ffffff 65%)',
+                  padding: '11px 12px',
+                }}
+              >
+                <div style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: 10,
+                  flexWrap: 'wrap',
+                }}>
+                  <div style={{ minWidth: 0, flex: '1 1 220px' }}>
+                    <div style={{
+                      display: 'flex',
+                      alignItems: 'center',
+                      gap: 8,
+                      flexWrap: 'wrap',
+                      marginBottom: 6,
+                    }}>
+                      <span style={{
+                        fontSize: 10,
+                        fontWeight: 800,
+                        letterSpacing: '0.08em',
+                        textTransform: 'uppercase',
+                        color: darkMode ? '#79c0ff' : '#0969da',
+                      }}>
+                        Proposed Extension
+                      </span>
+                      {proposalGenerating && (
+                        <span
+                          className="run-results-pill"
+                          style={{
+                            color: '#d29922',
+                            background: '#9a670022',
+                            border: '1px solid #d2992266',
+                          }}
+                        >
+                          Generating
+                        </span>
+                      )}
+                      {!proposalGenerating && proposal?.source && (
+                        <span
+                          className="run-results-pill"
+                          style={{
+                            color: mutedColor,
+                            background: darkMode ? '#21262d' : '#eaeef2',
+                            border: `1px solid ${borderColor}`,
+                          }}
+                        >
+                          {proposal.source === 'llm'
+                            ? (proposal.engine || 'LLM')
+                            : 'Draft'}
+                        </span>
+                      )}
+                    </div>
+                    <p style={{
+                      margin: 0,
+                      fontSize: 13.5,
+                      lineHeight: 1.45,
+                      color: textColor,
+                      fontWeight: 600,
+                    }}>
+                      {proposalNote}
+                    </p>
+                    {proposal?.rationale && (
+                      <p style={{
+                        margin: '6px 0 0',
+                        fontSize: 12,
+                        lineHeight: 1.45,
+                        color: mutedColor,
+                      }}>
+                        {proposal.rationale}
+                      </p>
+                    )}
+                  </div>
+                  <button
+                    type="button"
+                    className="run-results-extend-btn"
+                    onClick={() => { void runExtend(); }}
+                    disabled={!extendEnabled || extendBusy || !proposalNote}
+                    title={
+                      !extendEnabled
+                        ? 'Extend available when the mission is idle / completed'
+                        : 'Start follow-on run with this proposal'
+                    }
+                    style={{
+                      flexShrink: 0,
+                      marginLeft: 'auto',
+                      alignSelf: 'center',
+                      padding: '8px 14px',
+                      borderRadius: 8,
+                      border: `1px solid ${
+                        (!extendEnabled || extendBusy)
+                          ? borderColor
+                          : '#238636'
+                      }`,
+                      background: (!extendEnabled || extendBusy)
+                        ? (darkMode ? '#21262d' : '#e1e4e8')
+                        : '#238636',
+                      color: (!extendEnabled || extendBusy)
+                        ? mutedColor
+                        : '#ffffff',
+                      fontSize: 13,
+                      fontWeight: 700,
+                      cursor: (!extendEnabled || extendBusy) ? 'not-allowed' : 'pointer',
+                      letterSpacing: '0.01em',
+                      boxShadow: (!extendEnabled || extendBusy)
+                        ? 'none'
+                        : '0 0 0 1px #23863655',
+                    }}
+                  >
+                    {extendBusy ? 'Starting…' : 'Extend'}
+                  </button>
+                </div>
+
+                {extendError && (
+                  <div style={{
+                    marginTop: 8,
+                    fontSize: 12,
+                    fontWeight: 600,
+                    color: '#f85149',
+                  }}>
+                    {extendError}
+                  </div>
+                )}
+
+                {Array.isArray(proposal?.chain) && proposal.chain.length > 0 && (
+                  <div style={{ marginTop: 10 }}>
+                    <button
+                      type="button"
+                      onClick={() => setChainOpen(v => !v)}
+                      aria-expanded={chainOpen}
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        background: 'none',
+                        border: 'none',
+                        padding: 0,
+                        color: darkMode ? '#79c0ff' : '#0969da',
+                        fontSize: 12,
+                        fontWeight: 600,
+                        cursor: 'pointer',
+                      }}
+                    >
+                      <Chevron open={chainOpen} />
+                      {chainOpen ? 'Hide' : 'Show'} prompt / response chain
+                      <span style={{ color: mutedColor, fontWeight: 500 }}>
+                        · {proposal.chain.length}
+                      </span>
+                    </button>
+                    {chainOpen && (
+                      <div
+                        className="run-results-chain"
+                        style={{
+                          marginTop: 8,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 8,
+                        }}
+                      >
+                        {proposal.chain.map((step, i) => (
+                          <div
+                            key={`${step.role}-${i}`}
+                            style={{
+                              borderRadius: 6,
+                              border: `1px solid ${borderColor}`,
+                              background: surface,
+                              padding: '8px 10px',
+                            }}
+                          >
+                            <div style={{
+                              fontSize: 10,
+                              fontWeight: 800,
+                              letterSpacing: '0.08em',
+                              textTransform: 'uppercase',
+                              color: mutedColor,
+                              marginBottom: 4,
+                            }}>
+                              {chainRoleLabel(step.role)}
+                            </div>
+                            <pre
+                              className="run-results-chain-body"
+                              style={{
+                                margin: 0,
+                                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                                fontSize: 11.5,
+                                lineHeight: 1.45,
+                                color: textColor,
+                                whiteSpace: 'pre-wrap',
+                                wordBreak: 'break-word',
+                                maxHeight: step.role === 'prompt' ? 160 : 220,
+                                overflow: 'auto',
+                              }}
+                            >
+                              {step.content}
+                            </pre>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Metric strip */}
             <div className="run-results-metrics">
               {spend && (
                 <Metric
                   label="Spend"
-                  value={formatUsd(spend.costUsd)}
+                  value={formatCostWithTokens(spend.costUsd, spend.tokensTotal)}
                   hint={`of ${formatUsd(spend.maxCostUsd)} · ${formatUsd(spend.remainingUsd)} left`}
                   mutedColor={mutedColor}
                   textColor={textColor}
@@ -454,7 +804,7 @@ export function RunResultsPanel({
                 <Metric
                   label="Budget"
                   value={`${spendPct}%`}
-                  hint={`${formatTokens(spend.tokensTotal)} tokens`}
+                  hint={`of ${formatUsd(spend.maxCostUsd)} mission`}
                   accent={spendColor}
                   mutedColor={mutedColor}
                   textColor={textColor}
@@ -479,7 +829,7 @@ export function RunResultsPanel({
                   value={formatDuration(critic.wallSeconds)}
                   hint={[
                     critic.outcome === 'finished' ? 'finished' : critic.outcome,
-                    formatUsd(critic.costUsd),
+                    formatCostWithTokens(critic.costUsd, critic.tokens),
                     typeof critic.turns === 'number' ? `${critic.turns} turns` : '',
                   ].filter(Boolean).join(' · ')}
                   mutedColor={mutedColor}

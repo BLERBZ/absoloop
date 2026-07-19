@@ -10,12 +10,45 @@ import { ObjectiveDropdown } from './components/ObjectiveDropdown';
 import { RunResultsPanel } from './components/RunResultsPanel';
 import { matchesActivityFilter } from './components/ActivityFeed';
 
-function formatElapsed(startTime: number): string {
-  const s = Math.floor((Date.now() - startTime) / 1000);
+function formatElapsedSeconds(totalSeconds: number): string {
+  const s = Math.max(0, Math.floor(totalSeconds));
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const sec = s % 60;
   return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${sec.toString().padStart(2, '0')}`;
+}
+
+const TERMINAL_ELAPSED = new Set([
+  'COMPLETED', 'BLOCKED', 'BUDGET_EXHAUSTED', 'REJECTED', 'STOPPED',
+  'AWAITING_APPROVAL',
+]);
+
+/** Mission wall-clock elapsed from bridge anchors (stable across polls). */
+function missionElapsedSeconds(
+  metrics?: {
+    startedAt?: number | null;
+    endedAt?: number | null;
+    awaitingRun?: boolean;
+    status?: string;
+    loopId?: string;
+  } | null,
+  frozenEndByLoop?: { current: Record<string, number> },
+): number | null {
+  if (!metrics || metrics.awaitingRun) return null;
+  const started = Number(metrics.startedAt);
+  if (!(started > 0)) return null;
+  const status = String(metrics.status || '').toUpperCase();
+  const terminal = TERMINAL_ELAPSED.has(status);
+  let ended = Number(metrics.endedAt);
+  const loopKey = metrics.loopId || '_';
+  if (terminal && !(ended > started) && frozenEndByLoop) {
+    if (!(frozenEndByLoop.current[loopKey] > started)) {
+      frozenEndByLoop.current[loopKey] = Date.now() / 1000;
+    }
+    ended = frozenEndByLoop.current[loopKey];
+  }
+  const endSec = (terminal && ended > started) ? ended : (Date.now() / 1000);
+  return Math.max(0, endSec - started);
 }
 
 /** Chevron button used to collapse / expand the side panels */
@@ -131,12 +164,12 @@ function CollapsedRail({ label, side, count, onExpand, darkMode, mutedColor, bor
 
 export default function App() {
   const {
-    state, error, startTime, lastUpdate, connectionHealth,
-    runEpoch, markRunRestarting,
+    state, error, lastUpdate, connectionHealth,
+    runEpoch, markRunRestarting, refreshNow,
   } = usePolling(3000);
   const [darkMode, setDarkMode] = useState(true);
   const [activityFilter, setActivityFilter] = useState<string>('focused');
-  const [elapsed, setElapsed] = useState('00:00:00');
+  const [elapsed, setElapsed] = useState('—');
   const [agentsOpen, setAgentsOpen] = useState(() => localStorage.getItem('zc-panel-agents') !== '0');
   const [feedOpen, setFeedOpen] = useState(() => localStorage.getItem('zc-panel-feed') !== '0');
   const [objectiveCopied, setObjectiveCopied] = useState(false);
@@ -145,6 +178,7 @@ export default function App() {
   const [extendBusy, setExtendBusy] = useState(false);
   const [extendError, setExtendError] = useState<string | null>(null);
   const extendInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const frozenElapsedEnd = useRef<Record<string, number>>({});
 
   const toggleAgents = () => setAgentsOpen(open => {
     localStorage.setItem('zc-panel-agents', open ? '0' : '1');
@@ -172,15 +206,26 @@ export default function App() {
     return () => window.clearTimeout(id);
   }, [extendMode]);
 
-  // Update elapsed time every second
-  useEffect(() => {
-    const id = setInterval(() => setElapsed(formatElapsed(startTime)), 1000);
-    return () => clearInterval(id);
-  }, [startTime]);
-
   const tasks = state?.tasks?.tasks || [];
   const agents = state?.agents?.agents || [];
   const metrics = state?.metrics;
+
+  // Mission wall-clock — anchored to metrics.startedAt, not UI remounts.
+  useEffect(() => {
+    const tick = () => {
+      const seconds = missionElapsedSeconds(metrics, frozenElapsedEnd);
+      setElapsed(seconds == null ? '—' : formatElapsedSeconds(seconds));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [
+    metrics?.startedAt,
+    metrics?.endedAt,
+    metrics?.awaitingRun,
+    metrics?.status,
+    metrics?.loopId,
+  ]);
   const awaitingRun = Boolean(metrics?.awaitingRun);
   const objective = (metrics?.objective || '').trim();
   const objectiveHistory = metrics?.objectiveHistory || [];
@@ -204,6 +249,30 @@ export default function App() {
   const headerBg = darkMode ? '#010409' : '#f6f8fa';
   const showObjectiveRow = extendMode || awaitingRun
     || Boolean(displayedObjective || objective || projectName);
+
+  const live = Boolean(metrics?.live);
+  const statusUpper = String(metrics?.status || '').trim().toUpperCase();
+  const hasMission = Boolean(metrics?.missionId || statusUpper) && statusUpper !== 'IDLE';
+  const atHumanGate = Boolean(metrics?.awaitingApproval)
+    || statusUpper === 'AWAITING_APPROVAL';
+  // One-click from Run Results — green/active on COMPLETED (and other idle
+  // terminal states). Matches Controls Extend enablement.
+  const runResultsExtendEnabled = Boolean(
+    hasMission
+    && !live
+    && !awaitingRun
+    && !atHumanGate
+    && statusUpper !== 'STARTING'
+    && !extendBusy
+    && (
+      statusUpper === 'COMPLETED'
+      || statusUpper === 'BUDGET_EXHAUSTED'
+      || statusUpper === 'STOPPED'
+      || statusUpper === 'BLOCKED'
+      || statusUpper === 'REJECTED'
+      || Boolean(state?.runResults?.proposedExtension?.note)
+    ),
+  );
 
   const openExtendEditor = () => {
     setExtendMode(true);
@@ -318,6 +387,7 @@ export default function App() {
             extendMode={extendMode}
             onRequestExtend={openExtendEditor}
             onRunRestarting={markRunRestarting}
+            onRefresh={refreshNow}
           />
         </div>
 
@@ -800,6 +870,8 @@ export default function App() {
               runResults={state?.runResults}
               darkMode={darkMode}
               runEpoch={runEpoch}
+              extendEnabled={runResultsExtendEnabled}
+              onExtended={markRunRestarting}
             />
           </div>
           <KanbanBoard key={runEpoch} tasks={tasks} agents={agents} darkMode={darkMode} />

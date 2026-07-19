@@ -14,7 +14,9 @@ interface MissionControlsProps {
   /** Open the highlighted extend-objective editor (does not launch yet). */
   onRequestExtend?: () => void;
   /** Called when Resume/Extend starts a new/continued run so Kanban can reset. */
-  onRunRestarting?: () => void;
+  onRunRestarting?: (note?: string) => void;
+  /** Force an immediate `/api/state` poll (e.g. after Approve). */
+  onRefresh?: () => void;
 }
 
 export async function triggerAction(
@@ -53,6 +55,7 @@ export function MissionControls({
   extendMode = false,
   onRequestExtend,
   onRunRestarting,
+  onRefresh,
 }: MissionControlsProps) {
   const [busy, setBusy] = useState<ActionName | null>(null);
   const [flash, setFlash] = useState<{ ok: boolean; text: string } | null>(null);
@@ -67,14 +70,21 @@ export function MissionControls({
   const hasMission = Boolean(metrics?.missionId || status) && status !== 'IDLE';
   const runningLike = live
     || ['EXECUTING', 'FINAL_REVIEW', 'RUNNING', 'STARTING'].includes(status);
+  // After a clean landing, Extend is the primary next step (not Resume).
+  const preferExtend = status === 'COMPLETED' || status === 'BUDGET_EXHAUSTED';
 
   // Prefer the explicit bridge flag — Codex can briefly disagree between
   // metrics.status and state.json while still being CLI-approvable.
   const approveEnabled = !busy && hasMission && atHumanGate;
-  const resumeEnabled = !busy && hasMission && !live && !awaitingRun
-    && !atHumanGate && status !== 'STARTING' && !extendMode;
   const extendEnabled = !busy && hasMission && !live && !awaitingRun
     && !atHumanGate && status !== 'STARTING';
+  // Resume stays available from the menu after COMPLETED, but is not the
+  // primary CTA — Extend owns the green button in that state.
+  const resumeEnabled = !busy && hasMission && !live && !awaitingRun
+    && !atHumanGate && status !== 'STARTING' && !extendMode
+    && !preferExtend;
+  const resumeMenuEnabled = !busy && hasMission && !live && !awaitingRun
+    && !atHumanGate && status !== 'STARTING' && !extendMode;
   const reportEnabled = !busy && hasMission && !awaitingRun;
   const abortEnabled = !busy && hasMission && runningLike && !awaitingRun && !atHumanGate;
 
@@ -121,8 +131,14 @@ export function MissionControls({
       if (action === 'resume' && result.ok) {
         onRunRestarting?.();
       }
+      // Approve (and report/abort) mutate state.json — poll immediately so the
+      // gate badge / Approve enablement don't lag on a stale metrics.json.
+      if (action === 'approve' || action === 'abort' || action === 'report') {
+        onRefresh?.();
+      }
     } catch (err: any) {
       setFlash({ ok: false, text: err?.message || `Failed to ${action}` });
+      onRefresh?.();
     } finally {
       setBusy(null);
       window.setTimeout(() => setFlash(null), 4000);
@@ -166,6 +182,15 @@ export function MissionControls({
     cursor: enabled ? 'pointer' : 'not-allowed',
   });
 
+  const extendBtn = (enabled: boolean): CSSProperties => ({
+    ...btnBase,
+    background: enabled ? '#238636' : 'transparent',
+    border: `1px solid ${enabled ? '#238636' : borderColor}`,
+    color: enabled ? '#fff' : mutedColor,
+    opacity: enabled ? 1 : 0.45,
+    cursor: enabled ? 'pointer' : 'not-allowed',
+  });
+
   const abortBtn = (enabled: boolean): CSSProperties => ({
     ...btnBase,
     background: enabled ? (darkMode ? '#3d1215' : '#ffebe9') : 'transparent',
@@ -177,7 +202,8 @@ export function MissionControls({
 
   const menuBg = darkMode ? '#161b22' : '#ffffff';
   const menuHover = darkMode ? '#21262d' : '#eaeef2';
-  const splitEnabled = resumeEnabled || extendEnabled;
+  const primaryIsExtend = preferExtend && extendEnabled;
+  const splitEnabled = resumeEnabled || resumeMenuEnabled || extendEnabled;
 
   return (
     <div style={{
@@ -249,38 +275,57 @@ export function MissionControls({
         {busy === 'approve' ? '…' : 'Approve'}
       </button>
 
-      {/* Split Resume / Extend control */}
+      {/* Split Resume / Extend — on COMPLETED the primary CTA flips to green Extend */}
       <div ref={menuRef} style={{ position: 'relative', display: 'flex', alignItems: 'stretch' }}>
         <button
           type="button"
-          disabled={!resumeEnabled}
+          disabled={primaryIsExtend ? !extendEnabled : !resumeEnabled}
           title={
-            extendMode
-              ? 'Finish or cancel the extend objective below'
-              : live
-                ? 'Loop is already running'
-                : atHumanGate
-                  ? 'Decide the gate first (Approve), then resume'
-                  : 'Continue the loop (absoloop resume)'
+            primaryIsExtend
+              ? (extendMode
+                ? 'Finish or cancel the extend objective below'
+                : 'Start a follow-on run with fresh budgets (absoloop extend)')
+              : extendMode
+                ? 'Finish or cancel the extend objective below'
+                : live
+                  ? 'Loop is already running'
+                  : atHumanGate
+                    ? 'Decide the gate first (Approve), then resume'
+                    : 'Continue the loop (absoloop resume)'
           }
-          onClick={() => run('resume')}
+          onClick={() => {
+            if (primaryIsExtend) requestExtend();
+            else void run('resume');
+          }}
           style={{
-            ...outlineBtn(resumeEnabled),
+            ...(primaryIsExtend
+              ? extendBtn(extendEnabled)
+              : outlineBtn(resumeEnabled)),
             borderTopRightRadius: 0,
             borderBottomRightRadius: 0,
-            borderRight: 'none',
+            borderRight: primaryIsExtend
+              ? `1px solid ${extendEnabled ? '#1a7f37' : borderColor}`
+              : 'none',
             minWidth: 72,
           }}
           onMouseEnter={e => {
-            if (resumeEnabled) {
+            if (primaryIsExtend && extendEnabled) {
+              e.currentTarget.style.background = '#2ea043';
+            } else if (!primaryIsExtend && resumeEnabled) {
               e.currentTarget.style.background = darkMode ? '#21262d' : '#e1e4e8';
             }
           }}
           onMouseLeave={e => {
-            e.currentTarget.style.background = 'none';
+            if (primaryIsExtend && extendEnabled) {
+              e.currentTarget.style.background = '#238636';
+            } else {
+              e.currentTarget.style.background = 'none';
+            }
           }}
         >
-          {busy === 'resume' ? '…' : 'Resume'}
+          {primaryIsExtend
+            ? (busy === 'extend' || extendMode ? (extendMode ? 'Extend…' : '…') : 'Extend')
+            : (busy === 'resume' ? '…' : 'Resume')}
         </button>
         <button
           type="button"
@@ -293,22 +338,37 @@ export function MissionControls({
             setMenuOpen(open => !open);
           }}
           style={{
-            ...outlineBtn(splitEnabled),
+            ...(primaryIsExtend
+              ? {
+                  ...extendBtn(extendEnabled),
+                  background: menuOpen
+                    ? '#2ea043'
+                    : (extendEnabled ? '#238636' : 'transparent'),
+                }
+              : {
+                  ...outlineBtn(splitEnabled),
+                  background: menuOpen || extendMode
+                    ? (darkMode ? '#21262d' : '#e1e4e8')
+                    : 'none',
+                }),
             borderTopLeftRadius: 0,
             borderBottomLeftRadius: 0,
             paddingLeft: 7,
             paddingRight: 7,
-            background: menuOpen || extendMode
-              ? (darkMode ? '#21262d' : '#e1e4e8')
-              : 'none',
           }}
           onMouseEnter={e => {
-            if (splitEnabled) {
+            if (primaryIsExtend && extendEnabled) {
+              e.currentTarget.style.background = '#2ea043';
+            } else if (splitEnabled) {
               e.currentTarget.style.background = darkMode ? '#21262d' : '#e1e4e8';
             }
           }}
           onMouseLeave={e => {
-            if (!menuOpen && !extendMode) e.currentTarget.style.background = 'none';
+            if (primaryIsExtend && extendEnabled) {
+              e.currentTarget.style.background = menuOpen ? '#2ea043' : '#238636';
+            } else if (!menuOpen && !extendMode) {
+              e.currentTarget.style.background = 'none';
+            }
           }}
         >
           <svg width="10" height="10" viewBox="0 0 12 12" aria-hidden="true"
@@ -348,38 +408,11 @@ export function MissionControls({
             <button
               type="button"
               role="menuitem"
-              disabled={!resumeEnabled}
-              onClick={() => run('resume')}
-              style={{
-                textAlign: 'left',
-                background: 'none',
-                border: 'none',
-                borderRadius: 6,
-                padding: '8px 10px',
-                cursor: resumeEnabled ? 'pointer' : 'not-allowed',
-                opacity: resumeEnabled ? 1 : 0.45,
-                color: textColor,
-              }}
-              onMouseEnter={e => {
-                if (resumeEnabled) e.currentTarget.style.background = menuHover;
-              }}
-              onMouseLeave={e => {
-                e.currentTarget.style.background = 'none';
-              }}
-            >
-              <div style={{ fontSize: 12, fontWeight: 700 }}>Resume</div>
-              <div style={{ fontSize: 11, color: mutedColor, marginTop: 2 }}>
-                Continue from the last checkpoint
-              </div>
-            </button>
-            <button
-              type="button"
-              role="menuitem"
               disabled={!extendEnabled}
               onClick={requestExtend}
               style={{
                 textAlign: 'left',
-                background: extendMode ? menuHover : 'none',
+                background: extendMode || primaryIsExtend ? menuHover : 'none',
                 border: 'none',
                 borderRadius: 6,
                 padding: '8px 10px',
@@ -391,12 +424,45 @@ export function MissionControls({
                 if (extendEnabled) e.currentTarget.style.background = menuHover;
               }}
               onMouseLeave={e => {
-                if (!extendMode) e.currentTarget.style.background = 'none';
+                if (!extendMode && !primaryIsExtend) e.currentTarget.style.background = 'none';
               }}
             >
-              <div style={{ fontSize: 12, fontWeight: 700 }}>Extend</div>
+              <div style={{
+                fontSize: 12,
+                fontWeight: 700,
+                color: extendEnabled ? '#3fb950' : textColor,
+              }}>
+                Extend
+              </div>
               <div style={{ fontSize: 11, color: mutedColor, marginTop: 2 }}>
                 Fresh budgets — set continuation objective
+              </div>
+            </button>
+            <button
+              type="button"
+              role="menuitem"
+              disabled={!resumeMenuEnabled}
+              onClick={() => run('resume')}
+              style={{
+                textAlign: 'left',
+                background: 'none',
+                border: 'none',
+                borderRadius: 6,
+                padding: '8px 10px',
+                cursor: resumeMenuEnabled ? 'pointer' : 'not-allowed',
+                opacity: resumeMenuEnabled ? 1 : 0.45,
+                color: textColor,
+              }}
+              onMouseEnter={e => {
+                if (resumeMenuEnabled) e.currentTarget.style.background = menuHover;
+              }}
+              onMouseLeave={e => {
+                e.currentTarget.style.background = 'none';
+              }}
+            >
+              <div style={{ fontSize: 12, fontWeight: 700 }}>Resume</div>
+              <div style={{ fontSize: 11, color: mutedColor, marginTop: 2 }}>
+                Continue from the last checkpoint
               </div>
             </button>
           </div>

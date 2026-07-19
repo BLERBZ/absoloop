@@ -1,6 +1,8 @@
 import express from 'express';
 import { spawn } from 'child_process';
-import { readFileSync, existsSync, mkdirSync } from 'fs';
+import {
+  readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync,
+} from 'fs';
 import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -34,6 +36,12 @@ function readStateFile(filename) {
   }
 }
 
+function writeStateFile(filename, payload) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  const filepath = join(STATE_DIR, filename);
+  writeFileSync(filepath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
+}
+
 function readActivityLog() {
   const filepath = join(STATE_DIR, 'activity.jsonl');
   if (!existsSync(filepath)) return [];
@@ -62,6 +70,111 @@ function resolveAbsoloopBin() {
   const sibling = resolve(__dirname, '../../bin/absoloop');
   if (existsSync(sibling)) return sibling;
   return 'absoloop';
+}
+
+function resolveAbsoloopHome() {
+  const home = process.env.ABSOLOOP_HOME;
+  if (home && existsSync(home)) return resolve(home);
+  return resolve(__dirname, '../..');
+}
+
+/**
+ * Persist a restart marker + optimistic awaiting Kanban state so the UI
+ * flips to STARTING immediately — before the CLI finishes rewriting
+ * state.json / loop_id (which can take several seconds).
+ */
+function markDashboardRestarting(action, note = '') {
+  const project = resolveProjectRoot();
+  const metrics = readStateFile('metrics.json') || {
+    completionPct: 0,
+    errorRate: 0,
+    tasksPerHour: 0,
+    phases: [],
+  };
+  const prevLoop = String(metrics.loopId || '').trim();
+  const nowIso = new Date().toISOString();
+  const marker = {
+    ts: Date.now() / 1000,
+    action: String(action || ''),
+    previousLoopId: prevLoop,
+    note: String(note || '').slice(0, 500),
+  };
+
+  try {
+    const markerDir = join(project, '.absoloop', 'zcomb');
+    mkdirSync(markerDir, { recursive: true });
+    writeFileSync(
+      join(markerDir, 'restarting.json'),
+      `${JSON.stringify(marker, null, 2)}\n`,
+      'utf-8',
+    );
+  } catch (err) {
+    console.warn('  warn: could not write restart marker:', err?.message || err);
+  }
+
+  const nextMetrics = {
+    ...metrics,
+    awaitingRun: true,
+    live: false,
+    awaitingApproval: false,
+    status: 'STARTING',
+    runKey: `${prevLoop || 'run'}:restarting`,
+    startedAt: null,
+    endedAt: null,
+    completionPct: 0,
+    tasksPerHour: 0,
+    displayedObjective: note
+      ? String(note).trim()
+      : (metrics.displayedObjective || metrics.objective || ''),
+  };
+  writeStateFile('metrics.json', nextMetrics);
+  writeStateFile('run-results.json', { available: false });
+  writeStateFile('tasks.json', {
+    tasks: [{
+      id: 'task-waiting',
+      title: 'Waiting for new Absoloop run to start',
+      status: 'inbox',
+      assignee: null,
+      priority: 'high',
+      dependencies: [],
+      phase: 0,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      description: note
+        ? `Extend starting — ${String(note).trim().slice(0, 160)}`
+        : `Refreshing after ${action}…`,
+    }],
+  });
+  writeStateFile('risk-analysis.json', {
+    summary: `Restarting via ${action}`
+      + (prevLoop ? ` · prior ${prevLoop}` : '')
+      + (note ? ` · ${String(note).trim().slice(0, 80)}` : ''),
+    iteration: 0,
+    maxIterations: metrics.maxIterations || 0,
+    costUsd: 0,
+    tokensTotal: 0,
+  });
+
+  // Kick an immediate bridge sync so files stay coherent (best-effort).
+  try {
+    const home = resolveAbsoloopHome();
+    spawn(
+      process.env.PYTHON || 'python3',
+      ['-c',
+        'from pathlib import Path; from absoloop_harness.zcomb import sync_state; '
+        + `sync_state(Path(${JSON.stringify(project)}))`],
+      {
+        cwd: home,
+        env: process.env,
+        detached: true,
+        stdio: 'ignore',
+      },
+    ).unref();
+  } catch {
+    // ignore — optimistic files above already cover the first polls
+  }
+
+  return marker;
 }
 
 /**
@@ -113,20 +226,51 @@ function runAbsoloopAction(action, extraArgs = []) {
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      const out = stdout.trim();
+      const err = stderr.trim();
+      // Prefer the CLI's human line (e.g. "already APPROVED") over a generic
+      // "completed" so the Kanban flash matches what actually happened.
+      const cliLine = (code === 0 ? out : err || out)
+        .split('\n')
+        .map((line) => line.trim())
+        .find(Boolean);
       resolvePromise({
         ok: code === 0,
         action,
         project,
         detached: false,
         code: code ?? 1,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        message: code === 0
-          ? `absoloop ${action} completed`
-          : (stderr.trim() || stdout.trim() || `absoloop ${action} exited ${code}`),
+        stdout: out,
+        stderr: err,
+        message: cliLine
+          || (code === 0
+            ? `absoloop ${action} completed`
+            : `absoloop ${action} exited ${code}`),
       });
     });
   });
+}
+
+/** Best-effort bridge sync so Kanban metrics match state.json after actions. */
+function syncDashboardBridge() {
+  const project = resolveProjectRoot();
+  try {
+    const home = resolveAbsoloopHome();
+    const child = spawn(
+      process.env.PYTHON || 'python3',
+      ['-c',
+        'from pathlib import Path; from absoloop_harness.zcomb import sync_state; '
+        + `sync_state(Path(${JSON.stringify(project)}))`],
+      {
+        cwd: home,
+        env: process.env,
+        stdio: 'ignore',
+      },
+    );
+    child.on('error', () => {});
+  } catch {
+    // ignore — approve CLI also syncs; poller will catch up
+  }
 }
 
 // API: Get all state in one call
@@ -203,6 +347,30 @@ app.post('/api/retarget', (req, res) => {
   STATE_DIR = nextState;
   process.env.ZCOMB_PROJECT = nextProject;
   process.env.ZCOMB_STATE_DIR = nextState;
+
+  // Fresh Kanban session baseline — hide archives that already exist on disk.
+  try {
+    const runsDir = join(nextProject, '.absoloop', 'runs');
+    const baseline = [];
+    if (existsSync(runsDir)) {
+      for (const name of readdirSync(runsDir)) {
+        if (existsSync(join(runsDir, name, 'state.json'))) baseline.push(name);
+      }
+    }
+    const sessionDir = join(nextProject, '.absoloop', 'zcomb');
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(
+      join(sessionDir, 'kanban-session.json'),
+      `${JSON.stringify({
+        startedAt: Date.now() / 1000,
+        baselineArchiveIds: baseline.sort(),
+      }, null, 2)}\n`,
+      'utf-8',
+    );
+  } catch (err) {
+    console.warn('  warn: could not reset kanban session:', err?.message || err);
+  }
+
   console.log(`  retargeted → project ${nextProject}`);
   console.log(`               state ${nextState}`);
   res.json({
@@ -234,6 +402,7 @@ app.post('/api/actions/:action', async (req, res) => {
   }
 
   const extraArgs = [];
+  let extendNote = '';
 
   if (action === 'extend') {
     const note = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
@@ -244,16 +413,31 @@ app.post('/api/actions/:action', async (req, res) => {
       });
       return;
     }
+    extendNote = note;
     extraArgs.push('-m', note);
   }
   if (action === 'abort') {
     extraArgs.push('--yes');
   }
 
+  // Flip Kanban to STARTING before the CLI returns so polls never briefly
+  // re-paint the old COMPLETED Run Results during extend/resume.
+  if (action === 'extend' || action === 'resume') {
+    markDashboardRestarting(action, extendNote);
+  }
+
   try {
     const result = await runAbsoloopAction(action, extraArgs);
+    // Approve/abort/report mutate mission files — refresh Kanban metrics so
+    // the Approve button cannot stay green on a stale AWAITING_APPROVAL paint.
+    if (action === 'approve' || action === 'abort' || action === 'report') {
+      syncDashboardBridge();
+    }
     res.status(result.ok || result.detached ? 200 : 500).json(result);
   } catch (err) {
+    if (action === 'approve' || action === 'abort') {
+      syncDashboardBridge();
+    }
     res.status(500).json({
       ok: false,
       action,

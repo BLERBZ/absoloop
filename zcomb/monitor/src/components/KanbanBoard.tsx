@@ -327,6 +327,77 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                   const priority = priorityConfig[task.priority] || priorityConfig.low;
                   const assigneeName = task.assignee ? (agentMap.get(task.assignee) || task.assignee) : '—';
                   const avatarColor = getAvatarColor(assigneeName);
+                  const isPastRun = task.kind === 'past_run'
+                    || task.id.startsWith('run-');
+
+                  if (isPastRun) {
+                    return (
+                      <div
+                        key={task.id}
+                        className="kanban-task-card kanban-past-run-card"
+                        title={task.description || task.title}
+                        style={{
+                          background: darkMode ? '#0d1117' : '#f6f8fa',
+                          border: `1px solid ${darkMode ? '#21262d' : '#d8dee4'}`,
+                          borderRadius: px(6),
+                          padding: `${px(5)}px ${px(7)}px`,
+                          cursor: 'default',
+                          flexShrink: 0,
+                          opacity: 0.92,
+                        }}
+                      >
+                        <div style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: px(6),
+                          minWidth: 0,
+                        }}>
+                          <span style={{
+                            fontSize: px(8, 5.5),
+                            fontWeight: 800,
+                            letterSpacing: '0.06em',
+                            textTransform: 'uppercase',
+                            color: darkMode ? '#3fb950' : '#1a7f37',
+                            flexShrink: 0,
+                          }}>
+                            Prior
+                          </span>
+                          <span style={{
+                            fontSize: px(10, 7),
+                            fontWeight: 600,
+                            color: textColor,
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            minWidth: 0,
+                          }}>
+                            <HighlightText
+                              text={task.title}
+                              query={searchQuery}
+                              color="#58a6ff"
+                            />
+                          </span>
+                        </div>
+                        {task.description && (
+                          <div style={{
+                            marginTop: px(3),
+                            fontSize: px(8.5, 6),
+                            color: subText,
+                            whiteSpace: 'nowrap',
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            fontVariantNumeric: 'tabular-nums',
+                          }}>
+                            <HighlightText
+                              text={task.description}
+                              query={searchQuery}
+                              color="#58a6ff"
+                            />
+                          </div>
+                        )}
+                      </div>
+                    );
+                  }
 
                   return (
                     <div key={task.id} className="kanban-task-card" style={{
