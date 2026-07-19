@@ -16,7 +16,7 @@ let PROJECT_ROOT = process.env.ZCOMB_PROJECT
   ? resolve(process.env.ZCOMB_PROJECT)
   : resolve(STATE_DIR, '../../..');
 
-const ALLOWED_ACTIONS = new Set(['approve', 'resume', 'report', 'abort']);
+const ALLOWED_ACTIONS = new Set(['approve', 'resume', 'extend', 'report', 'abort']);
 
 app.use(express.json());
 
@@ -66,13 +66,13 @@ function resolveAbsoloopBin() {
 
 /**
  * Run an Absoloop CLI action against the bridged project.
- * Resume is detached (long-running loop); approve/report/abort wait for exit.
+ * Resume/extend are detached (long-running loop); approve/report/abort wait.
  */
 function runAbsoloopAction(action, extraArgs = []) {
   const project = resolveProjectRoot();
   const bin = resolveAbsoloopBin();
   const args = [action, '-C', project, ...extraArgs];
-  const detached = action === 'resume';
+  const detached = action === 'resume' || action === 'extend';
 
   return new Promise((resolvePromise, reject) => {
     const child = spawn(bin, args, {
@@ -212,13 +212,13 @@ app.post('/api/retarget', (req, res) => {
   });
 });
 
-// Mission quick actions → absoloop approve | resume | report | abort
+// Mission quick actions → absoloop approve | resume | extend | report | abort
 app.post('/api/actions/:action', async (req, res) => {
   const action = String(req.params.action || '').toLowerCase();
   if (!ALLOWED_ACTIONS.has(action)) {
     res.status(400).json({
       ok: false,
-      error: `Unknown action '${action}'. Allowed: approve, resume, report, abort`,
+      error: `Unknown action '${action}'. Allowed: approve, resume, extend, report, abort`,
     });
     return;
   }
@@ -232,12 +232,18 @@ app.post('/api/actions/:action', async (req, res) => {
     return;
   }
 
-  const metrics = readStateFile('metrics.json') || {};
-  const status = String(metrics.status || '').toUpperCase();
   const extraArgs = [];
 
-  if (action === 'resume' && status === 'COMPLETED') {
-    extraArgs.push('--extend');
+  if (action === 'extend') {
+    const note = typeof req.body?.note === 'string' ? req.body.note.trim() : '';
+    if (!note) {
+      res.status(400).json({
+        ok: false,
+        error: 'Extend requires a continuation objective (body.note)',
+      });
+      return;
+    }
+    extraArgs.push('-m', note);
   }
   if (action === 'abort') {
     extraArgs.push('--yes');

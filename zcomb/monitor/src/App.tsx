@@ -1,11 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { usePolling } from './hooks/usePolling';
 import { AgentCards } from './components/AgentCards';
 import { KanbanBoard } from './components/KanbanBoard';
 import { ActivityFeed } from './components/ActivityFeed';
 import { MetricsPanel } from './components/MetricsPanel';
 import { Timeline } from './components/Timeline';
-import { MissionControls } from './components/MissionControls';
+import { MissionControls, triggerAction } from './components/MissionControls';
 import { matchesActivityFilter } from './components/ActivityFeed';
 
 function formatElapsed(startTime: number): string {
@@ -138,6 +138,11 @@ export default function App() {
   const [agentsOpen, setAgentsOpen] = useState(() => localStorage.getItem('zc-panel-agents') !== '0');
   const [feedOpen, setFeedOpen] = useState(() => localStorage.getItem('zc-panel-feed') !== '0');
   const [objectiveCopied, setObjectiveCopied] = useState(false);
+  const [extendMode, setExtendMode] = useState(false);
+  const [extendNote, setExtendNote] = useState('');
+  const [extendBusy, setExtendBusy] = useState(false);
+  const [extendError, setExtendError] = useState<string | null>(null);
+  const extendInputRef = useRef<HTMLTextAreaElement | null>(null);
 
   const toggleAgents = () => setAgentsOpen(open => {
     localStorage.setItem('zc-panel-agents', open ? '0' : '1');
@@ -151,7 +156,19 @@ export default function App() {
   // Reset activity filter when a new run/project identity arrives.
   useEffect(() => {
     setActivityFilter('focused');
+    setExtendMode(false);
+    setExtendNote('');
+    setExtendError(null);
   }, [runEpoch]);
+
+  useEffect(() => {
+    if (!extendMode) return;
+    const id = window.setTimeout(() => {
+      extendInputRef.current?.focus();
+      extendInputRef.current?.select();
+    }, 40);
+    return () => window.clearTimeout(id);
+  }, [extendMode]);
 
   // Update elapsed time every second
   useEffect(() => {
@@ -176,6 +193,45 @@ export default function App() {
   const textColor = darkMode ? '#e6edf3' : '#1f2328';
   const mutedColor = darkMode ? '#7d8590' : '#656d76';
   const headerBg = darkMode ? '#010409' : '#f6f8fa';
+  const showObjectiveRow = extendMode || awaitingRun || Boolean(objective || projectName);
+
+  const openExtendEditor = () => {
+    setExtendMode(true);
+    setExtendError(null);
+    setExtendNote('');
+  };
+
+  const cancelExtend = () => {
+    if (extendBusy) return;
+    setExtendMode(false);
+    setExtendNote('');
+    setExtendError(null);
+  };
+
+  const confirmExtend = async () => {
+    const note = extendNote.trim();
+    if (!note) {
+      setExtendError('Enter a continuation objective for the follow-on run.');
+      extendInputRef.current?.focus();
+      return;
+    }
+    setExtendBusy(true);
+    setExtendError(null);
+    try {
+      const result = await triggerAction('extend', { note });
+      if (!result.ok) {
+        setExtendError(result.message);
+        return;
+      }
+      setExtendMode(false);
+      setExtendNote('');
+      markRunRestarting();
+    } catch (err: any) {
+      setExtendError(err?.message || 'Failed to start extend');
+    } finally {
+      setExtendBusy(false);
+    }
+  };
 
   return (
     <div style={{
@@ -249,6 +305,8 @@ export default function App() {
             borderColor={borderColor}
             textColor={textColor}
             mutedColor={mutedColor}
+            extendMode={extendMode}
+            onRequestExtend={openExtendEditor}
             onRunRestarting={markRunRestarting}
           />
         </div>
@@ -334,22 +392,34 @@ export default function App() {
         </div>
       </header>
 
-      {/* New-run banner — shown while waiting for objective/runner after activation */}
-      {(awaitingRun || objective || projectName) && (
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: 12,
-          padding: '8px 16px',
-          borderBottom: `1px solid ${borderColor}`,
-          background: awaitingRun
-            ? (darkMode ? '#1f6feb22' : '#ddf4ff')
-            : headerBg,
-          flexShrink: 0,
-          flexWrap: 'wrap',
-          minHeight: 36,
-        }}>
-          {objective && (
+      {/* Objective / new-run banner — editable + highlighted during Extend */}
+      {showObjectiveRow && (
+        <div
+          className={extendMode ? 'extend-objective-banner' : undefined}
+          style={{
+            display: 'flex',
+            alignItems: extendMode ? 'stretch' : 'center',
+            gap: 12,
+            padding: extendMode ? '10px 16px 12px' : '8px 16px',
+            borderBottom: `1px solid ${extendMode
+              ? (darkMode ? '#d2992266' : '#bf8700aa')
+              : borderColor}`,
+            background: extendMode
+              ? (darkMode ? '#3d2e0a' : '#fff8c5')
+              : awaitingRun
+                ? (darkMode ? '#1f6feb22' : '#ddf4ff')
+                : headerBg,
+            flexShrink: 0,
+            flexWrap: 'wrap',
+            minHeight: extendMode ? 72 : 36,
+            boxShadow: extendMode
+              ? (darkMode
+                ? 'inset 3px 0 0 #d29922, 0 0 0 1px #d2992233'
+                : 'inset 3px 0 0 #bf8700, 0 0 0 1px #bf870033')
+              : undefined,
+          }}
+        >
+          {!extendMode && objective && (
             <button
               type="button"
               onClick={async () => {
@@ -417,52 +487,214 @@ export default function App() {
               )}
             </button>
           )}
-          {awaitingRun && (
-            <span style={{
-              fontSize: 11,
-              fontWeight: 700,
-              letterSpacing: '0.06em',
-              textTransform: 'uppercase',
-              color: '#58a6ff',
-              whiteSpace: 'nowrap',
-            }}>
-              Waiting for new run
-            </span>
-          )}
-          {projectName && (
-            <span style={{
-              fontSize: 12,
-              fontWeight: 600,
-              color: textColor,
-              whiteSpace: 'nowrap',
-            }}>
-              {projectName}
-            </span>
-          )}
-          {objective && (
-            <span style={{
-              fontSize: 12,
-              color: mutedColor,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-              minWidth: 0,
+          {extendMode ? (
+            <div style={{
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 8,
               flex: 1,
-            }}
-              title={objective}
-            >
-              {objective}
-            </span>
-          )}
-          {metrics?.loopId && (
-            <span style={{
-              fontSize: 11,
-              fontFamily: 'monospace',
-              color: mutedColor,
-              whiteSpace: 'nowrap',
+              minWidth: 240,
             }}>
-              {metrics.loopId}
-            </span>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                flexWrap: 'wrap',
+              }}>
+                <span style={{
+                  fontSize: 11,
+                  fontWeight: 800,
+                  letterSpacing: '0.08em',
+                  textTransform: 'uppercase',
+                  color: darkMode ? '#e3b341' : '#9a6700',
+                  whiteSpace: 'nowrap',
+                }}>
+                  Extend · continuation objective
+                </span>
+                {projectName && (
+                  <span style={{
+                    fontSize: 12,
+                    fontWeight: 600,
+                    color: textColor,
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {projectName}
+                  </span>
+                )}
+                {objective && (
+                  <span style={{
+                    fontSize: 11,
+                    color: mutedColor,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    minWidth: 0,
+                    flex: 1,
+                  }}
+                    title={`Current: ${objective}`}
+                  >
+                    current: {objective}
+                  </span>
+                )}
+              </div>
+              <div style={{
+                display: 'flex',
+                alignItems: 'flex-start',
+                gap: 8,
+                flexWrap: 'wrap',
+              }}>
+                <textarea
+                  ref={extendInputRef}
+                  value={extendNote}
+                  disabled={extendBusy}
+                  rows={2}
+                  placeholder="What should the follow-on run accomplish?"
+                  onChange={e => {
+                    setExtendNote(e.target.value);
+                    if (extendError) setExtendError(null);
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Escape') {
+                      e.preventDefault();
+                      cancelExtend();
+                    }
+                    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                      e.preventDefault();
+                      void confirmExtend();
+                    }
+                  }}
+                  aria-label="Extend continuation objective"
+                  style={{
+                    flex: 1,
+                    minWidth: 220,
+                    resize: 'vertical',
+                    minHeight: 44,
+                    maxHeight: 120,
+                    padding: '8px 10px',
+                    borderRadius: 8,
+                    border: `1px solid ${darkMode ? '#d29922' : '#bf8700'}`,
+                    background: darkMode ? '#0d1117' : '#ffffff',
+                    color: textColor,
+                    fontSize: 13,
+                    fontFamily: 'inherit',
+                    lineHeight: 1.4,
+                    outline: 'none',
+                    boxShadow: darkMode
+                      ? '0 0 0 3px #d2992233'
+                      : '0 0 0 3px #bf870033',
+                  }}
+                />
+                <div style={{
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 6,
+                  flexShrink: 0,
+                }}>
+                  <button
+                    type="button"
+                    disabled={extendBusy}
+                    onClick={() => void confirmExtend()}
+                    style={{
+                      borderRadius: 6,
+                      padding: '7px 14px',
+                      fontSize: 12,
+                      fontWeight: 700,
+                      border: '1px solid #bf8700',
+                      background: '#bf8700',
+                      color: '#0d1117',
+                      cursor: extendBusy ? 'wait' : 'pointer',
+                      opacity: extendBusy ? 0.7 : 1,
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    {extendBusy ? 'Starting…' : 'Start extend'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={extendBusy}
+                    onClick={cancelExtend}
+                    style={{
+                      borderRadius: 6,
+                      padding: '6px 14px',
+                      fontSize: 12,
+                      fontWeight: 600,
+                      border: `1px solid ${borderColor}`,
+                      background: 'none',
+                      color: mutedColor,
+                      cursor: extendBusy ? 'not-allowed' : 'pointer',
+                      whiteSpace: 'nowrap',
+                    }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 10,
+                flexWrap: 'wrap',
+              }}>
+                <span style={{ fontSize: 11, color: mutedColor }}>
+                  ⌘/Ctrl+Enter to start · Esc to cancel · becomes a definition-of-done item
+                </span>
+                {extendError && (
+                  <span style={{ fontSize: 11, color: '#f85149' }} title={extendError}>
+                    {extendError}
+                  </span>
+                )}
+              </div>
+            </div>
+          ) : (
+            <>
+              {awaitingRun && (
+                <span style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  letterSpacing: '0.06em',
+                  textTransform: 'uppercase',
+                  color: '#58a6ff',
+                  whiteSpace: 'nowrap',
+                }}>
+                  Waiting for new run
+                </span>
+              )}
+              {projectName && (
+                <span style={{
+                  fontSize: 12,
+                  fontWeight: 600,
+                  color: textColor,
+                  whiteSpace: 'nowrap',
+                }}>
+                  {projectName}
+                </span>
+              )}
+              {objective && (
+                <span style={{
+                  fontSize: 12,
+                  color: mutedColor,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  minWidth: 0,
+                  flex: 1,
+                }}
+                  title={objective}
+                >
+                  {objective}
+                </span>
+              )}
+              {metrics?.loopId && (
+                <span style={{
+                  fontSize: 11,
+                  fontFamily: 'monospace',
+                  color: mutedColor,
+                  whiteSpace: 'nowrap',
+                }}>
+                  {metrics.loopId}
+                </span>
+              )}
+            </>
           )}
         </div>
       )}

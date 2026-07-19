@@ -93,8 +93,8 @@ ACTIONS: Dict[str, Action] = {
         "resume", "Re-enter the active mission loop",
         ("resume",), group="mission", micro_slot="continue"),
     "extend": Action(
-        "extend", "Follow-on run for a COMPLETED mission",
-        ("resume", "--extend"), group="mission", micro_slot="extend"),
+        "extend", "Follow-on run with fresh budgets (completed / budget spent)",
+        ("extend",), group="mission", micro_slot="extend"),
     "schedule-tick": Action(
         "schedule-tick", "Fire due Absoloop schedules once",
         ("schedule", "tick", "--once"), group="system", micro_slot=""),
@@ -109,6 +109,10 @@ ACTIONS: Dict[str, Action] = {
         "cancel", "Cancel a live harness run (prompts for run-id if needed)",
         ("cancel",), group="harness", micro_slot="error",
         needs_prompt=True, prompt_label="run-id (blank = newest live)",
+        dangerous=True),
+    "restart": Action(
+        "restart", "Factory-reset Absoloop (wipe runs/objectives)",
+        ("restart",), group="mission", micro_slot="",
         dangerous=True),
     "setup": Action(
         "setup", "First-run setup wizard (PATH · providers · defaults)",
@@ -383,6 +387,9 @@ def run_action(action_name: str, *, cwd: pathlib.Path,
             print("error: no live harness run to cancel", file=sys.stderr)
             return 2
         argv = ["cancel", run_id]
+    elif action.name == "restart":
+        # Shortcut layer already confirmed (or --yes); skip CLI re-prompt.
+        argv = ["restart", "-y"]
     elif action.name == "inspect":
         argv = ["inspect"] + ([text] if text else list(trailing))
     elif action.name == "run":

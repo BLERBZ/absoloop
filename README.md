@@ -92,7 +92,9 @@ absoloop --zcomb                   # same briefing/launch as absoloop + ZComb UI
 absoloop zcomb                     # browser Kanban for a running mission
 absoloop approve                   # accept at the human gate
 absoloop reject "use the v2 API"   # steer the next iteration
-absoloop resume · resume --extend
+absoloop resume · extend
+absoloop abort                     # stop a live loop
+absoloop restart                   # factory reset: wipe runs/objectives (asks first)
 absoloop schedule add|tick|daemon   # cron / interval triggers (never auto-approves)
 ```
 

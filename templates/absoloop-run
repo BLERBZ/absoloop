@@ -1850,6 +1850,14 @@ def main() -> int:
 
     while state.iteration < int(runtime["max_iterations"]):
         if time.time() - state.started_at >= max_wall:
+            # Resume keeps started_at — if the cap was already spent, say so
+            # clearly instead of looking like a brand-new zero-work failure.
+            if state.status == "BUDGET_EXHAUSTED" or (
+                    state.iteration and time.time() - state.started_at > max_wall + 1):
+                say("wall-clock budget already exhausted — use 'absoloop extend' "
+                    "for a follow-on run with fresh budgets, or raise "
+                    "max_wall_seconds in .absoloop/runtime.json then resume",
+                    "err")
             return stop(state, "wall_clock_budget", "BUDGET_EXHAUSTED", runtime)
         if state.cost_usd >= float(runtime["max_cost_usd"]):
             return stop(state, "cost_budget", "BUDGET_EXHAUSTED", runtime)

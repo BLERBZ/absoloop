@@ -109,9 +109,26 @@ button, select, input, a {
 
 /* Focus styles for accessibility */
 button:focus-visible,
-select:focus-visible {
+select:focus-visible,
+textarea:focus-visible {
   outline: 2px solid #58a6ff;
   outline-offset: 2px;
+}
+
+/* Extend mode — pulse the objective banner so the continuation prompt is obvious */
+@keyframes extend-banner-pulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.06); }
+}
+
+.extend-objective-banner {
+  animation: extend-banner-pulse 2.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .extend-objective-banner {
+    animation: none;
+  }
 }
 
 /* Pulse glow animation for active agents */

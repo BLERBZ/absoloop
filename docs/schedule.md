@@ -90,7 +90,7 @@ absoloop schedule daemon start -f --interval 60
 - **No auto-approve** — `AWAITING_APPROVAL` → skip (exit 3 recorded in history)
 - **Busy detection** — live `.absoloop/tmp/monitor.json` or harness `live.json`
 - **Human breaks** — `schedule disable <id>` or `daemon stop`, then continue later
-- Schedules call the same `absoloop resume` / `resume --extend` paths as a human
+- Schedules call the same `absoloop resume` / `absoloop extend` paths as a human
 
 ## Example: week-long mission with breaks
 

@@ -60,7 +60,7 @@ absoloop shortcuts bind watch f14    # persist to ~/.absoloop/absoloop.toml
 | K5 | `approve` | `f17` | accept |
 | K6 | `reject` | `f18` | reject (prompts for text) |
 | K7 | `resume` | `f19` | continue |
-| K8 | `extend` | `ctrl+shift+alt+e` | extend completed mission |
+| K8 | `extend` | `ctrl+shift+alt+e` | extend (fresh budgets + focus note) |
 | K9 | `brief` | `f20` | new mission briefing |
 | K10 | `cancel` | `f21` | cancel live harness run |
 | K11 | `doctor` | `f22` | doctor |

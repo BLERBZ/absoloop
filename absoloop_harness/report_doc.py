@@ -556,10 +556,11 @@ def _next_step(status: str) -> str:
                 "`absoloop reject \"what to change\"` and `absoloop resume`.")
     if status == "COMPLETED":
         return ("Results were delivered per the mission delivery mode. "
-                "`absoloop resume --extend` starts a follow-on run with fresh budgets.")
+                "`absoloop extend` starts a follow-on run with fresh budgets.")
     if status == "BUDGET_EXHAUSTED":
         return ("Raise `max_iterations` / `max_cost_usd` / `max_wall_seconds` in "
-                "`.absoloop/runtime.json`, then `absoloop resume`.")
+                "`.absoloop/runtime.json`, then `absoloop resume` — or "
+                "`absoloop extend` for a follow-on run with fresh budgets.")
     if status == "BLOCKED":
         return ("Inspect `stop_reason` and latest logs, fix the cause "
                 "(or `absoloop reject \"guidance\"`), then `absoloop resume`.")

@@ -86,7 +86,9 @@ absoloop report              # Markdown + lite HTML viewer
 absoloop approve
 absoloop reject "guidance"
 absoloop resume
-absoloop resume --extend
+absoloop extend              # follow-on run with fresh budgets (alias: resume --extend)
+absoloop abort               # stop a live loop
+absoloop restart             # factory reset: wipe runs/objectives (asks first)
 absoloop schedule …          # cron / interval triggers (see docs/schedule.md)
 ```
 
@@ -128,7 +130,7 @@ Installed into `.claude/skills/` and `.codex/skills/` from
 | `cli-creator` | codex | [openai/skills](https://github.com/openai/skills) |
 
 Skills are authorized infrastructure in the `/goal` contract; the critic
-audits them like any artifact. They persist across `resume --extend`.
+audits them like any artifact. They persist across `absoloop extend`.
 
 ## Delivery
 
