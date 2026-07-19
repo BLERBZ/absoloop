@@ -388,7 +388,7 @@ export function RunResultsPanel({
               textTransform: 'uppercase',
               color: mutedColor,
             }}>
-              Run Results
+              Loop Results
             </span>
             {recommendation && (
               <span

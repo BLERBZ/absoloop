@@ -223,7 +223,7 @@ export function MissionControls({
         color: mutedColor,
         marginRight: 2,
       }}>
-        Controls
+        Loop Controls
       </span>
 
       {status && status !== 'IDLE' && (
