@@ -164,7 +164,7 @@ function CollapsedRail({ label, side, count, onExpand, darkMode, mutedColor, bor
 
 export default function App() {
   const {
-    state, error, lastUpdate, connectionHealth,
+    state, error,
     runEpoch, markRunRestarting, refreshNow,
   } = usePolling(3000);
   const [darkMode, setDarkMode] = useState(() => {
@@ -214,6 +214,21 @@ export default function App() {
   const tasks = state?.tasks?.tasks || [];
   const agents = state?.agents?.agents || [];
   const metrics = state?.metrics;
+  const headerEngine = String(
+    metrics?.settings?.activeEngine
+    || metrics?.engine
+    || metrics?.settings?.engine
+    || '',
+  ).trim();
+  const headerModel = String(
+    metrics?.settings?.activeModel
+    || metrics?.model
+    || metrics?.settings?.model
+    || '',
+  ).trim();
+  const headerEngineLabel = headerEngine
+    ? headerEngine.charAt(0).toUpperCase() + headerEngine.slice(1)
+    : '';
 
   // Mission wall-clock — anchored to metrics.startedAt, not UI remounts.
   useEffect(() => {
@@ -436,22 +451,39 @@ export default function App() {
             {elapsed}
           </div>
 
-          {/* Connection Health */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-            <div style={{
-              width: 8,
-              height: 8,
-              borderRadius: '50%',
-              background: connectionHealth === 'connected' ? '#3fb950' :
-                connectionHealth === 'degraded' ? '#d29922' : '#f85149',
-              boxShadow: `0 0 6px ${connectionHealth === 'connected' ? '#3fb950' :
-                connectionHealth === 'degraded' ? '#d29922' : '#f85149'}`,
-              animation: connectionHealth === 'connected' ? 'pulse-healthy 2.5s ease-in-out infinite' : 'pulse 1.5s infinite'
-            }} />
-            <span style={{ color: mutedColor, fontSize: 11 }}>
-              {lastUpdate ? `${Math.round((Date.now() - lastUpdate) / 1000)}s ago` : 'connecting...'}
-            </span>
-          </div>
+          {(headerEngine || headerModel) && (
+            <div
+              title="Engine and model for the active (or last) loop"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                fontSize: 12,
+                fontWeight: 600,
+                color: textColor,
+                fontVariantNumeric: 'tabular-nums',
+                maxWidth: 220,
+                minWidth: 0,
+              }}
+            >
+              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {headerEngineLabel || '—'}
+              </span>
+              <span style={{ color: mutedColor, fontWeight: 500 }}>|</span>
+              <span
+                style={{
+                  color: mutedColor,
+                  fontWeight: 500,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                  minWidth: 0,
+                }}
+              >
+                {headerModel || '—'}
+              </span>
+            </div>
+          )}
 
           {error && <span style={{ color: '#f85149', fontSize: 12 }}>Connection error</span>}
 

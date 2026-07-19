@@ -2461,6 +2461,18 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             # Mission wall-clock anchors for the header elapsed timer.
             "startedAt": started if started > 0 and not awaiting else None,
             "endedAt": ended_at if ended_at > 0 and not awaiting else None,
+            # Active loop engine/model for the header (monitor → runtime).
+            "engine": (
+                str(monitor.get("engine") or "").strip()
+                or (engine if engine != "builder" else "")
+                or str(runtime.get("engine") or "").strip()
+                or None
+            ),
+            "model": (
+                str(monitor.get("model") or "").strip()
+                or str(runtime.get("model") or "").strip()
+                or None
+            ),
             # Gear-menu prefs: next-loop engine/model + available engines.
             "settings": _bridge_settings(
                 project, runtime=runtime, monitor=monitor,

@@ -94,6 +94,10 @@ export interface Metrics {
   startedAt?: number | null;
   /** Unix seconds — when terminal; freezes the header elapsed timer. */
   endedAt?: number | null;
+  /** Active (or last) loop engine — header badge. */
+  engine?: string | null;
+  /** Active (or last) loop model — header badge. */
+  model?: string | null;
   /** Gear menu: theme + next-loop engine/model. */
   settings?: LoopSettings;
 }
