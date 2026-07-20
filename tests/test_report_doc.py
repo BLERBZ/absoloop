@@ -137,6 +137,12 @@ class ReportDocTests(unittest.TestCase):
             self.assertIn("## Mission ops", md)
             self.assertIn("qa-frame.png", md)
             self.assertIn("Make the parser stop crashing", md)
+            # Builder work headings match the Kanban card titles: iteration
+            # number + summary gist, not "Iteration N · Builder · <status>".
+            self.assertIn("### #1/5 Added empty-input guard in parser.py.", md)
+            self.assertIn("### #2/5 Hardened empty-input path; tests green.", md)
+            builder_work = md.split("## Builder work", 1)[1].split("## Critic")[0]
+            self.assertNotIn("Iteration 1 · Builder ·", builder_work)
             self.assertIn("Hardened empty-input path", md)
             self.assertIn("parser.py", md)
             self.assertIn("Verdict", md)
@@ -176,6 +182,8 @@ class ReportDocTests(unittest.TestCase):
             self.assertNotIn("Run heatmap", page)
             self.assertNotIn('class="heatmap"', page)
             self.assertNotIn(">Tasks<", page)
+            # Builder cards use Kanban-style summary-gist titles.
+            self.assertIn("#2/5 Hardened empty-input path; tests green.", page)
             self.assertIn("Hardened empty-input path", page)
             self.assertIn("AbsoLoop", page)
             self.assertIn('class="brand-logo"', page)

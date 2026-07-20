@@ -296,6 +296,22 @@ def _headline(summary: str, *, max_len: int = 160) -> str:
     return text
 
 
+_ITER_LEAD_RE = re.compile(r"^iteration\s+\d+\b[\s:,\-–—]*", re.IGNORECASE)
+
+
+def _iter_gist(summary: str, *, max_len: int = 72) -> str:
+    """Kanban-card-style gist of a builder summary for section headings.
+
+    Strips the redundant "Iteration N ..." lead-in (the heading already
+    carries the iteration number) and keeps the first sentence, capped.
+    """
+    text = " ".join(str(summary or "").split())
+    cleaned = _ITER_LEAD_RE.sub("", text).strip()
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]
+    return _headline(cleaned or text, max_len=max_len)
+
+
 def _role_and_iteration(result_rel: str) -> Tuple[str, Optional[int]]:
     name = pathlib.Path(result_rel or "").name.lower()
     role = "critic" if "critic" in name else "builder"
@@ -339,6 +355,11 @@ def _load_agent_structured(
             "summary" in nested or "recommendation" in nested or "done" in nested
         ):
             structured = nested
+    if not structured and (
+        "summary" in payload or "recommendation" in payload or "done" in payload
+    ):
+        # Codex-style results are the bare schema with no envelope.
+        structured = payload
 
     errors = payload.get("errors")
     if isinstance(errors, list):
@@ -919,10 +940,19 @@ def _render_arc_markdown(report: MissionReport) -> List[str]:
     return lines
 
 
-def _highlight_heading(hl: AgentHighlight) -> str:
-    iter_label = f"Iteration {hl.iteration}" if hl.iteration is not None else "Run"
-    role = "Builder" if hl.role == "builder" else "Critic"
-    return f"{iter_label} · {role} · {hl.status_label}"
+def _highlight_heading(hl: AgentHighlight, max_iterations: int = 0) -> str:
+    """Heading matching the Kanban card title: iteration number + summary gist."""
+    if hl.iteration is not None:
+        iter_label = (f"#{hl.iteration}/{max_iterations}"
+                      if max_iterations else f"#{hl.iteration}")
+    else:
+        iter_label = "Run"
+    if hl.role == "builder":
+        gist = _iter_gist(hl.summary)
+        if gist:
+            return f"{iter_label} {gist}"
+        return f"{iter_label} · Builder · {hl.status_label}"
+    return f"{iter_label} · Critic · {hl.status_label}"
 
 
 def _render_builder_nuggets_markdown(report: MissionReport) -> List[str]:
@@ -931,13 +961,17 @@ def _render_builder_nuggets_markdown(report: MissionReport) -> List[str]:
         return ["_No builder reports recorded yet._", ""]
     lines: List[str] = []
     for hl in builders:
-        lines.append(f"### {_highlight_heading(hl)}")
+        lines.append(f"### {_highlight_heading(hl, report.max_iterations)}")
         lines.append("")
         exact = "" if hl.cost_exact else "~"
         meta = f"`{hl.engine}` · {exact}${hl.cost_usd:.2f} · {hl.wall_seconds:.0f}s"
+        if hl.status_label:
+            meta += f" · {hl.status_label}"
         lines.append(meta)
         lines.append("")
-        if hl.headline:
+        # The heading already carries the summary gist; only repeat the
+        # headline when the heading had to fall back to the status label.
+        if hl.headline and not _iter_gist(hl.summary):
             lines.append(f"**{hl.headline}**")
             lines.append("")
         nuggets = _nuggets_for_highlight(hl)
@@ -2238,6 +2272,8 @@ def _render_builder_nuggets_html(report: MissionReport) -> str:
     for hl in builders:
         exact = "" if hl.cost_exact else "~"
         meta = f"{hl.engine} · {exact}${hl.cost_usd:.2f} · {hl.wall_seconds:.0f}s"
+        if hl.status_label:
+            meta += f" · {hl.status_label}"
         nuggets = _nuggets_for_highlight(hl)
         if not nuggets and hl.summary:
             nuggets = [_headline(hl.summary, max_len=140)]
@@ -2245,13 +2281,17 @@ def _render_builder_nuggets_html(report: MissionReport) -> str:
         if nuggets:
             items = "".join(f"<li>{_esc(n)}</li>" for n in nuggets)
             nugget_html = f'<ul class="nugget-list">{items}</ul>'
+        # Heading carries the summary gist (Kanban-card style); only show
+        # the standalone headline when the heading fell back to status.
+        show_headline = bool(hl.headline) and not _iter_gist(hl.summary)
         cards.append(
             f'<article class="hl-card {hl.tone}">'
             f'<div class="hl-head">'
-            f'<div class="hl-title">{_esc(_highlight_heading(hl))}</div>'
+            f'<div class="hl-title">'
+            f"{_esc(_highlight_heading(hl, report.max_iterations))}</div>"
             f'<div class="hl-meta">{_esc(meta)}</div>'
             f"</div>"
-            + (f'<div class="hl-headline">{_esc(hl.headline)}</div>' if hl.headline else "")
+            + (f'<div class="hl-headline">{_esc(hl.headline)}</div>' if show_headline else "")
             + nugget_html
             + "</article>"
         )
