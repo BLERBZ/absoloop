@@ -215,6 +215,7 @@ export function RunResultsPanel({
   darkMode,
   runEpoch,
   extendEnabled = false,
+  reportEnabled = false,
   onExtended,
 }: {
   runResults?: RunResults | null;
@@ -222,6 +223,8 @@ export function RunResultsPanel({
   runEpoch: number;
   /** True when one-click extend is allowed (mission idle / not live). */
   extendEnabled?: boolean;
+  /** True when opening the mission report is allowed. */
+  reportEnabled?: boolean;
   /** Called after a successful one-click extend starts. */
   onExtended?: () => void;
 }) {
@@ -245,6 +248,8 @@ export function RunResultsPanel({
   const [chainOpen, setChainOpen] = useState(false);
   const [extendBusy, setExtendBusy] = useState(false);
   const [extendError, setExtendError] = useState<string | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
+  const [reportError, setReportError] = useState<string | null>(null);
 
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY);
@@ -253,6 +258,8 @@ export function RunResultsPanel({
     setChainOpen(false);
     setExtendError(null);
     setExtendBusy(false);
+    setReportError(null);
+    setReportBusy(false);
   }, [runEpoch, shouldDefaultOpen]);
 
   useEffect(() => {
@@ -335,6 +342,23 @@ export function RunResultsPanel({
       setExtendError(message);
     } finally {
       setExtendBusy(false);
+    }
+  };
+
+  const runReport = async () => {
+    if (!reportEnabled || reportBusy) return;
+    setReportBusy(true);
+    setReportError(null);
+    try {
+      const result = await triggerAction('report');
+      if (!result.ok) {
+        setReportError(result.message);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Failed to open report';
+      setReportError(message);
+    } finally {
+      setReportBusy(false);
     }
   };
 
@@ -544,34 +568,85 @@ export function RunResultsPanel({
                   </div>
                 )}
               </div>
-              {finishedAt && (
-                <div style={{
-                  marginLeft: 'auto',
-                  textAlign: 'right',
-                  flexShrink: 0,
-                }}>
-                  <div style={{
-                    fontSize: 10,
+              <div style={{
+                marginLeft: 'auto',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 12,
+                flexShrink: 0,
+                flexWrap: 'wrap',
+                justifyContent: 'flex-end',
+              }}>
+                {finishedAt && (
+                  <div style={{ textAlign: 'right' }}>
+                    <div style={{
+                      fontSize: 10,
+                      fontWeight: 700,
+                      letterSpacing: '0.08em',
+                      textTransform: 'uppercase',
+                      color: mutedColor,
+                    }}>
+                      Finished
+                    </div>
+                    <div style={{
+                      marginTop: 2,
+                      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+                      fontSize: 13,
+                      fontWeight: 600,
+                      color: textColor,
+                      fontVariantNumeric: 'tabular-nums',
+                    }}>
+                      {finishedAt}
+                    </div>
+                  </div>
+                )}
+                <button
+                  type="button"
+                  className="run-results-report-btn"
+                  onClick={() => { void runReport(); }}
+                  disabled={!reportEnabled || reportBusy}
+                  title={
+                    !reportEnabled
+                      ? 'Report available when a mission is loaded'
+                      : 'Open the HTML report for this loop (absoloop report)'
+                  }
+                  style={{
+                    alignSelf: 'center',
+                    padding: '7px 12px',
+                    borderRadius: 8,
+                    border: `1px solid ${
+                      (!reportEnabled || reportBusy)
+                        ? borderColor
+                        : (darkMode ? '#388bfd66' : '#0969da55')
+                    }`,
+                    background: (!reportEnabled || reportBusy)
+                      ? (darkMode ? '#21262d' : '#e1e4e8')
+                      : 'transparent',
+                    color: (!reportEnabled || reportBusy)
+                      ? mutedColor
+                      : (darkMode ? '#79c0ff' : '#0969da'),
+                    fontSize: 12.5,
                     fontWeight: 700,
-                    letterSpacing: '0.08em',
-                    textTransform: 'uppercase',
-                    color: mutedColor,
-                  }}>
-                    Finished
-                  </div>
-                  <div style={{
-                    marginTop: 2,
-                    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-                    fontSize: 13,
-                    fontWeight: 600,
-                    color: textColor,
-                    fontVariantNumeric: 'tabular-nums',
-                  }}>
-                    {finishedAt}
-                  </div>
-                </div>
-              )}
+                    cursor: (!reportEnabled || reportBusy) ? 'not-allowed' : 'pointer',
+                    letterSpacing: '0.01em',
+                    whiteSpace: 'nowrap',
+                  }}
+                >
+                  {reportBusy ? 'Opening…' : 'Open Report'}
+                </button>
+              </div>
             </div>
+
+            {reportError && (
+              <div style={{
+                fontSize: 12,
+                fontWeight: 600,
+                color: '#f85149',
+                padding: '0 2px',
+              }}>
+                {reportError}
+              </div>
+            )}
 
             {/* Proposed Extension — LLM chain + one-click extend */}
             {proposalReady && (

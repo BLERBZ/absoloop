@@ -296,6 +296,15 @@ textarea:focus-visible {
   background: #238636 !important;
 }
 
+.run-results-report-btn:not(:disabled):hover {
+  background: #388bfd22 !important;
+  border-color: #388bfd99 !important;
+}
+
+.run-results-report-btn:not(:disabled):active {
+  transform: translateY(1px);
+}
+
 .run-results-chain-body::-webkit-scrollbar {
   width: 6px;
   height: 6px;

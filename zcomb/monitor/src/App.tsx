@@ -293,6 +293,8 @@ export default function App() {
       || Boolean(state?.runResults?.proposedExtension?.note)
     ),
   );
+  // Matches Controls Report enablement — regenerate + open HTML viewer.
+  const runResultsReportEnabled = Boolean(hasMission && !awaitingRun);
 
   const openExtendEditor = () => {
     setExtendMode(true);
@@ -901,6 +903,7 @@ export default function App() {
               darkMode={darkMode}
               runEpoch={runEpoch}
               extendEnabled={runResultsExtendEnabled}
+              reportEnabled={runResultsReportEnabled}
               onExtended={markRunRestarting}
             />
           </div>
