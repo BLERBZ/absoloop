@@ -35,7 +35,9 @@ HEARTBEAT_STALE_SECONDS = 90
 # spawn event is younger than this; afterwards it flips to "done".
 TEAMMATE_ACTIVE_SECONDS = 600
 TEAMMATE_SPAWN_PREFIX = "spawn teammate · "
-TEAMMATE_TOOL_NAMES = ("Task", "Agent", "SpawnAgent", "spawn_subagent")
+TEAMMATE_TOOL_NAMES = (
+    "Task", "Agent", "SpawnAgent", "spawn_subagent", "spawn_agent",
+)
 
 # Quirky teammate names, themed by what the teammate was spawned to do.
 TEAMMATE_NAME_THEMES: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (

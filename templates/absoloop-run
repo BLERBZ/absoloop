@@ -625,7 +625,8 @@ def claude_stream_events(line: str) -> list[tuple[str, str]]:
                 name = str(block.get("name", "tool"))
                 tool_input = block.get("input")
                 # Surface Agent Teams / subagent spawns clearly in watch.
-                if name in ("Task", "Agent", "SpawnAgent", "spawn_subagent"):
+                if name in ("Task", "Agent", "SpawnAgent", "spawn_subagent",
+                            "spawn_agent"):
                     detail = describe_tool_use(name, tool_input)
                     described.append(("tool", f"spawn teammate · {detail}"))
                 else:
@@ -717,6 +718,33 @@ def _summary_from_result_blob(text: str) -> str:
     return "".join(chars).strip()
 
 
+def _codex_collab_detail(item: dict[str, Any]) -> tuple[str, str] | None:
+    """Map Codex collab_tool_call items to live.jsonl narration.
+
+    ZComb Agent cards only appear for lines prefixed with
+    ``spawn teammate · `` (same contract as Claude Task/Agent tool_use).
+    Codex emits native multi-agent work as ``collab_tool_call`` /
+    ``spawn_agent`` — without this mapping, the Agents panel stays at
+    Builder + Critic only.
+    """
+    tool = str(item.get("tool") or "").strip()
+    tool_key = tool.lower().replace("-", "_")
+    focus = " ".join(
+        _first_of(item, "prompt", "message", "task_name", "description").split()
+    )
+    if tool_key in ("spawn_agent", "spawnagent"):
+        detail = f"spawn_agent: {focus}" if focus else "spawn_agent"
+        return ("tool", f"spawn teammate · {detail}")
+    if not tool_key:
+        return None
+    if focus:
+        return ("tool", f"{tool_key}: {focus}")
+    receivers = item.get("receiver_thread_ids")
+    if isinstance(receivers, list) and receivers:
+        return ("tool", f"{tool_key}: {', '.join(str(r) for r in receivers[:3])}")
+    return ("tool", tool_key)
+
+
 def codex_stream_events(line: str) -> list[tuple[str, str]]:
     """(kind, detail) narration for one codex --json event line."""
     try:
@@ -730,6 +758,22 @@ def codex_stream_events(line: str) -> list[tuple[str, str]]:
     itype = str(item.get("item_type") or item.get("type") or "")
     if etype == "thread.started":
         return [("start", "session started")]
+    # Collab spawns: narrate on item.started so teammate cards appear while
+    # the subagent runs. Non-spawn collab tools (wait/send_input/close)
+    # narrate on completed. Completed spawn is skipped to avoid double
+    # "joins the team" rows when Codex emits both lifecycle events.
+    if itype == "collab_tool_call" and etype in ("item.started", "item.completed"):
+        tool_key = str(item.get("tool") or "").strip().lower().replace("-", "_")
+        is_spawn = tool_key in ("spawn_agent", "spawnagent")
+        if is_spawn:
+            if etype != "item.started":
+                return []
+            narrated = _codex_collab_detail(item)
+            return [narrated] if narrated else []
+        if etype == "item.completed":
+            narrated = _codex_collab_detail(item)
+            return [narrated] if narrated else []
+        return []
     if etype == "item.completed":
         if itype == "command_execution":
             exit_code = item.get("exit_code")

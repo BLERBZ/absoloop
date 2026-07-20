@@ -152,6 +152,48 @@ class BridgeStateTests(unittest.TestCase):
             "plain progress note",
         )
 
+    def test_codex_spawn_agent_lines_become_teammate_cards(self):
+        """Codex collab spawn_agent narration must surface in Agents."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json",
+                   {"objective": "x", "max_iterations": 5, "engine": "codex"})
+            _write(abs_dir / "state.json",
+                   {"status": "EXECUTING", "iteration": 1, "started_at": now - 30})
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "EXECUTING", "phase": "builder", "iteration": 1,
+                "pid": os.getpid(), "heartbeat_ts": now, "agent": "builder",
+                "engine": "codex", "started_at": now - 30,
+            })
+            lines = [
+                json.dumps({
+                    "ts": now - 5, "agent": "builder", "kind": "tool",
+                    "detail": (
+                        "spawn teammate · spawn_agent: "
+                        "Write unit tests for parser"
+                    ),
+                }),
+                json.dumps({
+                    "ts": now - 4, "agent": "builder", "kind": "tool",
+                    "detail": (
+                        "spawn teammate · spawn_agent: "
+                        "Audit auth boundary for INSERT grants"
+                    ),
+                }),
+            ]
+            _write(abs_dir / "tmp" / "live.jsonl", "\n".join(lines) + "\n")
+
+            bridged = zcomb.build_bridge_state(project)
+            agents = bridged["agents"]["agents"]
+            self.assertEqual(len(agents), 4)  # builder + critic + 2 teammates
+            teammates = [a for a in agents if a["id"].startswith("teammate-")]
+            self.assertEqual(len(teammates), 2)
+            focuses = " ".join(a["role"] for a in teammates)
+            self.assertIn("Write unit tests for parser", focuses)
+            self.assertIn("Audit auth boundary", focuses)
+
     def test_quirky_names_are_deterministic_and_themed(self):
         name1 = zcomb.quirky_teammate_name("Independent critic of mission")
         name2 = zcomb.quirky_teammate_name("Independent critic of mission")

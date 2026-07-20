@@ -27,6 +27,17 @@ class ClaudeStreamEvents(unittest.TestCase):
         self.assertEqual(events[0], ("tool", "Bash: ls"))
         self.assertEqual(events[1], ("say", "done now"))
 
+    def test_task_tool_emits_spawn_teammate_prefix(self):
+        line = json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "Task",
+             "input": {"description": "Write unit tests for parser"}},
+        ]}})
+        events = run.claude_stream_events(line)
+        self.assertEqual(events, [(
+            "tool",
+            "spawn teammate · Task: Write unit tests for parser",
+        )])
+
     def test_garbage_line_is_ignored(self):
         self.assertEqual(run.claude_stream_events("{not json"), [])
 
@@ -49,6 +60,40 @@ class CodexStreamEvents(unittest.TestCase):
             "changes": [{"path": "a.py"}, {"path": "b.py"}]}})
         self.assertEqual(run.codex_stream_events(line),
                          [("tool", "edited: a.py, b.py")])
+
+    def test_collab_spawn_agent_emits_spawn_teammate_prefix(self):
+        line = json.dumps({"type": "item.started", "item": {
+            "id": "item_0",
+            "type": "collab_tool_call",
+            "tool": "spawn_agent",
+            "prompt": "Write unit tests for parser",
+            "sender_thread_id": "thread-parent",
+            "receiver_thread_ids": ["thread-child"],
+            "agents_states": {
+                "thread-child": {"status": "running", "message": None},
+            },
+            "status": "in_progress",
+        }})
+        self.assertEqual(run.codex_stream_events(line), [(
+            "tool",
+            "spawn teammate · spawn_agent: Write unit tests for parser",
+        )])
+
+    def test_collab_wait_is_plain_tool_not_spawn(self):
+        line = json.dumps({"type": "item.completed", "item": {
+            "id": "item_1",
+            "type": "collab_tool_call",
+            "tool": "wait",
+            "prompt": None,
+            "receiver_thread_ids": ["thread-child"],
+            "agents_states": {},
+            "status": "completed",
+        }})
+        events = run.codex_stream_events(line)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "tool")
+        self.assertTrue(events[0][1].startswith("wait:"))
+        self.assertNotIn("spawn teammate", events[0][1])
 
     def test_usage(self):
         line = json.dumps({"type": "turn.completed",

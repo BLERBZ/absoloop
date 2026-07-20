@@ -212,5 +212,20 @@ class CodexAdapter(ProviderAdapter):
                 return [AgentEvent(type=EventType.PROGRESS, provider=self.name,
                                    text=summary, raw_type=f"{etype}/{itype}")]
             return []
+        if itype == "collab_tool_call":
+            tool = str(item.get("tool") or "").strip()
+            prompt = str(
+                item.get("prompt")
+                or item.get("message")
+                or item.get("task_name")
+                or ""
+            ).strip()
+            text = f"{tool}: {prompt}" if prompt else tool or "collab_tool_call"
+            event_type = (
+                EventType.TOOL_STARTED if started else EventType.TOOL_COMPLETED
+            )
+            return [AgentEvent(type=event_type, provider=self.name,
+                               text=text, raw_type=f"{etype}/{itype}",
+                               data={"item": item, "tool": tool})]
         return [AgentEvent(type=EventType.UNKNOWN, provider=self.name,
                            raw_type=f"{etype}/{itype or '?'}", data=raw)]
