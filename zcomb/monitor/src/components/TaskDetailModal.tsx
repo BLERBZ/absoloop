@@ -1,4 +1,5 @@
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
+import type { ReactNode } from 'react';
 import type { Task } from '../hooks/usePolling';
 
 const statusMeta: Record<string, { label: string; icon: string; color: string }> = {
@@ -14,6 +15,14 @@ const priorityMeta: Record<string, { label: string; color: string }> = {
   high: { label: 'High', color: '#f85149' },
   medium: { label: 'Medium', color: '#d29922' },
   low: { label: 'Low', color: '#7d8590' },
+};
+
+const verdictColor: Record<string, string> = {
+  APPROVE: '#3fb950',
+  PASS: '#3fb950',
+  REJECT: '#f85149',
+  FAIL: '#f85149',
+  REVISE: '#d29922',
 };
 
 function kindLabel(task: Task): string {
@@ -41,6 +50,13 @@ function formatTimestamp(iso: string): string {
   return `${abs} · ${rel}`;
 }
 
+/** Shorten an absolute path to its most meaningful trailing segments. */
+function shortPath(p: string): string {
+  const parts = p.replace(/\/+$/, '').split('/');
+  if (parts.length <= 4) return p;
+  return parts.slice(-4).join('/');
+}
+
 export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
   task: Task;
   assigneeName: string;
@@ -63,6 +79,7 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
   const bgOverlay = darkMode ? 'rgba(1, 4, 9, 0.78)' : 'rgba(0, 0, 0, 0.45)';
   const cardBg = darkMode ? '#161b22' : '#ffffff';
   const insetBg = darkMode ? '#0d1117' : '#f6f8fa';
+  const hairline = darkMode ? '#21262d' : '#e8e8e8';
   const borderColor = darkMode ? '#30363d' : '#d0d7de';
   const textColor = darkMode ? '#e6edf3' : '#1f2328';
   const mutedColor = darkMode ? '#7d8590' : '#656d76';
@@ -71,12 +88,12 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
   const status = statusMeta[task.status] || statusMeta.inbox;
   const priority = priorityMeta[task.priority] || priorityMeta.low;
   const details = task.details || {};
+  const isIteration = task.id.startsWith('iter-');
 
-  // Description body: prefer the richer bridge excerpt; else everything
-  // after the first summary line of the card description.
   const descLines = (task.description || '').split('\n');
   const summaryLine = descLines[0] || '';
-  const body = details.excerpt || descLines.slice(1).join('\n').trim();
+  const body = details.excerpt
+    || (details.summary ? '' : descLines.slice(1).join('\n').trim());
 
   const copyText = async (label: string, value: string) => {
     try {
@@ -88,39 +105,49 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
     }
   };
 
+  // ── Hero stats: the 2-4 numbers that matter most, shown big ──────────
   const iterationCount = details.iterations ?? details.iteration;
-  const dataPoints: { label: string; value: string; mono?: boolean }[] = [
-    ...(details.outcome ? [{ label: 'Outcome', value: details.outcome }] : []),
+  const heroStats: { label: string; value: string; accent?: string }[] = [];
+  if (iterationCount != null) {
+    heroStats.push({
+      label: isIteration ? 'Iteration' : 'Iterations',
+      value: details.maxIterations
+        ? `${iterationCount}/${details.maxIterations}`
+        : String(iterationCount),
+    });
+  }
+  if (details.costUsd) {
+    heroStats.push({
+      label: details.budgetUsd ? `Spend of $${details.budgetUsd.toFixed(0)}` : 'Spend',
+      value: `$${details.costUsd.toFixed(2)}`,
+    });
+  }
+  if (details.filesChanged) {
+    heroStats.push({
+      label: isIteration ? 'Artifacts touched' : 'Files changed',
+      value: String(details.filesChanged),
+    });
+  }
+  if (details.tokens) heroStats.push({ label: 'Tokens', value: details.tokens });
+  if (details.criticVerdict) {
+    heroStats.push({
+      label: 'Critic',
+      value: details.criticVerdict,
+      accent: verdictColor[details.criticVerdict] || '#a371f7',
+    });
+  } else if (details.outcome) {
+    heroStats.push({ label: 'Outcome', value: details.outcome, accent: status.color });
+  }
+
+  // ── Secondary meta: quiet key-value rows, no boxes ────────────────────
+  const metaRows: { label: string; value: string; color?: string }[] = [
     { label: 'Assignee', value: assigneeName || '—' },
-    { label: 'Priority', value: priority.label },
-    { label: 'Phase', value: `P${task.phase}` },
     ...(details.engine ? [{ label: 'Engine', value: details.engine }] : []),
-    ...(iterationCount != null
-      ? [{
-          label: task.id.startsWith('iter-') ? 'Iteration' : 'Iterations',
-          value: details.maxIterations
-            ? `${iterationCount} / ${details.maxIterations}`
-            : String(iterationCount),
-        }]
-      : []),
-    ...(details.costUsd
-      ? [{
-          label: 'Spend',
-          value: details.budgetUsd
-            ? `$${details.costUsd.toFixed(2)} of $${details.budgetUsd.toFixed(2)}`
-            : `$${details.costUsd.toFixed(2)}`,
-        }]
-      : []),
-    ...(details.tokens ? [{ label: 'Tokens', value: details.tokens }] : []),
-    ...(details.filesChanged
-      ? [{ label: 'Files changed', value: String(details.filesChanged) }]
-      : []),
+    { label: 'Priority', value: `${priority.label} · P${task.phase}`, color: priority.color },
     ...(details.statusLabel && details.statusLabel !== details.outcome
       ? [{ label: 'Run status', value: details.statusLabel }]
       : []),
-    ...(details.generatedAt
-      ? [{ label: 'Report generated', value: details.generatedAt }]
-      : []),
+    ...(details.generatedAt ? [{ label: 'Report generated', value: details.generatedAt }] : []),
     { label: 'Created', value: formatTimestamp(task.createdAt) },
     { label: 'Updated', value: formatTimestamp(task.updatedAt) },
   ];
@@ -151,9 +178,16 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
       textTransform: 'uppercase',
       letterSpacing: 1,
       color: mutedColor,
-      marginBottom: 6,
+      marginBottom: 7,
     }}>
       {label}
+    </div>
+  );
+
+  const section = (label: string, node: ReactNode) => (
+    <div style={{ padding: '14px 0', borderTop: `1px solid ${hairline}` }}>
+      {sectionLabel(label)}
+      {node}
     </div>
   );
 
@@ -181,10 +215,10 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
         style={{
           background: cardBg,
           border: `1px solid ${borderColor}`,
-          borderRadius: 12,
-          maxWidth: 640,
+          borderRadius: 14,
+          maxWidth: 620,
           width: '94vw',
-          maxHeight: '84vh',
+          maxHeight: '86vh',
           display: 'flex',
           flexDirection: 'column',
           overflow: 'hidden',
@@ -194,17 +228,13 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
         }}
       >
         {/* Header */}
-        <div style={{
-          padding: '18px 22px 14px',
-          borderBottom: `1px solid ${darkMode ? '#21262d' : '#e8e8e8'}`,
-          flexShrink: 0,
-        }}>
+        <div style={{ padding: '18px 24px 0', flexShrink: 0 }}>
           <div style={{
             display: 'flex',
             alignItems: 'center',
             justifyContent: 'space-between',
             gap: 10,
-            marginBottom: 10,
+            marginBottom: 12,
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
               {chip(status.label, status.color, status.icon)}
@@ -240,7 +270,8 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
           }}>
             {task.title}
           </h2>
-          {summaryLine && summaryLine !== task.title && (
+          {summaryLine && summaryLine !== task.title
+            && summaryLine !== details.summary && (
             <div style={{
               marginTop: 6,
               fontSize: 12,
@@ -251,184 +282,328 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
               {summaryLine}
             </div>
           )}
+
+          {/* Hero stat strip */}
+          {heroStats.length > 0 && (
+            <div style={{
+              display: 'flex',
+              alignItems: 'stretch',
+              gap: 0,
+              margin: '16px 0 0',
+              background: insetBg,
+              border: `1px solid ${hairline}`,
+              borderRadius: 10,
+              overflow: 'hidden',
+            }}>
+              {heroStats.map((s, idx) => (
+                <div key={s.label} style={{
+                  flex: 1,
+                  minWidth: 0,
+                  padding: '10px 14px',
+                  borderLeft: idx > 0 ? `1px solid ${hairline}` : 'none',
+                }}>
+                  <div style={{
+                    fontSize: 15,
+                    fontWeight: 700,
+                    color: s.accent || textColor,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                    letterSpacing: -0.2,
+                  }}>
+                    {s.value}
+                  </div>
+                  <div style={{
+                    fontSize: 9,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.8,
+                    color: mutedColor,
+                    marginTop: 2,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {s.label}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ height: 16 }} />
         </div>
 
         {/* Body — scrolls */}
-        <div style={{ padding: '16px 22px', overflowY: 'auto', minHeight: 0 }}>
-          {/* Data points */}
-          <div style={{
-            display: 'grid',
-            gridTemplateColumns: 'repeat(auto-fill, minmax(150px, 1fr))',
-            gap: 10,
-            marginBottom: 16,
-          }}>
-            {dataPoints.map(dp => (
-              <div key={dp.label} style={{
-                background: insetBg,
-                border: `1px solid ${darkMode ? '#21262d' : '#e8e8e8'}`,
-                borderRadius: 8,
-                padding: '7px 10px',
-                minWidth: 0,
-              }}>
-                <div style={{
-                  fontSize: 9,
-                  fontWeight: 700,
-                  textTransform: 'uppercase',
-                  letterSpacing: 0.8,
-                  color: mutedColor,
-                  marginBottom: 2,
-                }}>
-                  {dp.label}
-                </div>
-                <div style={{
-                  fontSize: 12,
-                  fontWeight: 600,
-                  color: textColor,
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                  whiteSpace: 'nowrap',
-                  fontFamily: dp.mono ? 'monospace' : undefined,
-                }}>
-                  {dp.value}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          {/* Objective */}
-          {details.objective && (
-            <div style={{ marginBottom: 16 }}>
-              {sectionLabel('Objective')}
-              <div style={{
-                fontSize: 13,
-                lineHeight: 1.55,
-                color: textColor,
-                background: insetBg,
-                border: `1px solid ${darkMode ? '#21262d' : '#e8e8e8'}`,
-                borderLeft: `3px solid #58a6ff`,
-                borderRadius: 8,
-                padding: '10px 12px',
-                wordBreak: 'break-word',
-              }}>
-                {details.objective}
-              </div>
-            </div>
+        <div style={{ padding: '0 24px 10px', overflowY: 'auto', minHeight: 0 }}>
+          {/* Builder summary (iteration cards) */}
+          {details.summary && section('What the builder did',
+            <div style={{
+              fontSize: 13,
+              lineHeight: 1.6,
+              color: textColor,
+              wordBreak: 'break-word',
+            }}>
+              {details.summary}
+            </div>,
           )}
 
-          {/* Top changed areas */}
-          {details.areas && details.areas.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              {sectionLabel('Most changed areas')}
-              <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-                {details.areas.map(area => (
-                  <span key={area} style={{
-                    fontSize: 11,
-                    color: subText,
-                    background: insetBg,
-                    border: `1px solid ${darkMode ? '#21262d' : '#e1e4e8'}`,
-                    padding: '2px 8px',
-                    borderRadius: 5,
-                    fontFamily: 'monospace',
-                  }}>
-                    {area}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Extend focus note */}
-          {details.focus && (
-            <div style={{ marginBottom: 16 }}>
-              {sectionLabel('Continuation focus')}
-              <div style={{ fontSize: 13, lineHeight: 1.55, color: textColor, wordBreak: 'break-word' }}>
-                {details.focus}
-              </div>
-            </div>
+          {/* Critic verdict */}
+          {details.criticVerdict && details.criticSummary && section('Critic review',
+            <div style={{ fontSize: 12.5, lineHeight: 1.6, color: subText, wordBreak: 'break-word' }}>
+              <span style={{
+                fontWeight: 700,
+                color: verdictColor[details.criticVerdict] || '#a371f7',
+                marginRight: 6,
+              }}>
+                {details.criticVerdict}
+              </span>
+              {details.criticSummary}
+            </div>,
           )}
 
           {/* Live activity */}
-          {details.nowLine && (
-            <div style={{ marginBottom: 16 }}>
-              {sectionLabel('Currently running')}
-              <div style={{
-                fontSize: 12,
-                lineHeight: 1.55,
-                color: textColor,
-                fontFamily: 'monospace',
-                background: insetBg,
-                border: `1px solid ${darkMode ? '#21262d' : '#e8e8e8'}`,
-                borderRadius: 8,
-                padding: '9px 12px',
-                wordBreak: 'break-word',
-              }}>
-                {details.nowLine}
-              </div>
-            </div>
+          {details.nowLine && section('Currently running',
+            <div style={{
+              fontSize: 12,
+              lineHeight: 1.55,
+              color: textColor,
+              fontFamily: 'monospace',
+              background: insetBg,
+              border: `1px solid ${hairline}`,
+              borderRadius: 8,
+              padding: '9px 12px',
+              wordBreak: 'break-word',
+            }}>
+              {details.nowLine}
+            </div>,
+          )}
+
+          {/* Changed artifacts */}
+          {details.changedArtifacts && details.changedArtifacts.length > 0 && section(
+            `Changed artifacts${details.filesChanged && details.filesChanged > details.changedArtifacts.length
+              ? ` · showing ${details.changedArtifacts.length} of ${details.filesChanged}` : ''}`,
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              {details.changedArtifacts.map(p => (
+                <div key={p} style={{
+                  fontSize: 11,
+                  color: subText,
+                  fontFamily: 'monospace',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }} title={p}>
+                  {shortPath(p)}
+                </div>
+              ))}
+            </div>,
+          )}
+
+          {/* Verification commands */}
+          {details.commandsRun && details.commandsRun.length > 0 && section('Verification',
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              {details.commandsRun.map(c => (
+                <div key={c} style={{
+                  fontSize: 11.5,
+                  color: subText,
+                  fontFamily: 'monospace',
+                  lineHeight: 1.5,
+                  display: 'flex',
+                  gap: 7,
+                  wordBreak: 'break-word',
+                }}>
+                  <span aria-hidden style={{ color: '#3fb950', flexShrink: 0 }}>›</span>
+                  <span>{c}</span>
+                </div>
+              ))}
+            </div>,
+          )}
+
+          {/* Open risks */}
+          {details.risks && details.risks.length > 0 && section('Open risks',
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {details.risks.map(r => (
+                <div key={r} style={{
+                  fontSize: 12,
+                  lineHeight: 1.55,
+                  color: subText,
+                  display: 'flex',
+                  gap: 7,
+                  wordBreak: 'break-word',
+                }}>
+                  <span aria-hidden style={{ color: '#d29922', flexShrink: 0 }}>▲</span>
+                  <span>{r}</span>
+                </div>
+              ))}
+            </div>,
+          )}
+
+          {/* Objective */}
+          {details.objective && section('Objective',
+            <div style={{
+              fontSize: 12.5,
+              lineHeight: 1.6,
+              color: subText,
+              borderLeft: `3px solid ${darkMode ? '#30363d' : '#d0d7de'}`,
+              paddingLeft: 12,
+              wordBreak: 'break-word',
+            }}>
+              {details.objective}
+            </div>,
+          )}
+
+          {/* Top changed areas */}
+          {details.areas && details.areas.length > 0 && section('Most changed areas',
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+              {details.areas.map(area => (
+                <span key={area} style={{
+                  fontSize: 11,
+                  color: subText,
+                  background: insetBg,
+                  border: `1px solid ${hairline}`,
+                  padding: '2px 8px',
+                  borderRadius: 5,
+                  fontFamily: 'monospace',
+                }}>
+                  {area}
+                </span>
+              ))}
+            </div>,
+          )}
+
+          {/* Extend focus note */}
+          {details.focus && section('Continuation focus',
+            <div style={{ fontSize: 13, lineHeight: 1.55, color: textColor, wordBreak: 'break-word' }}>
+              {details.focus}
+            </div>,
           )}
 
           {/* Report / description body */}
-          {body && (
-            <div style={{ marginBottom: 16 }}>
-              {sectionLabel(details.excerpt ? 'Report excerpt' : 'Details')}
-              <div style={{
-                fontSize: 12.5,
-                lineHeight: 1.6,
-                color: subText,
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-              }}>
-                {body}
-              </div>
-            </div>
+          {body && section(details.excerpt ? 'Report excerpt' : 'Details',
+            <div style={{
+              fontSize: 12.5,
+              lineHeight: 1.6,
+              color: subText,
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-word',
+            }}>
+              {body}
+            </div>,
           )}
 
-          {/* Dependencies */}
-          {task.dependencies.length > 0 && (
-            <div style={{ marginBottom: 16 }}>
-              {sectionLabel('Dependencies')}
-              <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
-                {task.dependencies.map(dep => (
-                  <span key={dep} style={{
+          {/* Meta rows + identifiers, one quiet block */}
+          <div style={{ padding: '14px 0 6px', borderTop: `1px solid ${hairline}` }}>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'max-content 1fr',
+              columnGap: 18,
+              rowGap: 6,
+              alignItems: 'baseline',
+            }}>
+              {metaRows.map(row => (
+                <Fragment key={row.label}>
+                  <div style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.8,
+                    color: mutedColor,
+                  }}>
+                    {row.label}
+                  </div>
+                  <div style={{
+                    fontSize: 12,
+                    fontWeight: 500,
+                    color: row.color || textColor,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {row.value}
+                  </div>
+                </Fragment>
+              ))}
+              {task.dependencies.length > 0 && (
+                <>
+                  <div style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.8,
+                    color: mutedColor,
+                  }}>
+                    Depends on
+                  </div>
+                  <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                    {task.dependencies.map(dep => (
+                      <span key={dep} style={{
+                        fontSize: 10.5,
+                        color: subText,
+                        background: insetBg,
+                        border: `1px solid ${hairline}`,
+                        padding: '1px 7px',
+                        borderRadius: 5,
+                        fontFamily: 'monospace',
+                      }}>
+                        {dep.replace('task-', '#').replace('iter-', 'iter #')}
+                      </span>
+                    ))}
+                  </div>
+                </>
+              )}
+              {details.loopId && (
+                <>
+                  <div style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.8,
+                    color: mutedColor,
+                  }}>
+                    Loop
+                  </div>
+                  <div style={{
                     fontSize: 11,
                     color: subText,
-                    background: insetBg,
-                    border: `1px solid ${darkMode ? '#21262d' : '#e1e4e8'}`,
-                    padding: '2px 8px',
-                    borderRadius: 5,
                     fontFamily: 'monospace',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
                   }}>
-                    {dep.replace('task-', '#')}
-                  </span>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* Identifiers */}
-          {(details.loopId || details.missionId) && (
-            <div style={{ marginBottom: 4 }}>
-              {sectionLabel('Identifiers')}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-                {details.loopId && (
-                  <div style={{ fontSize: 11, color: subText, fontFamily: 'monospace', wordBreak: 'break-all' }}>
-                    loop&nbsp;&nbsp;&nbsp;&nbsp;{details.loopId}
+                    {details.loopId}
                   </div>
-                )}
-                {details.missionId && details.missionId !== details.loopId && (
-                  <div style={{ fontSize: 11, color: subText, fontFamily: 'monospace', wordBreak: 'break-all' }}>
-                    mission&nbsp;{details.missionId}
+                </>
+              )}
+              {details.missionId && details.missionId !== details.loopId && (
+                <>
+                  <div style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    textTransform: 'uppercase',
+                    letterSpacing: 0.8,
+                    color: mutedColor,
+                  }}>
+                    Mission
                   </div>
-                )}
-              </div>
+                  <div style={{
+                    fontSize: 11,
+                    color: subText,
+                    fontFamily: 'monospace',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {details.missionId}
+                  </div>
+                </>
+              )}
             </div>
-          )}
+          </div>
         </div>
 
         {/* Footer — links & actions */}
         <div style={{
-          padding: '12px 22px',
-          borderTop: `1px solid ${darkMode ? '#21262d' : '#e8e8e8'}`,
+          padding: '12px 24px',
+          borderTop: `1px solid ${hairline}`,
           display: 'flex',
           alignItems: 'center',
           gap: 8,

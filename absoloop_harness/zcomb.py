@@ -1823,6 +1823,51 @@ def _gist(text: Any, limit: int) -> str:
     return blob[: limit - 1].rstrip() + "…"
 
 
+_ITER_PREFIX_RE = re.compile(r"^iteration\s+\d+\b[\s:,\-–—]*", re.IGNORECASE)
+
+
+def _iteration_insights(abs_dir: pathlib.Path, iteration: int) -> dict:
+    """Distill one iteration's builder result + critic verdict into card data.
+
+    Reads the structured JSON the builder emits at the end of each
+    iteration (``tmp/iteration-NNNN-agent-result.json``) plus the critic
+    verdict for the same iteration when present.
+    """
+    tmp = abs_dir / "tmp"
+    out: dict = {}
+    agent = _read_json(tmp / f"iteration-{iteration:04d}-agent-result.json")
+    summary = " ".join(str(agent.get("summary") or "").split())
+    if summary:
+        # Builders often open with "Iteration N ..." — redundant on a card
+        # that already carries the iteration number.
+        cleaned = _ITER_PREFIX_RE.sub("", summary).strip()
+        if cleaned:
+            cleaned = cleaned[0].upper() + cleaned[1:]
+        out["summary"] = cleaned or summary
+    changed = agent.get("changed_artifacts")
+    if isinstance(changed, list) and changed:
+        out["changedArtifacts"] = [str(p) for p in changed[:8]]
+        out["filesChanged"] = len(changed)
+    commands = agent.get("commands_run")
+    if isinstance(commands, list) and commands:
+        out["commandsRun"] = [_gist(c, 100) for c in commands[:6] if str(c).strip()]
+    risks = agent.get("risks")
+    if isinstance(risks, list) and risks:
+        out["risks"] = [_gist(r, 180) for r in risks[:4] if str(r).strip()]
+    critic = _read_json(tmp / f"iteration-{iteration:04d}-critic.json")
+    # Some engines wrap the critic schema in a run envelope.
+    nested = critic.get("structured_output")
+    if isinstance(nested, dict) and nested.get("recommendation"):
+        critic = nested
+    rec = str(critic.get("recommendation") or "").strip()
+    if rec:
+        out["criticVerdict"] = rec.upper()
+        csum = " ".join(str(critic.get("summary") or "").split())
+        if csum:
+            out["criticSummary"] = _gist(csum, 240)
+    return out
+
+
 def _report_excerpt(path: pathlib.Path, limit: int = 700) -> str:
     """Plain-text excerpt from an archived report.md for Kanban search."""
     if not path.is_file():
@@ -2588,24 +2633,50 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             col = "done"
         else:
             col = "done"
-        if i == iteration and live and activity_detail:
-            iter_desc = f"Now: {activity_detail[:140]}"
+        insights = _iteration_insights(abs_dir, i)
+        is_live_iter = i == iteration and live and status in ("EXECUTING", "READY")
+        iter_no = f"#{i}/{max_iter}" if max_iter else f"#{i}"
+
+        # Title: lead with what the builder actually did, not the number.
+        gist = _gist(insights.get("summary", ""), 72)
+        if gist:
+            iter_title = f"{iter_no} {gist}"
+        elif is_live_iter and activity_detail:
+            iter_title = f"{iter_no} {_gist(activity_detail, 72)}"
         else:
-            iter_desc = f"Repair pass {i}" \
-                        + (f" of {max_iter}" if max_iter else "") \
-                        + f" toward: {objective[:110]}"
-        iter_title = f"Iteration {i} of {max_iter}" if max_iter else f"Iteration {i}"
+            iter_title = f"{iter_no} Repair pass toward objective"
+
+        desc_lines = []
+        if is_live_iter and activity_detail:
+            desc_lines.append(f"Now: {_gist(activity_detail, 120)}")
+        stat_bits = []
+        if insights.get("filesChanged"):
+            n = insights["filesChanged"]
+            stat_bits.append(f"{n} artifact" + ("s" if n != 1 else ""))
+        if insights.get("criticVerdict"):
+            stat_bits.append(f"critic: {insights['criticVerdict'].lower()}")
+        if stat_bits:
+            desc_lines.append(" · ".join(stat_bits))
+        if not desc_lines:
+            desc_lines.append(_gist(objective, 110) or f"Repair pass {iter_no}")
         tasks.append(_task(
             f"iter-{i:04d}",
             iter_title,
             col, builder_id, "medium", 1, created, updated,
             ["task-execute"] if i == 1 else [f"iter-{i - 1:04d}"],
-            description=iter_desc,
+            description="\n".join(desc_lines),
             details={
                 **mission_details,
                 "iteration": i,
+                "summary": insights.get("summary", ""),
+                "changedArtifacts": insights.get("changedArtifacts") or [],
+                "filesChanged": insights.get("filesChanged"),
+                "commandsRun": insights.get("commandsRun") or [],
+                "risks": insights.get("risks") or [],
+                "criticVerdict": insights.get("criticVerdict", ""),
+                "criticSummary": insights.get("criticSummary", ""),
                 "nowLine": activity_detail if (
-                    i == iteration and live and activity_detail) else "",
+                    is_live_iter and activity_detail) else "",
             }))
 
     # Prior loops stay visible: one consolidated Done card each (not wiped

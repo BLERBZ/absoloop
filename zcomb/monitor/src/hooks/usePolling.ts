@@ -31,6 +31,17 @@ export interface TaskDetails {
   iterations?: number;
   excerpt?: string;
   nowLine?: string;
+  /** Builder's own end-of-iteration summary (iteration cards). */
+  summary?: string;
+  /** Files/paths the builder reported touching this iteration. */
+  changedArtifacts?: string[];
+  /** Verification commands the builder ran, e.g. "npm run build — passed". */
+  commandsRun?: string[];
+  /** Open risks / unverified claims the builder flagged. */
+  risks?: string[];
+  /** Critic recommendation for this iteration, e.g. "APPROVE". */
+  criticVerdict?: string;
+  criticSummary?: string;
   /** Same-origin URL serving the loop's report (HTML or Markdown). */
   reportUrl?: string;
   reportFormat?: 'html' | 'md' | string;

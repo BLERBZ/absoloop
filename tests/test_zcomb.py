@@ -82,6 +82,53 @@ class BridgeStateTests(unittest.TestCase):
                                 for a in bridged["activity"]))
             self.assertTrue(bridged["metrics"]["live"])
 
+    def test_iteration_cards_use_builder_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            _write(abs_dir / "runtime.json", {
+                "objective": "Make tests pass", "max_iterations": 10,
+                "engine": "codex", "loop_id": "loop-1",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING", "iteration": 2,
+                "started_at": now - 60,
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "EXECUTING", "phase": "builder", "iteration": 2,
+                "pid": os.getpid(), "heartbeat_ts": now, "agent": "builder",
+                "started_at": now - 60,
+            })
+            _write(abs_dir / "tmp" / "iteration-0001-agent-result.json", {
+                "done": False,
+                "summary": "Iteration 1 rebuilt the settings panel to match "
+                           "desktop density and verified with the parity suite.",
+                "changed_artifacts": ["apps/web/a.tsx", "apps/web/b.tsx"],
+                "commands_run": ["npm run build — passed"],
+                "risks": ["Screenshots unavailable in sandbox."],
+            })
+            _write(abs_dir / "tmp" / "iteration-0001-critic.json", {
+                "recommendation": "approve",
+                "summary": "Bounded slice is sound.",
+                "blocking_findings": [],
+            })
+
+            bridged = zcomb.build_bridge_state(project)
+            by_id = {t["id"]: t for t in bridged["tasks"]["tasks"]}
+            card = by_id["iter-0001"]
+            # Title leads with the builder's own summary, not "Iteration N of N"
+            self.assertTrue(card["title"].startswith("#1/10 "))
+            self.assertIn("Rebuilt the settings panel", card["title"])
+            self.assertIn("2 artifacts", card["description"])
+            self.assertIn("critic: approve", card["description"])
+            details = card["details"]
+            self.assertEqual(details["criticVerdict"], "APPROVE")
+            self.assertEqual(details["filesChanged"], 2)
+            self.assertEqual(details["changedArtifacts"],
+                             ["apps/web/a.tsx", "apps/web/b.tsx"])
+            self.assertIn("npm run build — passed", details["commandsRun"])
+
     def test_teammate_spawns_become_agents_with_quirky_names(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = pathlib.Path(tmp)
