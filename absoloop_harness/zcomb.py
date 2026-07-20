@@ -653,11 +653,39 @@ def _load_critic_structured(project: pathlib.Path, result_rel: str) -> dict:
     }
 
 
-def _latest_critic_ledger_run(abs_dir: pathlib.Path) -> dict:
-    """Most recent ledger agent_run whose result path names the critic."""
+def _current_run_start_ts(events: list[dict]) -> float:
+    """Timestamp of the latest mission extension; 0.0 on the first run.
+
+    Loop Results must refresh per run. The ledger and live.jsonl are
+    append-only across ``--extend``, so critic/verdict rows at or before
+    this boundary belong to prior loops and must not paint the panel.
+    """
+    start = 0.0
+    for event in events:
+        if event.get("type") == "extension":
+            start = float(event.get("ts") or 0)
+    return start
+
+
+def _file_mtime(path: pathlib.Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _latest_critic_ledger_run(
+    abs_dir: pathlib.Path,
+    *,
+    run_start: float = 0.0,
+) -> dict:
+    """Most recent current-run ledger agent_run whose result path names the critic."""
     latest: dict = {}
     for event in _read_jsonl_dicts(abs_dir / "ledger.jsonl"):
         if event.get("type") != "agent_run":
+            continue
+        ts = float(event.get("ts") or 0)
+        if run_start > 0 and ts <= run_start:
             continue
         result = str(event.get("result") or "")
         if "critic" not in result.lower():
@@ -666,28 +694,49 @@ def _latest_critic_ledger_run(abs_dir: pathlib.Path) -> dict:
     return latest
 
 
-def _latest_critic_result_rel(project: pathlib.Path, abs_dir: pathlib.Path,
-                              iteration: int) -> str:
-    """Prefer ledger path; fall back to iteration-NNNN-critic.json on disk."""
-    run = _latest_critic_ledger_run(abs_dir)
+def _latest_critic_result_rel(
+    project: pathlib.Path,
+    abs_dir: pathlib.Path,
+    iteration: int,
+    *,
+    run_start: float = 0.0,
+) -> str:
+    """Prefer ledger path; fall back to current-run critic JSON on disk."""
+    run = _latest_critic_ledger_run(abs_dir, run_start=run_start)
     result = str(run.get("result") or "").strip()
     if result:
         return result
+
+    def _in_current_run(path: pathlib.Path) -> bool:
+        if run_start <= 0:
+            return True
+        return _file_mtime(path) > run_start
+
     if iteration > 0:
         candidate = abs_dir / "tmp" / f"iteration-{iteration:04d}-critic.json"
-        if candidate.is_file():
+        if candidate.is_file() and _in_current_run(candidate):
             return str(candidate.relative_to(project))
     tmp = abs_dir / "tmp"
     if tmp.is_dir():
-        matches = sorted(tmp.glob("iteration-*-critic.json"))
+        matches = [
+            path for path in sorted(tmp.glob("iteration-*-critic.json"))
+            if _in_current_run(path)
+        ]
         if matches:
             return str(matches[-1].relative_to(project))
     return ""
 
 
-def _verdict_from_live(live_events: list[dict]) -> dict:
+def _verdict_from_live(
+    live_events: list[dict],
+    *,
+    run_start: float = 0.0,
+) -> dict:
     for event in reversed(live_events):
         if str(event.get("kind") or "") != "verdict":
+            continue
+        ts = float(event.get("ts") or 0)
+        if run_start > 0 and ts <= run_start:
             continue
         detail = str(event.get("detail") or "").strip()
         if not detail:
@@ -1270,10 +1319,17 @@ def _build_run_results(
             "tokensTotal": tokens_total,
         }
 
-    ledger_run = _latest_critic_ledger_run(abs_dir)
-    result_rel = _latest_critic_result_rel(project, abs_dir, iteration)
+    # Scope critic / live verdict to the active loop. Codex REJECT → extend
+    # commonly leaves prior critic JSON + ledger/live rows in place while the
+    # next run is still EXECUTING; without this boundary the panel keeps the
+    # old REJECT paint until the new critic finishes.
+    ledger_events = _read_jsonl_dicts(abs_dir / "ledger.jsonl")
+    run_start = _current_run_start_ts(ledger_events)
+    ledger_run = _latest_critic_ledger_run(abs_dir, run_start=run_start)
+    result_rel = _latest_critic_result_rel(
+        project, abs_dir, iteration, run_start=run_start)
     structured = _load_critic_structured(project, result_rel) if result_rel else {}
-    live_verdict = _verdict_from_live(live_events)
+    live_verdict = _verdict_from_live(live_events, run_start=run_start)
 
     critic = None
     if ledger_run:

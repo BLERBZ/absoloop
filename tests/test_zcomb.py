@@ -882,6 +882,158 @@ class BridgeStateTests(unittest.TestCase):
             self.assertTrue(written["available"])
             self.assertEqual(written["verdict"]["recommendation"], "PASS")
 
+    def test_run_results_refresh_after_extension(self):
+        """Prior-loop REJECT critic must not paint Loop Results after extend.
+
+        Codex often REJECT → extend while tmp critic JSON, ledger agent_run,
+        and live.jsonl verdicts remain. The panel should stay empty until the
+        new run produces its own critic.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            abs_dir = project / ".absoloop"
+            now = time.time()
+            prior_critic = ".absoloop/tmp/iteration-0001-critic.json"
+            _write(abs_dir / "runtime.json", {
+                "objective": "Continue after Codex reject",
+                "max_iterations": 8,
+                "max_cost_usd": 50.0,
+                "loop_id": "loop-new",
+                "engine": "codex",
+            })
+            _write(abs_dir / "state.json", {
+                "status": "EXECUTING",
+                "iteration": 1,
+                "mission_id": "ABS-EXTEND",
+                "started_at": now - 30,
+                "cost_usd": 0.0,
+                "tokens_total": 0,
+            })
+            _write(abs_dir / "tmp" / "monitor.json", {
+                "status": "EXECUTING",
+                "phase": "builder",
+                "iteration": 1,
+                "pid": os.getpid(),
+                "heartbeat_ts": now,
+                "engine": "codex",
+                "agent": "builder",
+                "started_at": now - 30,
+                "cost_usd": 0.0,
+                "tokens_total": 0,
+            })
+            # Leftover prior-loop critic on disk (same iteration number).
+            _write(abs_dir / "tmp" / "iteration-0001-critic.json", {
+                "recommendation": "REJECT",
+                "blocking_findings": [
+                    "Unrestricted INSERT privilege is a security defect",
+                ],
+                "summary": (
+                    "Local checks passed, but the audit gate remains "
+                    "unverified."
+                ),
+            })
+            # Force mtime before the extension boundary so disk fallback
+            # cannot treat this as a current-run critic.
+            prior_path = abs_dir / "tmp" / "iteration-0001-critic.json"
+            os.utime(prior_path, (now - 400, now - 400))
+            _write(abs_dir / "ledger.jsonl", "\n".join([
+                json.dumps({
+                    "ts": now - 300,
+                    "type": "agent_run",
+                    "engine": "codex",
+                    "exit_code": 0,
+                    "wall_seconds": 272.0,
+                    "cost_usd": 2.0,
+                    "tokens": 1_860_000,
+                    "result": prior_critic,
+                }),
+                json.dumps({
+                    "ts": now - 280,
+                    "type": "mission_stop",
+                    "reason": "critic_reject",
+                    "status": "REJECTED",
+                }),
+                json.dumps({
+                    "ts": now - 200,
+                    "type": "extension",
+                    "previous_loop_id": "loop-old",
+                    "loop_id": "loop-new",
+                    "note": "fix security boundary and re-run audit",
+                }),
+            ]) + "\n")
+            _write(abs_dir / "tmp" / "live.jsonl", "\n".join([
+                json.dumps({
+                    "ts": now - 290,
+                    "agent": "critic",
+                    "kind": "verdict",
+                    "detail": (
+                        "REJECT: Local checks passed, but the audit gate "
+                        "remains unverified."
+                    ),
+                }),
+                json.dumps({
+                    "ts": now - 10,
+                    "agent": "builder",
+                    "kind": "tool",
+                    "detail": "Read docs/runbook.md",
+                }),
+            ]) + "\n")
+
+            bridged = zcomb.build_bridge_state(project)
+            results = bridged["runResults"]
+            self.assertFalse(results["available"])
+            self.assertIsNone(results["verdict"])
+            self.assertIsNone(results["critic"])
+            self.assertIsNone(results["mission"])
+
+            # After the new loop's critic lands, the panel updates.
+            fresh_rel = ".absoloop/tmp/iteration-0002-critic.json"
+            _write(abs_dir / "state.json", {
+                "status": "AWAITING_APPROVAL",
+                "iteration": 2,
+                "mission_id": "ABS-EXTEND",
+                "started_at": now - 30,
+                "stop_reason": "accepted_pending_human_gate",
+                "cost_usd": 4.5,
+                "tokens_total": 900_000,
+            })
+            _write(abs_dir / "tmp" / "iteration-0002-critic.json", {
+                "recommendation": "PASS",
+                "blocking_findings": [],
+                "summary": "Security boundary fixed; audit gate green.",
+                "num_turns": 4,
+            })
+            with open(abs_dir / "ledger.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "ts": now - 5,
+                    "type": "agent_run",
+                    "engine": "codex",
+                    "exit_code": 0,
+                    "wall_seconds": 40.0,
+                    "cost_usd": 0.5,
+                    "tokens": 120_000,
+                    "result": fresh_rel,
+                }) + "\n")
+            _write(abs_dir / "tmp" / "live.jsonl",
+                   (abs_dir / "tmp" / "live.jsonl").read_text(encoding="utf-8")
+                   + json.dumps({
+                       "ts": now - 4,
+                       "agent": "critic",
+                       "kind": "verdict",
+                       "detail": (
+                           "PASS: Security boundary fixed; audit gate green."
+                       ),
+                   }) + "\n")
+
+            bridged = zcomb.build_bridge_state(project)
+            results = bridged["runResults"]
+            self.assertTrue(results["available"])
+            self.assertEqual(results["verdict"]["recommendation"], "PASS")
+            self.assertIn("Security boundary fixed", results["verdict"]["summary"])
+            self.assertEqual(results["verdict"]["blockingFindings"], [])
+            self.assertEqual(results["critic"]["costUsd"], 0.5)
+            self.assertEqual(results["mission"]["status"], "AWAITING_APPROVAL")
+
     def test_proposed_extension_prompt_includes_run_context(self):
         ctx = {
             "objective": "Ship the Kanban Run Results panel",
