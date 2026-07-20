@@ -41,6 +41,56 @@ const priorityConfig: Record<string, { color: string; label: string; bg: string 
   low: { color: '#7d8590', label: 'Lo', bg: '#7d859015' }
 };
 
+/** Cards of the same family collapse into one stacked card per column. */
+const STACK_CONFIG: Record<string, { label: string; newestFirst: boolean }> = {
+  report: { label: 'Reports', newestFirst: true },
+  past_run: { label: 'Prior loops', newestFirst: true },
+  iteration: { label: 'Iterations', newestFirst: true },
+  pipeline: { label: 'ZCombinator Team', newestFirst: false },
+};
+const STACK_MIN = 3;
+
+function stackGroupOf(task: Task): string | null {
+  if (task.kind === 'report') return 'report';
+  if (task.kind === 'past_run' || task.id.startsWith('run-')) return 'past_run';
+  if (/^iter-\d{4}$/.test(task.id)) return 'iteration';
+  if (/^task-(scaffold|execute|integrity|critic|gate|deliver)$/.test(task.id)) {
+    return 'pipeline';
+  }
+  return null;
+}
+
+type RenderItem =
+  | { type: 'task'; task: Task }
+  | { type: 'stack'; group: string; tasks: Task[] };
+
+/** Fold same-family cards (≥ STACK_MIN) into a stack at first position. */
+function buildRenderItems(tasks: Task[], disableStacks: boolean): RenderItem[] {
+  if (disableStacks) return tasks.map(task => ({ type: 'task', task }));
+  const counts = new Map<string, number>();
+  for (const t of tasks) {
+    const g = stackGroupOf(t);
+    if (g) counts.set(g, (counts.get(g) || 0) + 1);
+  }
+  const items: RenderItem[] = [];
+  const stacks = new Map<string, Extract<RenderItem, { type: 'stack' }>>();
+  for (const t of tasks) {
+    const g = stackGroupOf(t);
+    if (g && (counts.get(g) || 0) >= STACK_MIN) {
+      let stack = stacks.get(g);
+      if (!stack) {
+        stack = { type: 'stack', group: g, tasks: [] };
+        stacks.set(g, stack);
+        items.push(stack);
+      }
+      stack.tasks.push(t);
+    } else {
+      items.push({ type: 'task', task: t });
+    }
+  }
+  return items;
+}
+
 function getInitials(name: string): string {
   return name.split(' ').map(w => w[0]).join('').slice(0, 2).toUpperCase();
 }
@@ -165,6 +215,7 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
   const [phaseFilter, setPhaseFilter] = useState<string>('all');
   const [zoomLevel, setZoomLevel] = useState(readStoredZoom);
   const [selectedTask, setSelectedTask] = useState<Task | null>(null);
+  const [expandedStacks, setExpandedStacks] = useState<Record<string, boolean>>({});
   const searchRef = useRef<HTMLInputElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const [containerW, setContainerW] = useState(1200);
@@ -247,6 +298,486 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
     const matchesPhase = phaseFilter === 'all' || t.phase === Number(phaseFilter);
     return matchesSearch && matchesPhase;
   });
+
+  type Column = typeof columns[number];
+
+  const renderCard = (task: Task, col: Column) => {
+    const priority = priorityConfig[task.priority] || priorityConfig.low;
+    const assigneeName = task.assignee ? (agentMap.get(task.assignee) || task.assignee) : '—';
+    const avatarColor = getAvatarColor(assigneeName);
+    const isPastRun = task.kind === 'past_run'
+      || task.id.startsWith('run-');
+
+    if (isPastRun) {
+      const descLines = (task.description || '').split('\n');
+      return (
+        <div
+          key={task.id}
+          className="kanban-task-card kanban-past-run-card"
+          title="Click for details"
+          role="button"
+          tabIndex={0}
+          onClick={() => setSelectedTask(task)}
+          onKeyDown={e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              setSelectedTask(task);
+            }
+          }}
+          style={{
+            background: darkMode ? '#0d1117' : '#f6f8fa',
+            border: `1px solid ${darkMode ? '#21262d' : '#d8dee4'}`,
+            borderRadius: px(6),
+            padding: `${px(5)}px ${px(7)}px`,
+            cursor: 'pointer',
+            flexShrink: 0,
+            opacity: 0.92,
+          }}
+        >
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: px(6),
+            minWidth: 0,
+          }}>
+            <span style={{
+              fontSize: px(8, 5.5),
+              fontWeight: 800,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+              color: darkMode ? '#3fb950' : '#1a7f37',
+              flexShrink: 0,
+            }}>
+              Prior
+            </span>
+            <span style={{
+              fontSize: px(10, 7),
+              fontWeight: 600,
+              color: textColor,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              minWidth: 0,
+            }}>
+              <HighlightText
+                text={task.title}
+                query={searchQuery}
+                color="#58a6ff"
+              />
+            </span>
+          </div>
+          {descLines[0] && (
+            <div style={{
+              marginTop: px(3),
+              fontSize: px(8.5, 6),
+              color: subText,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              fontVariantNumeric: 'tabular-nums',
+            }}>
+              <HighlightText
+                text={descLines[0]}
+                query={searchQuery}
+                color="#58a6ff"
+              />
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    return (
+      <div
+        key={task.id}
+        className="kanban-task-card"
+        title="Click for details"
+        role="button"
+        tabIndex={0}
+        onClick={() => setSelectedTask(task)}
+        onKeyDown={e => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setSelectedTask(task);
+          }
+        }}
+        style={{
+          background: darkMode
+            ? 'linear-gradient(135deg, #161b22 0%, #1c2128 100%)'
+            : 'linear-gradient(135deg, #ffffff 0%, #f9fafb 100%)',
+          border: `1px solid ${darkMode ? '#30363d' : '#d0d7de'}`,
+          borderRadius: px(7),
+          padding: 0,
+          cursor: 'pointer',
+          overflow: 'hidden',
+          position: 'relative',
+          flexShrink: 0,
+        }}>
+        {/* Left accent bar */}
+        <div style={{
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          bottom: 0,
+          width: Math.max(2, px(3)),
+          background: `linear-gradient(180deg, ${col.color}, ${col.color}80)`,
+          borderRadius: `${px(7)}px 0 0 ${px(7)}px`,
+        }} />
+
+        <div style={{ padding: `${px(6)}px ${px(7)}px ${px(6)}px ${px(9)}px` }}>
+          {/* Title */}
+          <div style={{
+            fontWeight: 600,
+            lineHeight: 1.35,
+            color: textColor,
+            fontSize: px(12, 8),
+            marginBottom: px(6),
+            wordBreak: 'break-word',
+          }}>
+            <HighlightText
+              text={task.title.replace(/^Phase \d+: /, '')}
+              query={searchQuery}
+              color="#58a6ff"
+            />
+          </div>
+
+          {/* Contextual description */}
+          {task.description && (
+            <div style={{
+              fontSize: px(10, 7),
+              color: subText,
+              lineHeight: 1.4,
+              marginTop: -px(2),
+              marginBottom: px(6),
+              wordBreak: 'break-word',
+              display: '-webkit-box',
+              WebkitLineClamp: 3,
+              WebkitBoxOrient: 'vertical',
+              overflow: 'hidden',
+            }}>
+              <HighlightText
+                text={task.description}
+                query={searchQuery}
+                color="#58a6ff"
+              />
+            </div>
+          )}
+
+          {/* Meta row */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: px(3),
+          }}>
+            {/* Assignee */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: px(3),
+              flex: 1,
+              minWidth: 0,
+            }}>
+              <div style={{
+                width: px(14, 8),
+                height: px(14, 8),
+                borderRadius: '50%',
+                background: task.assignee
+                  ? `linear-gradient(135deg, ${avatarColor}, ${avatarColor}cc)`
+                  : darkMode ? '#21262d' : '#e1e4e8',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                fontSize: px(6, 4),
+                fontWeight: 700,
+                color: '#fff',
+                flexShrink: 0,
+              }}>
+                {task.assignee ? getInitials(assigneeName) : '?'}
+              </div>
+              <span style={{
+                fontSize: px(8.5, 6),
+                color: subText,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}>
+                {assigneeName}
+              </span>
+            </div>
+
+            {/* Badges */}
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: px(2),
+              flexShrink: 0,
+            }}>
+              <span style={{
+                fontSize: px(7.5, 5),
+                fontWeight: 700,
+                color: priority.color,
+                background: priority.bg,
+                padding: `0 ${px(4)}px`,
+                borderRadius: px(3),
+                textTransform: 'uppercase',
+                lineHeight: `${px(13, 8)}px`,
+              }}>
+                {priority.label}
+              </span>
+              <span style={{
+                fontSize: px(7.5, 5),
+                fontWeight: 700,
+                background: darkMode
+                  ? 'linear-gradient(135deg, #21262d, #30363d)'
+                  : 'linear-gradient(135deg, #e1e4e8, #eaeef2)',
+                color: subText,
+                padding: `0 ${px(4)}px`,
+                borderRadius: px(3),
+                lineHeight: `${px(13, 8)}px`,
+              }}>
+                P{task.phase}
+              </span>
+            </div>
+          </div>
+
+          {/* Dependencies — compact */}
+          {task.dependencies.length > 0 && (
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: px(2),
+              marginTop: px(4),
+              flexWrap: 'wrap',
+            }}>
+              <span style={{
+                fontSize: px(7, 5),
+                color: mutedColor,
+                opacity: 0.6,
+                flexShrink: 0,
+              }}>
+                dep:
+              </span>
+              {task.dependencies.slice(0, 3).map(dep => (
+                <span key={dep} style={{
+                  fontSize: px(7, 5),
+                  color: mutedColor,
+                  background: darkMode ? '#161b2280' : '#f6f8fa',
+                  border: `1px solid ${darkMode ? '#21262d' : '#e1e4e8'}`,
+                  padding: `0 ${px(3)}px`,
+                  borderRadius: px(2),
+                  lineHeight: `${px(12, 8)}px`,
+                  fontFamily: 'monospace',
+                }}>
+                  {dep.replace('task-', '#')}
+                </span>
+              ))}
+              {task.dependencies.length > 3 && (
+                <span style={{ fontSize: px(7, 5), color: mutedColor, opacity: 0.5 }}>
+                  +{task.dependencies.length - 3}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  const renderStack = (item: Extract<RenderItem, { type: 'stack' }>, col: Column) => {
+    const stackId = `${col.key}:${item.group}`;
+    const expanded = !!expandedStacks[stackId];
+    const config = STACK_CONFIG[item.group] || { label: 'Cards', newestFirst: true };
+    const label = config.label;
+    const count = item.tasks.length;
+    // Newest-first stacks preview the latest card; ordered stacks (e.g. the
+    // pipeline team) preview the next stage and keep their natural order.
+    const preview = config.newestFirst
+      ? item.tasks[item.tasks.length - 1]
+      : item.tasks[0];
+    const expandedTasks = config.newestFirst
+      ? item.tasks.slice().reverse()
+      : item.tasks;
+    const layerBg = darkMode ? '#161b22' : '#eaeef2';
+    const layerBorder = darkMode ? '#30363d' : '#d0d7de';
+    const toggle = () => setExpandedStacks(s => ({ ...s, [stackId]: !s[stackId] }));
+
+    if (expanded) {
+      return (
+        <div key={stackId} style={{
+          display: 'flex',
+          flexDirection: 'column',
+          gap: px(5),
+          flexShrink: 0,
+          borderLeft: `2px solid ${col.color}50`,
+          paddingLeft: px(4),
+          marginLeft: -px(2),
+        }}>
+          <button
+            type="button"
+            onClick={toggle}
+            title={`Collapse ${label.toLowerCase()}`}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: px(5),
+              background: 'none',
+              border: 'none',
+              padding: `${px(2)}px ${px(2)}px`,
+              cursor: 'pointer',
+              color: col.color,
+              fontSize: px(9, 6),
+              fontWeight: 800,
+              letterSpacing: '0.06em',
+              textTransform: 'uppercase',
+            }}
+          >
+            <span aria-hidden style={{ fontSize: px(8, 5) }}>▾</span>
+            {label} · {count}
+            <span style={{
+              marginLeft: 'auto',
+              fontWeight: 600,
+              textTransform: 'none',
+              letterSpacing: 0,
+              color: mutedColor,
+            }}>
+              collapse
+            </span>
+          </button>
+          {expandedTasks.map(t => renderCard(t, col))}
+        </div>
+      );
+    }
+
+    const previewLines = (preview.description || '').split('\n').slice(0, 2);
+    return (
+      <div key={stackId} style={{ position: 'relative', flexShrink: 0, paddingBottom: px(7) }}>
+        {/* Back layers of the stack */}
+        <div style={{
+          position: 'absolute',
+          left: px(8),
+          right: px(8),
+          bottom: 0,
+          height: px(16),
+          background: layerBg,
+          border: `1px solid ${layerBorder}`,
+          borderRadius: px(7),
+          opacity: 0.5,
+        }} />
+        <div style={{
+          position: 'absolute',
+          left: px(4),
+          right: px(4),
+          bottom: px(4),
+          height: px(16),
+          background: layerBg,
+          border: `1px solid ${layerBorder}`,
+          borderRadius: px(7),
+          opacity: 0.75,
+        }} />
+        <div
+          className="kanban-task-card"
+          role="button"
+          tabIndex={0}
+          title={`Show all ${count} ${label.toLowerCase()}`}
+          onClick={toggle}
+          onKeyDown={e => {
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggle();
+            }
+          }}
+          style={{
+            position: 'relative',
+            background: darkMode
+              ? 'linear-gradient(135deg, #161b22 0%, #1c2128 100%)'
+              : 'linear-gradient(135deg, #ffffff 0%, #f9fafb 100%)',
+            border: `1px solid ${darkMode ? '#30363d' : '#d0d7de'}`,
+            borderRadius: px(7),
+            cursor: 'pointer',
+            overflow: 'hidden',
+          }}
+        >
+          <div style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            bottom: 0,
+            width: Math.max(2, px(3)),
+            background: `linear-gradient(180deg, ${col.color}, ${col.color}80)`,
+          }} />
+          <div style={{ padding: `${px(6)}px ${px(7)}px ${px(6)}px ${px(9)}px` }}>
+            <div style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: px(5),
+              marginBottom: px(4),
+            }}>
+              <span style={{
+                fontSize: px(9, 6),
+                fontWeight: 800,
+                letterSpacing: '0.06em',
+                textTransform: 'uppercase',
+                color: col.color,
+              }}>
+                {label}
+              </span>
+              <span style={{
+                fontSize: px(8.5, 6),
+                fontWeight: 700,
+                background: `${col.color}18`,
+                color: col.color,
+                padding: `0 ${px(5)}px`,
+                borderRadius: px(8),
+                lineHeight: `${px(14)}px`,
+              }}>
+                {count}
+              </span>
+              <span aria-hidden style={{
+                marginLeft: 'auto',
+                fontSize: px(8, 5),
+                color: mutedColor,
+              }}>
+                ▸
+              </span>
+            </div>
+            <div style={{
+              fontWeight: 600,
+              fontSize: px(11, 7.5),
+              color: textColor,
+              lineHeight: 1.35,
+              whiteSpace: 'nowrap',
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              marginBottom: px(3),
+            }}>
+              {preview.title}
+            </div>
+            {previewLines.map((line, i) => line && (
+              <div key={i} style={{
+                fontSize: px(9, 6),
+                color: subText,
+                lineHeight: 1.4,
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                fontVariantNumeric: 'tabular-nums',
+              }}>
+                {line}
+              </div>
+            ))}
+            <div style={{
+              marginTop: px(4),
+              fontSize: px(8, 5.5),
+              color: mutedColor,
+            }}>
+              {config.newestFirst ? 'Latest shown' : 'Next stage shown'} · click to expand {count - 1} more
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   return (
     <div style={{
@@ -484,287 +1015,11 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                 flexDirection: 'column',
                 gap: px(5),
               }}>
-                {colTasks.map(task => {
-                  const priority = priorityConfig[task.priority] || priorityConfig.low;
-                  const assigneeName = task.assignee ? (agentMap.get(task.assignee) || task.assignee) : '—';
-                  const avatarColor = getAvatarColor(assigneeName);
-                  const isPastRun = task.kind === 'past_run'
-                    || task.id.startsWith('run-');
-
-                  if (isPastRun) {
-                    return (
-                      <div
-                        key={task.id}
-                        className="kanban-task-card kanban-past-run-card"
-                        title="Click for details"
-                        role="button"
-                        tabIndex={0}
-                        onClick={() => setSelectedTask(task)}
-                        onKeyDown={e => {
-                          if (e.key === 'Enter' || e.key === ' ') {
-                            e.preventDefault();
-                            setSelectedTask(task);
-                          }
-                        }}
-                        style={{
-                          background: darkMode ? '#0d1117' : '#f6f8fa',
-                          border: `1px solid ${darkMode ? '#21262d' : '#d8dee4'}`,
-                          borderRadius: px(6),
-                          padding: `${px(5)}px ${px(7)}px`,
-                          cursor: 'pointer',
-                          flexShrink: 0,
-                          opacity: 0.92,
-                        }}
-                      >
-                        <div style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: px(6),
-                          minWidth: 0,
-                        }}>
-                          <span style={{
-                            fontSize: px(8, 5.5),
-                            fontWeight: 800,
-                            letterSpacing: '0.06em',
-                            textTransform: 'uppercase',
-                            color: darkMode ? '#3fb950' : '#1a7f37',
-                            flexShrink: 0,
-                          }}>
-                            Prior
-                          </span>
-                          <span style={{
-                            fontSize: px(10, 7),
-                            fontWeight: 600,
-                            color: textColor,
-                            whiteSpace: 'nowrap',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            minWidth: 0,
-                          }}>
-                            <HighlightText
-                              text={task.title}
-                              query={searchQuery}
-                              color="#58a6ff"
-                            />
-                          </span>
-                        </div>
-                        {task.description && (
-                          <div style={{
-                            marginTop: px(3),
-                            fontSize: px(8.5, 6),
-                            color: subText,
-                            whiteSpace: 'nowrap',
-                            overflow: 'hidden',
-                            textOverflow: 'ellipsis',
-                            fontVariantNumeric: 'tabular-nums',
-                          }}>
-                            <HighlightText
-                              text={task.description}
-                              query={searchQuery}
-                              color="#58a6ff"
-                            />
-                          </div>
-                        )}
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div
-                      key={task.id}
-                      className="kanban-task-card"
-                      title="Click for details"
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => setSelectedTask(task)}
-                      onKeyDown={e => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault();
-                          setSelectedTask(task);
-                        }
-                      }}
-                      style={{
-                        background: darkMode
-                          ? 'linear-gradient(135deg, #161b22 0%, #1c2128 100%)'
-                          : 'linear-gradient(135deg, #ffffff 0%, #f9fafb 100%)',
-                        border: `1px solid ${darkMode ? '#30363d' : '#d0d7de'}`,
-                        borderRadius: px(7),
-                        padding: 0,
-                        cursor: 'pointer',
-                        overflow: 'hidden',
-                        position: 'relative',
-                        flexShrink: 0,
-                      }}>
-                      {/* Left accent bar */}
-                      <div style={{
-                        position: 'absolute',
-                        left: 0,
-                        top: 0,
-                        bottom: 0,
-                        width: Math.max(2, px(3)),
-                        background: `linear-gradient(180deg, ${col.color}, ${col.color}80)`,
-                        borderRadius: `${px(7)}px 0 0 ${px(7)}px`,
-                      }} />
-
-                      <div style={{ padding: `${px(6)}px ${px(7)}px ${px(6)}px ${px(9)}px` }}>
-                        {/* Title */}
-                        <div style={{
-                          fontWeight: 600,
-                          lineHeight: 1.35,
-                          color: textColor,
-                          fontSize: px(12, 8),
-                          marginBottom: px(6),
-                          wordBreak: 'break-word',
-                        }}>
-                          <HighlightText
-                            text={task.title.replace(/^Phase \d+: /, '')}
-                            query={searchQuery}
-                            color="#58a6ff"
-                          />
-                        </div>
-
-                        {/* Contextual description */}
-                        {task.description && (
-                          <div style={{
-                            fontSize: px(10, 7),
-                            color: subText,
-                            lineHeight: 1.4,
-                            marginTop: -px(2),
-                            marginBottom: px(6),
-                            wordBreak: 'break-word',
-                            display: '-webkit-box',
-                            WebkitLineClamp: 3,
-                            WebkitBoxOrient: 'vertical',
-                            overflow: 'hidden',
-                          }}>
-                            <HighlightText
-                              text={task.description}
-                              query={searchQuery}
-                              color="#58a6ff"
-                            />
-                          </div>
-                        )}
-
-                        {/* Meta row */}
-                        <div style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          justifyContent: 'space-between',
-                          gap: px(3),
-                        }}>
-                          {/* Assignee */}
-                          <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: px(3),
-                            flex: 1,
-                            minWidth: 0,
-                          }}>
-                            <div style={{
-                              width: px(14, 8),
-                              height: px(14, 8),
-                              borderRadius: '50%',
-                              background: task.assignee
-                                ? `linear-gradient(135deg, ${avatarColor}, ${avatarColor}cc)`
-                                : darkMode ? '#21262d' : '#e1e4e8',
-                              display: 'flex',
-                              alignItems: 'center',
-                              justifyContent: 'center',
-                              fontSize: px(6, 4),
-                              fontWeight: 700,
-                              color: '#fff',
-                              flexShrink: 0,
-                            }}>
-                              {task.assignee ? getInitials(assigneeName) : '?'}
-                            </div>
-                            <span style={{
-                              fontSize: px(8.5, 6),
-                              color: subText,
-                              whiteSpace: 'nowrap',
-                              overflow: 'hidden',
-                              textOverflow: 'ellipsis',
-                            }}>
-                              {assigneeName}
-                            </span>
-                          </div>
-
-                          {/* Badges */}
-                          <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: px(2),
-                            flexShrink: 0,
-                          }}>
-                            <span style={{
-                              fontSize: px(7.5, 5),
-                              fontWeight: 700,
-                              color: priority.color,
-                              background: priority.bg,
-                              padding: `0 ${px(4)}px`,
-                              borderRadius: px(3),
-                              textTransform: 'uppercase',
-                              lineHeight: `${px(13, 8)}px`,
-                            }}>
-                              {priority.label}
-                            </span>
-                            <span style={{
-                              fontSize: px(7.5, 5),
-                              fontWeight: 700,
-                              background: darkMode
-                                ? 'linear-gradient(135deg, #21262d, #30363d)'
-                                : 'linear-gradient(135deg, #e1e4e8, #eaeef2)',
-                              color: subText,
-                              padding: `0 ${px(4)}px`,
-                              borderRadius: px(3),
-                              lineHeight: `${px(13, 8)}px`,
-                            }}>
-                              P{task.phase}
-                            </span>
-                          </div>
-                        </div>
-
-                        {/* Dependencies — compact */}
-                        {task.dependencies.length > 0 && (
-                          <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: px(2),
-                            marginTop: px(4),
-                            flexWrap: 'wrap',
-                          }}>
-                            <span style={{
-                              fontSize: px(7, 5),
-                              color: mutedColor,
-                              opacity: 0.6,
-                              flexShrink: 0,
-                            }}>
-                              dep:
-                            </span>
-                            {task.dependencies.slice(0, 3).map(dep => (
-                              <span key={dep} style={{
-                                fontSize: px(7, 5),
-                                color: mutedColor,
-                                background: darkMode ? '#161b2280' : '#f6f8fa',
-                                border: `1px solid ${darkMode ? '#21262d' : '#e1e4e8'}`,
-                                padding: `0 ${px(3)}px`,
-                                borderRadius: px(2),
-                                lineHeight: `${px(12, 8)}px`,
-                                fontFamily: 'monospace',
-                              }}>
-                                {dep.replace('task-', '#')}
-                              </span>
-                            ))}
-                            {task.dependencies.length > 3 && (
-                              <span style={{ fontSize: px(7, 5), color: mutedColor, opacity: 0.5 }}>
-                                +{task.dependencies.length - 3}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
+                {buildRenderItems(colTasks, searchQuery !== '').map(item => (
+                  item.type === 'stack'
+                    ? renderStack(item, col)
+                    : renderCard(item.task, col)
+                ))}
 
                 {colTasks.length === 0 && (
                   <div style={{

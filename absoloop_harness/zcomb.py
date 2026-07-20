@@ -15,6 +15,7 @@ URL: http://localhost:3141. See ``zcomb/README.md``.
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -1847,6 +1848,144 @@ def _report_excerpt(path: pathlib.Path, limit: int = 700) -> str:
     return blob
 
 
+_STOP_REASON_LABELS = {
+    "cost_budget": "cost budget hit",
+    "wall_clock_budget": "wall-clock budget hit",
+    "iteration_budget": "iteration budget hit",
+    "accepted_pending_human_gate": "awaiting human gate",
+    "repeated_failures": "repeated failures",
+}
+
+
+def _parse_report_insights(path: pathlib.Path) -> dict:
+    """Distill an Absoloop report.md into card-ready data points.
+
+    Extracts the at-a-glance metrics, the changed-files footprint, and a
+    human outcome line from the run-arc tail so Kanban cards can show
+    signal instead of raw markdown.
+    """
+    if not path.is_file():
+        return {}
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return {}
+    out: dict = {}
+
+    m = re.search(r"^> Generated (.+)$", text, re.MULTILINE)
+    if m:
+        raw = m.group(1).strip()
+        out["generatedAt"] = raw
+        try:
+            dt = datetime.datetime.strptime(raw, "%Y-%m-%d %H:%M")
+            out["generatedShort"] = dt.strftime("%b %d %H:%M")
+        except ValueError:
+            out["generatedShort"] = raw
+
+    m = re.search(
+        r"^\|\s*Iterations\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|", text, re.MULTILINE)
+    if m:
+        out["iterationsUsed"] = int(m.group(1))
+        out["iterationsBudget"] = int(m.group(2))
+    m = re.search(
+        r"^\|\s*Spend\s*\|\s*\$([\d.,]+)(?:\s*\(([^)]*)\))?\s*\|\s*\$([\d.,]+)",
+        text, re.MULTILINE)
+    if m:
+        try:
+            out["spendUsd"] = float(m.group(1).replace(",", ""))
+            out["budgetUsd"] = float(m.group(3).replace(",", ""))
+        except ValueError:
+            pass
+        if m.group(2):
+            out["tokens"] = m.group(2).strip()
+
+    cf = re.search(
+        r"^## Changed files\s*$(.*?)(?=^## |\Z)", text,
+        re.MULTILINE | re.DOTALL)
+    if cf:
+        files = re.findall(r"^- `([^`]+)`", cf.group(1), re.MULTILINE)
+        if files:
+            out["filesChanged"] = len(files)
+            areas: dict[str, int] = {}
+            for f in files:
+                parts = f.split("/")
+                if len(parts) > 2:
+                    area = "/".join(parts[:2])
+                elif len(parts) == 2:
+                    area = parts[0]
+                else:
+                    area = parts[0]
+                areas[area] = areas.get(area, 0) + 1
+            top = sorted(areas.items(), key=lambda kv: (-kv[1], kv[0]))[:3]
+            out["areas"] = [a for a, _ in top]
+
+    arc = re.search(
+        r"^## Run arc\s*$(.*?)(?=^## |\Z)", text, re.MULTILINE | re.DOTALL)
+    if arc:
+        events = [
+            ln.strip() for ln in arc.group(1).splitlines()
+            if ln.strip().startswith("- ")
+        ]
+        approved = any("Human gate · approved" in e for e in events)
+        delivered = any("Delivered" in e for e in events)
+        rejected = any("Human gate · rejected" in e for e in events)
+        stop = next((e for e in reversed(events) if "Stop ·" in e), "")
+        if approved and delivered:
+            out["outcome"] = "Approved & delivered"
+        elif approved:
+            out["outcome"] = "Human-approved"
+        elif rejected:
+            out["outcome"] = "Rejected at human gate"
+        elif stop:
+            sm = re.search(r"Stop · ([A-Z_]+)\*{0,2}\s*(?:—|-)\s*(\S+)", stop)
+            if sm:
+                status_word = sm.group(1).replace("_", " ").title()
+                reason = _STOP_REASON_LABELS.get(
+                    sm.group(2), sm.group(2).replace("_", " "))
+                out["outcome"] = (
+                    f"{status_word} — {reason}"
+                    if reason and reason.lower() not in status_word.lower()
+                    else status_word
+                )
+    return out
+
+
+def _report_card_lines(
+    insights: dict,
+    fallback_status: str,
+    title_outcome: str = "",
+) -> list[str]:
+    """Two concise data-point lines for a report/past-run card face.
+
+    ``title_outcome`` is the outcome text already visible in the card
+    title — skipped here so the face doesn't repeat itself.
+    """
+    outcome = insights.get("outcome") or fallback_status
+    line1_bits = []
+    if outcome and outcome != title_outcome:
+        line1_bits.append(outcome)
+    used = insights.get("iterationsUsed")
+    if used is not None:
+        budget = insights.get("iterationsBudget")
+        line1_bits.append(f"{used}/{budget} iters" if budget else f"{used} iters")
+    spend = insights.get("spendUsd")
+    if spend:
+        line1_bits.append(f"${spend:.2f}")
+    files = insights.get("filesChanged")
+    if files:
+        line1_bits.append(f"{files} file" + ("s" if files != 1 else ""))
+    lines = [" · ".join(line1_bits)] if line1_bits else []
+    line2_bits = []
+    areas = insights.get("areas") or []
+    if areas:
+        line2_bits.append(", ".join(areas))
+    if insights.get("generatedShort"):
+        line2_bits.append(insights["generatedShort"])
+    if line2_bits:
+        lines.append(" · ".join(line2_bits))
+    return lines
+
+
 def _discover_report_archives(abs_dir: pathlib.Path) -> list[dict]:
     """Loop report archives from ``reports/`` and ``runs/*/report.md``."""
     found: dict[str, dict] = {}
@@ -1926,18 +2065,19 @@ def _report_archive_tasks(
     cards: list[dict] = []
     for index, row in enumerate(_discover_report_archives(abs_dir), start=1):
         loop_id = row["loopId"]
-        excerpt = _report_excerpt(row["path"])
         status = (row.get("status") or "").replace("_", " ").title() or "Archived"
         objective = " ".join(str(row.get("objective") or "").split())
-        # Lead with what the mission was about, not the raw loop id.
-        gist = _gist(objective, 52)
-        title = f"Report · {gist}" if gist else f"Report #{index} · {status}"
-        bits = [f"Report #{index}", status]
+        insights = _parse_report_insights(row["path"])
+        outcome = insights.get("outcome") or status
+        title = f"Report #{index} · {_gist(outcome, 42)}"
+        # Card face: distilled data points, then searchable tail (clamped
+        # away on the board, still hit by search).
+        desc_parts = _report_card_lines(insights, status, title_outcome=outcome)
+        tail_bits = [loop_id]
         if objective:
-            bits.append(_gist(objective, 80))
-        # Keep the loop id searchable but out of the headline.
-        bits.append(loop_id)
-        desc_parts = [" · ".join(bits)]
+            tail_bits.append(_gist(objective, 100))
+        desc_parts.append(" · ".join(tail_bits))
+        excerpt = _report_excerpt(row["path"])
         if excerpt:
             desc_parts.append(excerpt)
         html_path = row.get("html")
@@ -1956,8 +2096,17 @@ def _report_archive_tasks(
             details={
                 "loopId": loop_id,
                 "statusLabel": status,
+                "outcome": outcome,
                 "objective": objective,
                 "missionId": str(row.get("missionId") or ""),
+                "iterations": insights.get("iterationsUsed"),
+                "maxIterations": insights.get("iterationsBudget"),
+                "costUsd": insights.get("spendUsd"),
+                "budgetUsd": insights.get("budgetUsd"),
+                "tokens": insights.get("tokens"),
+                "filesChanged": insights.get("filesChanged"),
+                "areas": insights.get("areas"),
+                "generatedAt": insights.get("generatedAt"),
                 "excerpt": _report_excerpt(row["path"], limit=1600),
                 "reportUrl": f"/api/report/{loop_id}",
                 "reportFormat": "html" if has_html else "md",
@@ -1993,20 +2142,24 @@ def _past_run_tasks(
             label = status_u.replace("_", " ").title() or "Archived"
         title = f"Loop {index} · {label}"
         iters = int(row["iteration"] or 0)
-        bits = [f"{iters} iter" + ("s" if iters != 1 else "")]
-        if row["costUsd"]:
-            bits.append(f"${row['costUsd']:.2f}")
         focus = " ".join(str(row.get("focus") or "").split())
-        if focus:
-            bits.append(focus[:48] + ("…" if len(focus) > 48 else ""))
         # Fold report body into description so Task Board search finds it.
         report_md = abs_dir / "runs" / loop_id / "report.md"
         if not report_md.is_file():
             report_md = abs_dir / "reports" / loop_id / "report.md"
+        insights = _parse_report_insights(report_md)
+        if not insights.get("iterationsUsed") and iters:
+            insights["iterationsUsed"] = iters
+        if not insights.get("spendUsd") and row["costUsd"]:
+            insights["spendUsd"] = float(row["costUsd"])
+        desc_lines = _report_card_lines(insights, label)
+        if focus:
+            desc_lines.append(f"Focus: {_gist(focus, 90)}")
         excerpt = _report_excerpt(report_md)
-        desc = " · ".join(bits)
+        desc_lines.append(loop_id)
         if excerpt:
-            desc = f"{desc}\n{excerpt}"
+            desc_lines.append(excerpt)
+        desc = "\n".join(desc_lines)
         created = _iso(row.get("startedAt")) if row.get("startedAt") else now
         report_html = abs_dir / "runs" / loop_id / "report.html"
         if not report_html.is_file():
@@ -2026,8 +2179,16 @@ def _past_run_tasks(
             details={
                 "loopId": loop_id,
                 "statusLabel": label,
-                "iterations": iters,
-                "costUsd": round(float(row["costUsd"] or 0), 2) or None,
+                "outcome": insights.get("outcome") or label,
+                "iterations": insights.get("iterationsUsed") or iters,
+                "maxIterations": insights.get("iterationsBudget"),
+                "costUsd": insights.get("spendUsd")
+                or (round(float(row["costUsd"] or 0), 2) or None),
+                "budgetUsd": insights.get("budgetUsd"),
+                "tokens": insights.get("tokens"),
+                "filesChanged": insights.get("filesChanged"),
+                "areas": insights.get("areas"),
+                "generatedAt": insights.get("generatedAt"),
                 "focus": focus,
                 "excerpt": _report_excerpt(report_md, limit=1600),
                 "reportUrl": f"/api/report/{loop_id}" if has_report else "",

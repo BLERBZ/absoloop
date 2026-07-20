@@ -812,13 +812,15 @@ class BridgeStateTests(unittest.TestCase):
                 f"{t.get('title')} {t.get('description')}" for t in reports)
             self.assertIn("UniqueNeedlePhrase", blob)
             self.assertIn("loop-old", blob)
-            # Titles lead with the objective, not the raw loop id; the modal
-            # detail payload carries the loop id and a report deep-link.
+            # Titles lead with the distilled outcome, not the raw loop id;
+            # the modal detail payload carries the loop id, objective, and a
+            # report deep-link.
             card = next(t for t in reports if t["id"] == "report-loop-old")
             self.assertNotIn("loop-old", card["title"])
-            self.assertIn("Prior loop focus", card["title"])
+            self.assertIn("Completed", card["title"])
             details = card.get("details") or {}
             self.assertEqual(details.get("loopId"), "loop-old")
+            self.assertEqual(details.get("objective"), "Prior loop focus")
             self.assertEqual(details.get("reportUrl"), "/api/report/loop-old")
             self.assertEqual(details.get("statusLabel"), "Completed")
 

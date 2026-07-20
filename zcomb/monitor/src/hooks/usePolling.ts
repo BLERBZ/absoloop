@@ -18,7 +18,15 @@ export interface TaskDetails {
   iteration?: number;
   maxIterations?: number;
   costUsd?: number;
+  budgetUsd?: number;
+  tokens?: string;
   statusLabel?: string;
+  /** Distilled run outcome, e.g. "Approved & delivered". */
+  outcome?: string;
+  filesChanged?: number;
+  /** Top changed directories, e.g. ["apps/web", "apps/desktop"]. */
+  areas?: string[];
+  generatedAt?: string;
   focus?: string;
   iterations?: number;
   excerpt?: string;

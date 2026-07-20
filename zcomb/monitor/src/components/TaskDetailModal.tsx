@@ -90,6 +90,7 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
 
   const iterationCount = details.iterations ?? details.iteration;
   const dataPoints: { label: string; value: string; mono?: boolean }[] = [
+    ...(details.outcome ? [{ label: 'Outcome', value: details.outcome }] : []),
     { label: 'Assignee', value: assigneeName || '—' },
     { label: 'Priority', value: priority.label },
     { label: 'Phase', value: `P${task.phase}` },
@@ -102,8 +103,24 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
             : String(iterationCount),
         }]
       : []),
-    ...(details.costUsd ? [{ label: 'Cost', value: `$${details.costUsd.toFixed(2)}` }] : []),
-    ...(details.statusLabel ? [{ label: 'Run status', value: details.statusLabel }] : []),
+    ...(details.costUsd
+      ? [{
+          label: 'Spend',
+          value: details.budgetUsd
+            ? `$${details.costUsd.toFixed(2)} of $${details.budgetUsd.toFixed(2)}`
+            : `$${details.costUsd.toFixed(2)}`,
+        }]
+      : []),
+    ...(details.tokens ? [{ label: 'Tokens', value: details.tokens }] : []),
+    ...(details.filesChanged
+      ? [{ label: 'Files changed', value: String(details.filesChanged) }]
+      : []),
+    ...(details.statusLabel && details.statusLabel !== details.outcome
+      ? [{ label: 'Run status', value: details.statusLabel }]
+      : []),
+    ...(details.generatedAt
+      ? [{ label: 'Report generated', value: details.generatedAt }]
+      : []),
     { label: 'Created', value: formatTimestamp(task.createdAt) },
     { label: 'Updated', value: formatTimestamp(task.updatedAt) },
   ];
@@ -294,6 +311,28 @@ export function TaskDetailModal({ task, assigneeName, darkMode, onClose }: {
                 wordBreak: 'break-word',
               }}>
                 {details.objective}
+              </div>
+            </div>
+          )}
+
+          {/* Top changed areas */}
+          {details.areas && details.areas.length > 0 && (
+            <div style={{ marginBottom: 16 }}>
+              {sectionLabel('Most changed areas')}
+              <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                {details.areas.map(area => (
+                  <span key={area} style={{
+                    fontSize: 11,
+                    color: subText,
+                    background: insetBg,
+                    border: `1px solid ${darkMode ? '#21262d' : '#e1e4e8'}`,
+                    padding: '2px 8px',
+                    borderRadius: 5,
+                    fontFamily: 'monospace',
+                  }}>
+                    {area}
+                  </span>
+                ))}
               </div>
             </div>
           )}
