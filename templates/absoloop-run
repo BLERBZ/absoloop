@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -663,6 +664,59 @@ def grok_stream_events(line: str) -> list[tuple[str, str]]:
     return []
 
 
+def _summary_from_result_blob(text: str) -> str:
+    """If text is a done/summary JSON result blob, return just the summary.
+
+    Codex often prints the structured mission result as an agent_message.
+    Prefer the human summary over the raw JSON wrapper in watch/ZComb.
+    """
+    blob = text.strip()
+    if not blob.startswith("{"):
+        return ""
+    data: Any = None
+    try:
+        data = json.loads(blob)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            data, _ = json.JSONDecoder().raw_decode(blob)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+    if isinstance(data, dict) and "done" in data and "summary" in data:
+        return str(data.get("summary") or "").strip()
+    # Truncated mid-feed: {"done":false,"summary":"partial…
+    match = re.match(
+        r'^\s*\{\s*"done"\s*:\s*(?:true|false)\s*,\s*"summary"\s*:\s*"(.*)$',
+        blob,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return ""
+    rest = match.group(1)
+    chars: list[str] = []
+    escaped = False
+    for ch in rest:
+        if escaped:
+            if ch == "n":
+                chars.append("\n")
+            elif ch == "t":
+                chars.append("\t")
+            elif ch == '"':
+                chars.append('"')
+            elif ch == "\\":
+                chars.append("\\")
+            else:
+                chars.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            break
+        chars.append(ch)
+    return "".join(chars).strip()
+
+
 def codex_stream_events(line: str) -> list[tuple[str, str]]:
     """(kind, detail) narration for one codex --json event line."""
     try:
@@ -689,6 +743,9 @@ def codex_stream_events(line: str) -> list[tuple[str, str]]:
         if itype in ("agent_message", "reasoning"):
             text = " ".join(_first_of(item, "text", "summary").split())
             if text:
+                plain = _summary_from_result_blob(text)
+                if plain:
+                    text = plain
                 kind = "say" if itype == "agent_message" else "think"
                 return [(kind, text)]
         if itype in ("mcp_tool_call", "web_search"):

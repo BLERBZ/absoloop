@@ -129,6 +129,29 @@ class BridgeStateTests(unittest.TestCase):
             self.assertEqual(len(shell), 1)
             self.assertNotIn("2>&1", shell[0]["message"])
 
+    def test_say_strips_codex_done_summary_json(self):
+        full = json.dumps({
+            "done": False,
+            "summary": "Starting a bounded parity slice",
+            "changed_artifacts": [],
+            "risks": ["none"],
+        }, separators=(",", ":"))
+        self.assertEqual(
+            zcomb._humanize_activity("say", full),
+            "Starting a bounded parity slice",
+        )
+        truncated = (
+            '{"done":false,"summary":"I\'m starting with a bounded parity '
+            "slice: inspect the current desktop/web gap"
+        )
+        cleaned = zcomb._humanize_activity("say", truncated)
+        self.assertTrue(cleaned.startswith("I'm starting with a bounded"))
+        self.assertNotIn('{"done"', cleaned)
+        self.assertEqual(
+            zcomb._humanize_activity("say", "plain progress note"),
+            "plain progress note",
+        )
+
     def test_quirky_names_are_deterministic_and_themed(self):
         name1 = zcomb.quirky_teammate_name("Independent critic of mission")
         name2 = zcomb.quirky_teammate_name("Independent critic of mission")

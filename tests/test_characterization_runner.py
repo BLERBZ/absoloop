@@ -60,6 +60,20 @@ class CodexStreamEvents(unittest.TestCase):
         line = json.dumps({"type": "error", "message": "boom"})
         self.assertEqual(run.codex_stream_events(line), [("error", "boom")])
 
+    def test_agent_message_strips_done_summary_json(self):
+        blob = json.dumps({
+            "done": False,
+            "summary": "Starting a bounded parity slice",
+            "changed_artifacts": [],
+            "risks": [],
+        }, separators=(",", ":"))
+        line = json.dumps({"type": "item.completed", "item": {
+            "item_type": "agent_message", "text": blob}})
+        self.assertEqual(
+            run.codex_stream_events(line),
+            [("say", "Starting a bounded parity slice")],
+        )
+
 
 class Fingerprints(unittest.TestCase):
     def test_normalized_fingerprint_is_line_order_insensitive(self):

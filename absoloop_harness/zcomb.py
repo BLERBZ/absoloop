@@ -1588,9 +1588,67 @@ def _humanize_structured_output(payload: str) -> str:
     return "Reported structured results"
 
 
+# Codex (and occasionally Grok) emit the mission result JSON as a say line.
+# Activity truncates to ~240 chars, so the blob is often incomplete.
+_DONE_SUMMARY_PREFIX = re.compile(
+    r'^\s*\{\s*"done"\s*:\s*(?:true|false)\s*,\s*"summary"\s*:\s*"',
+    re.IGNORECASE,
+)
+
+
+def _summary_from_result_blob(detail: str) -> Optional[str]:
+    """Return the human summary from a done/summary JSON blob, if present."""
+    text = detail.strip()
+    if not text.startswith("{"):
+        return None
+    data: Any = None
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        try:
+            data, _ = json.JSONDecoder().raw_decode(text)
+        except (json.JSONDecodeError, TypeError):
+            data = None
+    if isinstance(data, dict) and "done" in data and "summary" in data:
+        summary = str(data.get("summary") or "").strip()
+        return summary or None
+    match = _DONE_SUMMARY_PREFIX.match(text)
+    if not match:
+        return None
+    rest = text[match.end():]
+    chars: list[str] = []
+    escaped = False
+    for ch in rest:
+        if escaped:
+            if ch == "n":
+                chars.append("\n")
+            elif ch == "t":
+                chars.append("\t")
+            elif ch == '"':
+                chars.append('"')
+            elif ch == "\\":
+                chars.append("\\")
+            else:
+                chars.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            break
+        chars.append(ch)
+    summary = "".join(chars).strip()
+    return summary or None
+
+
 def _humanize_activity(kind: str, detail: str) -> str:
     """Turn raw narration lines into readable activity-feed messages."""
     detail = detail.strip()
+    if kind in ("say", "think", "verdict"):
+        summary = _summary_from_result_blob(detail)
+        if summary:
+            return summary
     if kind != "tool" or ": " not in detail:
         return detail
     tool, _, rest = detail.partition(": ")
