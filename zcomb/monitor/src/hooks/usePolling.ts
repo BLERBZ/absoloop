@@ -9,6 +9,25 @@ export interface Agent {
   metrics: { tasksCompleted: number; errors: number };
 }
 
+/** Structured card detail emitted by the bridge for the expand modal. */
+export interface TaskDetails {
+  loopId?: string;
+  missionId?: string;
+  objective?: string;
+  engine?: string;
+  iteration?: number;
+  maxIterations?: number;
+  costUsd?: number;
+  statusLabel?: string;
+  focus?: string;
+  iterations?: number;
+  excerpt?: string;
+  nowLine?: string;
+  /** Same-origin URL serving the loop's report (HTML or Markdown). */
+  reportUrl?: string;
+  reportFormat?: 'html' | 'md' | string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -22,6 +41,7 @@ export interface Task {
   description?: string;
   /** Compact session past-loop card in Done. */
   kind?: 'past_run' | string;
+  details?: TaskDetails;
 }
 
 export interface Activity {

@@ -634,6 +634,67 @@ app.post('/api/actions/:action', async (req, res) => {
   }
 });
 
+/**
+ * Serve an archived loop report (HTML preferred, Markdown fallback) so the
+ * Kanban card detail modal can deep-link into mission reports.
+ */
+app.get('/api/report/:loopId', (req, res) => {
+  const loopId = String(req.params.loopId || '').trim();
+  if (!/^[A-Za-z0-9._-]{1,120}$/.test(loopId) || loopId.includes('..')) {
+    res.status(400).json({ ok: false, error: 'invalid loop id' });
+    return;
+  }
+  const absDir = join(resolveProjectRoot(), '.absoloop');
+  const candidates = [
+    join(absDir, 'reports', loopId, 'report.html'),
+    join(absDir, 'runs', loopId, 'report.html'),
+    join(absDir, 'reports', loopId, 'report.md'),
+    join(absDir, 'runs', loopId, 'report.md'),
+  ];
+
+  // Archive dirs whose meta.json loopId differs from the directory name.
+  const reportsRoot = join(absDir, 'reports');
+  if (existsSync(reportsRoot)) {
+    try {
+      for (const name of readdirSync(reportsRoot)) {
+        const metaPath = join(reportsRoot, name, 'meta.json');
+        if (!existsSync(metaPath)) continue;
+        try {
+          const meta = JSON.parse(readFileSync(metaPath, 'utf-8'));
+          if (String(meta?.loopId || '').trim() === loopId) {
+            candidates.push(
+              join(reportsRoot, name, 'report.html'),
+              join(reportsRoot, name, 'report.md'),
+            );
+          }
+        } catch { /* skip unreadable meta */ }
+      }
+    } catch { /* ignore scan errors */ }
+  }
+
+  // Live (unarchived) loop — its report sits at the .absoloop root.
+  try {
+    const runtimePath = join(absDir, 'runtime.json');
+    if (existsSync(runtimePath)) {
+      const runtime = JSON.parse(readFileSync(runtimePath, 'utf-8'));
+      if (String(runtime?.loop_id || '').trim() === loopId) {
+        candidates.push(join(absDir, 'report.html'), join(absDir, 'report.md'));
+      }
+    }
+  } catch { /* ignore */ }
+
+  const hit = candidates.find((p) => existsSync(p));
+  if (!hit) {
+    res.status(404).json({ ok: false, error: `no report found for ${loopId}` });
+    return;
+  }
+  if (hit.endsWith('.md')) {
+    res.type('text/plain; charset=utf-8');
+  }
+  // dotfiles must be allowed — reports live under the .absoloop directory.
+  res.sendFile(hit, { dotfiles: 'allow' });
+});
+
 // SPA fallback
 app.get('/{*splat}', (_req, res) => {
   res.sendFile(join(__dirname, 'dist', 'index.html'));

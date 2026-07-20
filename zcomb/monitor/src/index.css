@@ -340,3 +340,35 @@ textarea:focus-visible {
     flex-direction: column;
   }
 }
+
+/* Card detail modal (also used by the keyboard-help overlay) */
+@keyframes modal-backdrop-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes modal-content-scale-in {
+  from { opacity: 0; transform: scale(0.96) translateY(6px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.modal-backdrop-fade-in {
+  animation: modal-backdrop-fade-in 0.16s ease-out both;
+}
+
+.modal-content-scale-in {
+  animation: modal-content-scale-in 0.2s cubic-bezier(0.34, 1.4, 0.64, 1) both;
+}
+
+/* Keyboard focus ring for clickable kanban cards */
+.kanban-task-card:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .modal-backdrop-fade-in,
+  .modal-content-scale-in {
+    animation: none !important;
+  }
+}

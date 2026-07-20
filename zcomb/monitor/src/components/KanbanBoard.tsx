@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback, type ReactNode } from 'react';
 import type { Task, Agent } from '../hooks/usePolling';
+import { TaskDetailModal } from './TaskDetailModal';
 
 /** Zoom steps relative to the responsive baseline: −2 … 0 … +2. */
 const ZOOM_MIN = -2;
@@ -163,6 +164,7 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
   const [searchQuery, setSearchQuery] = useState('');
   const [phaseFilter, setPhaseFilter] = useState<string>('all');
   const [zoomLevel, setZoomLevel] = useState(readStoredZoom);
+  const [selectedTask, setSelectedTask] = useState<Task | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const gridRef = useRef<HTMLDivElement>(null);
   const [containerW, setContainerW] = useState(1200);
@@ -494,13 +496,22 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                       <div
                         key={task.id}
                         className="kanban-task-card kanban-past-run-card"
-                        title={task.description || task.title}
+                        title="Click for details"
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => setSelectedTask(task)}
+                        onKeyDown={e => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            setSelectedTask(task);
+                          }
+                        }}
                         style={{
                           background: darkMode ? '#0d1117' : '#f6f8fa',
                           border: `1px solid ${darkMode ? '#21262d' : '#d8dee4'}`,
                           borderRadius: px(6),
                           padding: `${px(5)}px ${px(7)}px`,
-                          cursor: 'default',
+                          cursor: 'pointer',
                           flexShrink: 0,
                           opacity: 0.92,
                         }}
@@ -559,18 +570,31 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
                   }
 
                   return (
-                    <div key={task.id} className="kanban-task-card" style={{
-                      background: darkMode
-                        ? 'linear-gradient(135deg, #161b22 0%, #1c2128 100%)'
-                        : 'linear-gradient(135deg, #ffffff 0%, #f9fafb 100%)',
-                      border: `1px solid ${darkMode ? '#30363d' : '#d0d7de'}`,
-                      borderRadius: px(7),
-                      padding: 0,
-                      cursor: 'default',
-                      overflow: 'hidden',
-                      position: 'relative',
-                      flexShrink: 0,
-                    }}>
+                    <div
+                      key={task.id}
+                      className="kanban-task-card"
+                      title="Click for details"
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => setSelectedTask(task)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter' || e.key === ' ') {
+                          e.preventDefault();
+                          setSelectedTask(task);
+                        }
+                      }}
+                      style={{
+                        background: darkMode
+                          ? 'linear-gradient(135deg, #161b22 0%, #1c2128 100%)'
+                          : 'linear-gradient(135deg, #ffffff 0%, #f9fafb 100%)',
+                        border: `1px solid ${darkMode ? '#30363d' : '#d0d7de'}`,
+                        borderRadius: px(7),
+                        padding: 0,
+                        cursor: 'pointer',
+                        overflow: 'hidden',
+                        position: 'relative',
+                        flexShrink: 0,
+                      }}>
                       {/* Left accent bar */}
                       <div style={{
                         position: 'absolute',
@@ -761,6 +785,17 @@ export function KanbanBoard({ tasks, agents, darkMode }: { tasks: Task[]; agents
           );
         })}
       </div>
+
+      {selectedTask && (
+        <TaskDetailModal
+          task={selectedTask}
+          assigneeName={selectedTask.assignee
+            ? (agentMap.get(selectedTask.assignee) || selectedTask.assignee)
+            : '—'}
+          darkMode={darkMode}
+          onClose={() => setSelectedTask(null)}
+        />
+      )}
     </div>
   );
 }

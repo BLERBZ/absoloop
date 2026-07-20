@@ -1672,7 +1672,8 @@ def _task(tid: str, title: str, status: str, assignee: Optional[str],
           priority: str, phase: int, created: str, updated: str,
           deps: Optional[list[str]] = None,
           description: str = "",
-          kind: str = "") -> dict:
+          kind: str = "",
+          details: Optional[dict] = None) -> dict:
     payload = {
         "id": tid,
         "title": title,
@@ -1687,6 +1688,12 @@ def _task(tid: str, title: str, status: str, assignee: Optional[str],
     }
     if kind:
         payload["kind"] = kind
+    if details:
+        # Structured card detail for the Kanban expand modal — only emit
+        # keys that carry a real value so the payload stays lean.
+        clean = {k: v for k, v in details.items() if v not in (None, "", [])}
+        if clean:
+            payload["details"] = clean
     return payload
 
 
@@ -1807,6 +1814,14 @@ def _archived_loop_summaries(
     return rows
 
 
+def _gist(text: Any, limit: int) -> str:
+    """Whitespace-normalized snippet capped at ``limit`` chars."""
+    blob = " ".join(str(text or "").split())
+    if len(blob) <= limit:
+        return blob
+    return blob[: limit - 1].rstrip() + "…"
+
+
 def _report_excerpt(path: pathlib.Path, limit: int = 700) -> str:
     """Plain-text excerpt from an archived report.md for Kanban search."""
     if not path.is_file():
@@ -1912,15 +1927,21 @@ def _report_archive_tasks(
     for index, row in enumerate(_discover_report_archives(abs_dir), start=1):
         loop_id = row["loopId"]
         excerpt = _report_excerpt(row["path"])
-        status = (row.get("status") or "Report").replace("_", " ").title()
+        status = (row.get("status") or "").replace("_", " ").title() or "Archived"
         objective = " ".join(str(row.get("objective") or "").split())
-        title = f"Report · {loop_id}"
-        bits = [f"#{index}", status, "report"]
+        # Lead with what the mission was about, not the raw loop id.
+        gist = _gist(objective, 52)
+        title = f"Report · {gist}" if gist else f"Report #{index} · {status}"
+        bits = [f"Report #{index}", status]
         if objective:
-            bits.append(objective[:80] + ("…" if len(objective) > 80 else ""))
+            bits.append(_gist(objective, 80))
+        # Keep the loop id searchable but out of the headline.
+        bits.append(loop_id)
         desc_parts = [" · ".join(bits)]
         if excerpt:
             desc_parts.append(excerpt)
+        html_path = row.get("html")
+        has_html = isinstance(html_path, pathlib.Path) and html_path.is_file()
         cards.append(_task(
             f"report-{loop_id}",
             title,
@@ -1932,6 +1953,15 @@ def _report_archive_tasks(
             now,
             description="\n".join(desc_parts),
             kind="report",
+            details={
+                "loopId": loop_id,
+                "statusLabel": status,
+                "objective": objective,
+                "missionId": str(row.get("missionId") or ""),
+                "excerpt": _report_excerpt(row["path"], limit=1600),
+                "reportUrl": f"/api/report/{loop_id}",
+                "reportFormat": "html" if has_html else "md",
+            },
         ))
     return cards
 
@@ -1970,13 +2000,18 @@ def _past_run_tasks(
         if focus:
             bits.append(focus[:48] + ("…" if len(focus) > 48 else ""))
         # Fold report body into description so Task Board search finds it.
-        excerpt = _report_excerpt(abs_dir / "runs" / loop_id / "report.md")
-        if not excerpt:
-            excerpt = _report_excerpt(abs_dir / "reports" / loop_id / "report.md")
+        report_md = abs_dir / "runs" / loop_id / "report.md"
+        if not report_md.is_file():
+            report_md = abs_dir / "reports" / loop_id / "report.md"
+        excerpt = _report_excerpt(report_md)
         desc = " · ".join(bits)
         if excerpt:
             desc = f"{desc}\n{excerpt}"
         created = _iso(row.get("startedAt")) if row.get("startedAt") else now
+        report_html = abs_dir / "runs" / loop_id / "report.html"
+        if not report_html.is_file():
+            report_html = abs_dir / "reports" / loop_id / "report.html"
+        has_report = report_md.is_file() or report_html.is_file()
         cards.append(_task(
             f"run-{loop_id}",
             title,
@@ -1988,6 +2023,16 @@ def _past_run_tasks(
             now,
             description=desc,
             kind="past_run",
+            details={
+                "loopId": loop_id,
+                "statusLabel": label,
+                "iterations": iters,
+                "costUsd": round(float(row["costUsd"] or 0), 2) or None,
+                "focus": focus,
+                "excerpt": _report_excerpt(report_md, limit=1600),
+                "reportUrl": f"/api/report/{loop_id}" if has_report else "",
+                "reportFormat": "html" if report_html.is_file() else "md",
+            },
         ))
     return cards
 
@@ -2350,12 +2395,23 @@ def build_bridge_state(project: pathlib.Path) -> dict:
         ("deliver", "Deliver accepted work", builder_id, "medium", 5,
          ["task-gate"], deliver_desc),
     ]
+    mission_details = {
+        "loopId": loop_id,
+        "missionId": mission_id,
+        "objective": objective,
+        "engine": engine,
+        "iteration": iteration,
+        "maxIterations": max_iter or None,
+        "costUsd": round(cost_usd, 2) or None,
+        "statusLabel": status.replace("_", " ").title(),
+    }
     tasks = []
     for name, title, assignee, priority, phase_n, deps, desc in pipe_defs:
         col = _pipeline_status(name, live, status, phase, iteration, max_iter)
         tasks.append(_task(
             f"task-{name}", title, col, assignee, priority, phase_n,
-            created, updated, deps, description=desc))
+            created, updated, deps, description=desc,
+            details=dict(mission_details)))
 
     # One card per completed/current iteration for kanban depth
     for i in range(1, max(iteration, 0) + 1):
@@ -2377,12 +2433,19 @@ def build_bridge_state(project: pathlib.Path) -> dict:
             iter_desc = f"Repair pass {i}" \
                         + (f" of {max_iter}" if max_iter else "") \
                         + f" toward: {objective[:110]}"
+        iter_title = f"Iteration {i} of {max_iter}" if max_iter else f"Iteration {i}"
         tasks.append(_task(
             f"iter-{i:04d}",
-            f"Iteration {i}: advance toward objective",
+            iter_title,
             col, builder_id, "medium", 1, created, updated,
             ["task-execute"] if i == 1 else [f"iter-{i - 1:04d}"],
-            description=iter_desc))
+            description=iter_desc,
+            details={
+                **mission_details,
+                "iteration": i,
+                "nowLine": activity_detail if (
+                    i == iteration and live and activity_detail) else "",
+            }))
 
     # Prior loops stay visible: one consolidated Done card each (not wiped
     # on Extend). Current loop keeps its live pipeline / waiting cards.
