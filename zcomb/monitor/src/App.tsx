@@ -9,6 +9,34 @@ import { ObjectiveDropdown } from './components/ObjectiveDropdown';
 import { RunResultsPanel } from './components/RunResultsPanel';
 import { SettingsMenu } from './components/SettingsMenu';
 import { matchesActivityFilter } from './components/ActivityFeed';
+import { ViewModeToggle, type ViewMode } from './components/compact/ViewModeToggle';
+import { CompactMonitor } from './components/compact/CompactMonitor';
+import { getStoredCompactSize } from './components/compact/useFloatingWindow';
+import type { TaskStatus } from './components/compact/runState';
+
+/** True when this document is the dedicated compact-monitor popup window. */
+const IS_COMPACT_WINDOW = typeof window !== 'undefined'
+  && new URLSearchParams(window.location.search).get('view') === 'compact';
+
+/**
+ * Pop the compact monitor out into its own small browser window. Browsers
+ * (Safari included) only allow scripts to resize windows they created via
+ * window.open, so a dedicated popup is the only way drag-resize can control
+ * the real window. Returns false when the popup was blocked.
+ */
+function openCompactWindow(): boolean {
+  const { w, h } = getStoredCompactSize();
+  const s = window.screen as Screen & { availLeft?: number; availTop?: number };
+  const left = (s.availLeft ?? 0) + Math.max(0, (s.availWidth || w) - w - 24);
+  const top = (s.availTop ?? 0) + 24;
+  const url = new URL(window.location.href);
+  url.searchParams.set('view', 'compact');
+  const features = `popup=yes,width=${w},height=${h},left=${left},top=${top},resizable=yes`;
+  const popup = window.open(url.toString(), 'zcomb-compact', features);
+  if (!popup) return false;
+  popup.focus();
+  return true;
+}
 
 function formatElapsedSeconds(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
@@ -178,6 +206,10 @@ export default function App() {
   const [agentsOpen, setAgentsOpen] = useState(() => localStorage.getItem('zc-panel-agents') !== '0');
   const [feedOpen, setFeedOpen] = useState(() => localStorage.getItem('zc-panel-feed') !== '0');
   const [objectiveCopied, setObjectiveCopied] = useState(false);
+  const [viewMode, setViewMode] = useState<ViewMode>(() => (
+    IS_COMPACT_WINDOW || localStorage.getItem('zc-view-mode') === 'compact' ? 'compact' : 'full'
+  ));
+  const [compactStatusFilter, setCompactStatusFilter] = useState<TaskStatus>('in_progress');
   const [extendMode, setExtendMode] = useState(false);
   const [extendNote, setExtendNote] = useState('');
   const [extendBusy, setExtendBusy] = useState(false);
@@ -193,6 +225,72 @@ export default function App() {
     localStorage.setItem('zc-panel-feed', open ? '0' : '1');
     return !open;
   });
+
+  const setViewModePersisted = (mode: ViewMode) => {
+    setViewMode(mode);
+    // The dedicated popup gets its mode from the URL — don't let it clobber
+    // the main tab's persisted preference.
+    if (!IS_COMPACT_WINDOW) localStorage.setItem('zc-view-mode', mode);
+  };
+  /** Leave compact mode — in the popup that means handing back to the opener. */
+  const switchToFull = () => {
+    if (IS_COMPACT_WINDOW) {
+      try {
+        if (window.opener && !window.opener.closed) {
+          window.opener.focus();
+          window.close();
+          return;
+        }
+      } catch {
+        /* opener gone or inaccessible — fall through */
+      }
+      const url = new URL(window.location.href);
+      url.searchParams.delete('view');
+      window.location.replace(url.toString());
+      return;
+    }
+    setViewModePersisted('full');
+  };
+  const toggleViewMode = () => {
+    if (viewMode === 'compact') {
+      switchToFull();
+      return;
+    }
+    // Prefer a real mini browser window (scripted resize only works on
+    // script-opened windows); fall back to the in-page panel if blocked.
+    if (openCompactWindow()) return;
+    setViewModePersisted('compact');
+  };
+
+  // Option/Alt + M toggles between full board and compact monitor.
+  // toggleViewMode reads viewMode, so keep the handler behind a fresh ref.
+  const toggleViewModeRef = useRef(toggleViewMode);
+  toggleViewModeRef.current = toggleViewMode;
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!e.altKey || e.metaKey || e.ctrlKey || e.code !== 'KeyM') return;
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      e.preventDefault();
+      toggleViewModeRef.current();
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
+  // The compact popup hands "Extend" back to the main tab via postMessage.
+  useEffect(() => {
+    if (IS_COMPACT_WINDOW) return;
+    const onMessage = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      if (e.data?.type === 'zc-open-extend') {
+        setViewModePersisted('full');
+        openExtendEditor();
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => window.removeEventListener('message', onMessage);
+  }, []);
 
   // Reset activity filter when a new run/project identity arrives.
   useEffect(() => {
@@ -334,7 +432,12 @@ export default function App() {
     }
   };
 
+  const compactActive = viewMode === 'compact';
+
   return (
+    <>
+    {/* Full board stays mounted while compact — filters, selection, and
+        scroll positions survive the mode toggle. */}
     <div style={{
       height: '100vh',
       background: bg,
@@ -344,6 +447,7 @@ export default function App() {
       display: 'flex',
       flexDirection: 'column',
       overflow: 'hidden',
+      visibility: compactActive ? 'hidden' : 'visible',
     }}>
       {/* Top Bar */}
       <header style={{
@@ -489,6 +593,13 @@ export default function App() {
 
           {error && <span style={{ color: '#f85149', fontSize: 12 }}>Connection error</span>}
 
+          <ViewModeToggle
+            mode={viewMode}
+            onToggle={toggleViewMode}
+            darkMode={darkMode}
+            borderColor={borderColor}
+            textColor={textColor}
+          />
           <SettingsMenu
             metrics={metrics}
             darkMode={darkMode}
@@ -1016,5 +1127,47 @@ export default function App() {
         />
       </div>
     </div>
+
+    {compactActive && (
+      <CompactMonitor
+        state={state}
+        metrics={metrics}
+        elapsed={elapsed}
+        progressPct={overallProgress}
+        doneTasks={doneTasks}
+        totalTasks={totalTasks}
+        projectName={projectName}
+        objective={displayedObjective}
+        darkMode={darkMode}
+        connectionError={error}
+        statusFilter={compactStatusFilter}
+        onStatusFilter={setCompactStatusFilter}
+        onSwitchToFull={switchToFull}
+        onThemeChange={(dark) => {
+          setDarkMode(dark);
+          localStorage.setItem('zc-theme', dark ? 'dark' : 'light');
+        }}
+        onRequestExtend={() => {
+          // Extend uses the full-board objective editor — switch and open it.
+          if (IS_COMPACT_WINDOW) {
+            try {
+              if (window.opener && !window.opener.closed) {
+                window.opener.postMessage({ type: 'zc-open-extend' }, window.location.origin);
+              }
+            } catch {
+              /* opener gone — switchToFull falls back to in-window full board */
+            }
+            switchToFull();
+            return;
+          }
+          setViewModePersisted('full');
+          openExtendEditor();
+        }}
+        onRunRestarting={markRunRestarting}
+        onRefresh={refreshNow}
+        windowed={IS_COMPACT_WINDOW}
+      />
+    )}
+    </>
   );
 }

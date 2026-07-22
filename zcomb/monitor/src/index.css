@@ -372,3 +372,121 @@ textarea:focus-visible {
     animation: none !important;
   }
 }
+
+/* ── Compact monitor mode ─────────────────────────────────────────────── */
+
+/* Kill geometry transitions while dragging/resizing so the window tracks
+   the pointer 1:1, keeping the docked-settle animation on release. */
+.compact-shell-moving {
+  transition: none !important;
+}
+
+/* View toggle icon morph */
+.view-mode-toggle .view-mode-toggle-icon {
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.view-mode-toggle:hover .view-mode-toggle-icon {
+  transform: scale(1.08);
+}
+
+.view-mode-toggle:active {
+  filter: brightness(1.25);
+}
+
+/* Restrained pulse for live indicators (state pill, running badge, stage) */
+@keyframes compact-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+.compact-pulse-dot {
+  animation: compact-pulse 2.6s ease-in-out infinite;
+}
+
+/* Interactive row/segment hovers */
+.compact-rail-segment,
+.compact-agent-row,
+.compact-done-summary,
+.compact-done-row,
+.compact-view-all,
+.compact-activity-entry {
+  transition: background 0.15s ease, border-color 0.15s ease, filter 0.15s ease;
+}
+
+.compact-rail-segment:hover,
+.compact-done-summary:hover,
+.compact-done-row:hover,
+.compact-view-all:hover {
+  filter: brightness(1.18);
+}
+
+.compact-agent-row:hover,
+.compact-activity-entry:hover {
+  background: #7d859018 !important;
+}
+
+.compact-task-card {
+  transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1),
+              box-shadow 0.18s ease,
+              border-color 0.18s ease;
+}
+
+.compact-task-card:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+  border-color: #58a6ff40 !important;
+}
+
+.compact-task-card:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 1px;
+}
+
+/* New activity entries slide in gently */
+@keyframes compact-activity-enter {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.compact-activity-entry {
+  animation: compact-activity-enter 0.24s ease-out both;
+}
+
+/* Fade mask hinting at more entries below */
+.compact-activity-fade {
+  mask-image: linear-gradient(180deg, #000 82%, transparent 100%);
+  -webkit-mask-image: linear-gradient(180deg, #000 82%, transparent 100%);
+}
+
+/* Drawer slide-in */
+@keyframes compact-drawer-enter {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+.compact-drawer {
+  animation: compact-drawer-enter 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Header drag affordance */
+.compact-drag-region:active {
+  cursor: grabbing;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .compact-shell {
+    transition: none !important;
+  }
+
+  .compact-pulse-dot,
+  .compact-activity-entry,
+  .compact-drawer {
+    animation: none !important;
+  }
+
+  .compact-task-card,
+  .view-mode-toggle .view-mode-toggle-icon {
+    transition: none !important;
+  }
+}
