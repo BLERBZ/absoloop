@@ -1,4 +1,4 @@
-"""Optional ZComb Kanban UI for Absoloop mission monitoring.
+"""ZComb Kanban UI for Absoloop mission monitoring (default monitor).
 
 Vendors the ZCombinator dashboard (``zcomb/monitor``) and bridges Absoloop
 telemetry (``.absoloop/tmp/monitor.json`` + ``live.jsonl`` + state/runtime)
@@ -6,8 +6,12 @@ into ZComb's agents/tasks/activity/metrics state files under
 ``.absoloop/zcomb/state/``.
 
 CLI:
-  ``absoloop --zcomb`` — same briefing/launch as ``absoloop``, then Kanban
+  ``absoloop`` / ``absoloop new`` — briefing/launch, then ZComb Kanban (default)
   ``absoloop zcomb [-C project] [--port N] [--no-browser]`` — dashboard only
+  ``absoloop --watch`` — classic terminal watcher instead of the browser UI
+
+The gear menu in the UI can switch the monitor back to the terminal watcher
+(persisted as ``monitor`` in ``.absoloop/zcomb/ui-settings.json``).
 
 Requires Node.js 18+. First run installs and builds ``monitor/``. Default
 URL: http://localhost:3141. See ``zcomb/README.md``.
@@ -21,6 +25,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -31,6 +36,11 @@ import urllib.request
 from typing import Any, Optional
 
 DEFAULT_PORT = 3141
+# Minimum dashboard REST API version this harness expects. Servers that
+# report an older (or no) version on /api/health are replaced instead of
+# retargeted, so the UI never hits 404s on newer endpoints. Keep in sync
+# with API_VERSION in zcomb/monitor/server.js.
+DASHBOARD_API_VERSION = 2
 HEARTBEAT_STALE_SECONDS = 90
 # A spawned teammate is shown "active" while the mission is live and its
 # spawn event is younger than this; afterwards it flips to "done".
@@ -2912,6 +2922,10 @@ def build_bridge_state(project: pathlib.Path) -> dict:
 
 _UI_SETTINGS_NAME = "ui-settings.json"
 _ENGINE_ORDER = ("claude", "codex", "grok")
+# Mission monitor surfaces: ZComb browser Kanban (default) or the classic
+# terminal watcher (`absoloop watch`).
+MONITOR_MODES = ("zcomb", "watch")
+DEFAULT_MONITOR = "zcomb"
 
 
 def ui_settings_path(project: pathlib.Path) -> pathlib.Path:
@@ -2995,6 +3009,113 @@ def read_ui_settings(project: pathlib.Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def monitor_preference(project: pathlib.Path) -> str:
+    """Preferred mission monitor: 'zcomb' (browser, default) or 'watch'."""
+    pref = str(read_ui_settings(project).get("monitor") or "").strip().lower()
+    return pref if pref in MONITOR_MODES else DEFAULT_MONITOR
+
+
+def save_monitor_preference(project: pathlib.Path, monitor: str) -> dict[str, Any]:
+    """Persist the monitor choice into ui-settings.json (merge, not rewrite)."""
+    monitor = (monitor or "").strip().lower()
+    if monitor not in MONITOR_MODES:
+        return {"ok": False,
+                "error": f"Unknown monitor '{monitor}' — use zcomb or watch"}
+    project = project.expanduser().resolve()
+    ui = read_ui_settings(project)
+    ui["monitor"] = monitor
+    ui["savedAt"] = time.time()
+    out = ui_settings_path(project)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(ui, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not write ui-settings: {exc}"}
+    return {"ok": True, "monitor": monitor}
+
+
+def _absoloop_bin() -> str:
+    """The absoloop CLI that owns this install (falls back to PATH)."""
+    candidate = zcomb_home().parent / "bin" / "absoloop"
+    if candidate.is_file():
+        return str(candidate)
+    return shutil.which("absoloop") or "absoloop"
+
+
+def open_watcher_terminal(project: pathlib.Path) -> dict[str, Any]:
+    """Open a new terminal window running `absoloop watch -C <project>`.
+
+    Best-effort per platform: Terminal.app on macOS, the first common
+    emulator on Linux, `start cmd /k` on Windows.
+    """
+    project = project.expanduser().resolve()
+    watch_cmd = [_absoloop_bin(), "watch", "-C", str(project)]
+    try:
+        if sys.platform == "darwin":
+            shell_cmd = " ".join(shlex.quote(part) for part in watch_cmd)
+            osa = shell_cmd.replace("\\", "\\\\").replace('"', '\\"')
+            subprocess.Popen(
+                ["osascript",
+                 "-e", f'tell application "Terminal" to do script "{osa}"',
+                 "-e", 'tell application "Terminal" to activate'],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        elif os.name == "nt":
+            shell_cmd = subprocess.list2cmdline(watch_cmd)
+            subprocess.Popen(
+                ["cmd", "/c", "start", "Absoloop Watch", "cmd", "/k", shell_cmd],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        else:
+            shell_cmd = " ".join(shlex.quote(part) for part in watch_cmd)
+            launchers = (
+                ["x-terminal-emulator", "-e", "sh", "-c", shell_cmd],
+                ["gnome-terminal", "--", "sh", "-c", shell_cmd],
+                ["konsole", "-e", "sh", "-c", shell_cmd],
+                ["xterm", "-e", "sh", "-c", shell_cmd],
+            )
+            for launcher in launchers:
+                if shutil.which(launcher[0]):
+                    subprocess.Popen(
+                        launcher,
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    break
+            else:
+                return {
+                    "ok": False,
+                    "error": ("No terminal emulator found — run "
+                              f"'absoloop watch -C {project}' manually"),
+                }
+    except OSError as exc:
+        return {"ok": False, "error": f"Could not open terminal: {exc}"}
+    return {
+        "ok": True,
+        "command": " ".join(shlex.quote(part) for part in watch_cmd),
+        "message": "Watcher opened in a terminal window",
+    }
+
+
+def switch_monitor(project: pathlib.Path, monitor: str) -> dict[str, Any]:
+    """Gear-menu monitor switch: persist the preference; when switching to
+    the terminal watcher, also open it right away."""
+    saved = save_monitor_preference(project, monitor)
+    if not saved.get("ok"):
+        return saved
+    if saved["monitor"] == "watch":
+        opened = open_watcher_terminal(project)
+        if not opened.get("ok"):
+            return {**saved, "ok": False,
+                    "error": opened.get("error") or "Could not open watcher"}
+        return {**saved,
+                "message": ("Watcher opened — new missions will use the "
+                            "terminal watcher"),
+                "command": opened.get("command")}
+    return {**saved,
+            "message": "ZComb UI is the mission monitor again"}
+
+
 def save_loop_settings(
     project: pathlib.Path,
     *,
@@ -3062,6 +3183,9 @@ def save_loop_settings(
         "theme": next_theme,
         "engine": next_engine,
         "model": next_model,
+        "monitor": (str(ui.get("monitor") or "").strip().lower()
+                    if str(ui.get("monitor") or "").strip().lower() in MONITOR_MODES
+                    else DEFAULT_MONITOR),
         "savedAt": time.time(),
         "applyOn": "next_loop",
     }
@@ -3118,6 +3242,9 @@ def _bridge_settings(
     theme = str(ui.get("theme") or "dark").strip().lower()
     if theme not in ("dark", "light"):
         theme = "dark"
+    monitor = str(ui.get("monitor") or "").strip().lower()
+    if monitor not in MONITOR_MODES:
+        monitor = DEFAULT_MONITOR
 
     pending = bool(
         (ui.get("engine") or ui.get("model"))
@@ -3131,6 +3258,7 @@ def _bridge_settings(
         "theme": theme,
         "engine": next_engine,
         "model": next_model,
+        "monitor": monitor,
         "activeEngine": live_engine,
         "activeModel": live_model,
         "pendingNextLoop": pending,
@@ -3245,6 +3373,20 @@ def _port_in_use(port: int) -> bool:
         return False
 
 
+def _dashboard_api_version(port: int) -> int:
+    """API version reported by a running dashboard (0 for pre-version builds)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health",
+                                    timeout=1.0) as resp:
+            if resp.status != 200:
+                return 0
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
+        return 0
+    version = body.get("apiVersion")
+    return version if isinstance(version, int) else 0
+
+
 def _pids_listening_on(port: int) -> list[int]:
     """PIDs with a TCP listen socket on `port` (best-effort via lsof)."""
     try:
@@ -3327,8 +3469,9 @@ def ensure_dashboard(project: pathlib.Path, state_dir: pathlib.Path,
     """Attach to a live dashboard or start/replace one for `project`.
 
     Prefer HTTP retarget when the server supports it. If the listener is an
-    older build (no `/api/retarget`) or retarget fails, replace the process
-    so new runs do not stay stuck on stale state.
+    older build (stale API version, no `/api/retarget`) or retarget fails,
+    replace the process so new runs do not stay stuck on stale state or hit
+    404s on endpoints the current UI expects.
 
     Returns `(proc_or_None, status)` where status is one of:
     `started`, `retargeted`, `restarted`, `failed`.
@@ -3343,7 +3486,8 @@ def ensure_dashboard(project: pathlib.Path, state_dir: pathlib.Path,
             return proc, "started"
         return proc, "failed"
 
-    if retarget_dashboard(project, port=port, state_dir=state_dir):
+    if (_dashboard_api_version(port) >= DASHBOARD_API_VERSION
+            and retarget_dashboard(project, port=port, state_dir=state_dir)):
         return None, "retargeted"
 
     # Pre-retarget servers answer /api/health but 404 on /api/retarget.
@@ -3465,6 +3609,104 @@ def spawn_background(project: pathlib.Path, *, port: int = DEFAULT_PORT,
         return None
 
 
+# ---------------------------------------------------------------------------
+# Web Mission Briefing — the browser Launch modal replaces the terminal card.
+#
+# Handshake (all files live in the project's ZComb state dir, which the
+# dashboard server also reads/writes):
+#   launch.json            CLI writes {status: pending, request} → the UI
+#                          shows the Launch modal → the server rewrites it
+#                          as {status: submitted, submission} (or cancelled)
+#                          → the CLI marks it launched/aborted/error.
+#   launch-heartbeat.json  CLI touches this every few seconds while waiting,
+#                          so the UI never resurrects a stale request after
+#                          a killed CLI.
+# ---------------------------------------------------------------------------
+
+LAUNCH_FILE_NAME = "launch.json"
+LAUNCH_HEARTBEAT_NAME = "launch-heartbeat.json"
+LAUNCH_HEARTBEAT_INTERVAL = 4.0
+
+
+def launch_file_path(state_dir: pathlib.Path) -> pathlib.Path:
+    return state_dir / LAUNCH_FILE_NAME
+
+
+def read_launch_state(state_dir: pathlib.Path) -> dict:
+    return _read_json(launch_file_path(state_dir))
+
+
+def write_launch_state(state_dir: pathlib.Path, payload: dict) -> None:
+    _atomic_write(launch_file_path(state_dir), payload)
+
+
+def touch_launch_heartbeat(state_dir: pathlib.Path) -> None:
+    _atomic_write(state_dir / LAUNCH_HEARTBEAT_NAME, {"ts": time.time()})
+
+
+def mark_launch_status(state_dir: pathlib.Path, status: str, **extra: Any) -> None:
+    """Update launch.json's status in place (request/submission preserved)."""
+    data = read_launch_state(state_dir)
+    data["status"] = status
+    data["ts"] = time.time()
+    data.update(extra)
+    write_launch_state(state_dir, data)
+
+
+def begin_web_briefing(project: pathlib.Path, request: dict,
+                       *, port: int = DEFAULT_PORT) -> Optional[pathlib.Path]:
+    """Open the dashboard with a pending Launch request for `project`.
+
+    Builds/starts (or retargets) the ZComb server, writes the launch
+    request, and opens the browser on the Launch modal. Returns the state
+    directory to poll, or None when the dashboard could not be started.
+    """
+    ensure_dashboard_built()
+    state_dir = sync_state(project)
+    write_launch_state(state_dir, {
+        "status": "pending",
+        "ts": time.time(),
+        "request": request,
+    })
+    touch_launch_heartbeat(state_dir)
+    proc, status = ensure_dashboard(project, state_dir, port)
+    if status == "failed":
+        write_launch_state(state_dir, {"status": "error",
+                                       "error": "dashboard failed to start"})
+        if proc is not None and proc.poll() is None:
+            proc.terminate()
+        return None
+    open_browser(f"http://localhost:{port}")
+    return state_dir
+
+
+def wait_for_web_briefing(state_dir: pathlib.Path,
+                          *, poll: float = 0.5) -> dict:
+    """Block until the browser submits or cancels the Launch modal.
+
+    Returns the final launch.json payload; Ctrl-C yields
+    ``{"status": "aborted"}`` (and marks the file so the UI closes).
+    """
+    last_beat = 0.0
+    try:
+        while True:
+            data = read_launch_state(state_dir)
+            status = str(data.get("status") or "")
+            if status in ("submitted", "cancelled"):
+                return data
+            if status not in ("pending",):
+                return {"status": "error",
+                        "error": f"launch request lost (status={status or 'gone'})"}
+            now = time.time()
+            if now - last_beat >= LAUNCH_HEARTBEAT_INTERVAL:
+                touch_launch_heartbeat(state_dir)
+                last_beat = now
+            time.sleep(poll)
+    except KeyboardInterrupt:
+        mark_launch_status(state_dir, "aborted")
+        return {"status": "aborted"}
+
+
 def zcomb_command(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         prog="absoloop zcomb",
@@ -3562,6 +3804,13 @@ __all__ = [
     "sync_state",
     "zcomb_command",
     "spawn_background",
+    "begin_web_briefing",
+    "wait_for_web_briefing",
+    "read_launch_state",
+    "write_launch_state",
+    "mark_launch_status",
+    "touch_launch_heartbeat",
+    "launch_file_path",
     "retarget_dashboard",
     "ensure_dashboard",
     "stop_dashboard",
@@ -3574,5 +3823,11 @@ __all__ = [
     "read_ui_settings",
     "load_loop_settings",
     "save_loop_settings",
+    "monitor_preference",
+    "save_monitor_preference",
+    "switch_monitor",
+    "open_watcher_terminal",
     "DEFAULT_PORT",
+    "DEFAULT_MONITOR",
+    "MONITOR_MODES",
 ]

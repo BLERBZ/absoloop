@@ -13,7 +13,7 @@ auditable cycles. Two surfaces share this entry point:
       Isolated git worktrees, normalized events, deterministic gates
 
 Also routes: setup wizard, shortcuts / Codex Micro (`do`), schedules, and
-optional ZComb Kanban (`--zcomb` / `zcomb`).
+the ZComb Kanban UI (default monitor; `--watch` keeps the terminal watcher).
 
 Install: put ``bin/`` on PATH. ``ABSOLOOP_HOME`` auto-detects from this
 checkout. Cross-platform: macOS, Linux, Windows (``absoloop.cmd`` shim or
@@ -79,7 +79,7 @@ class BannerParser(argparse.ArgumentParser):
 EPILOG = """\
 examples:
   absoloop setup                        # first-run wizard (PATH · providers · defaults)
-  absoloop                              # briefing: one prompt → review → launch
+  absoloop                              # briefing: one prompt → review → launch + ZComb UI
   absoloop new                          # same as bare absoloop (alias)
   absoloop "Make all tests pass"        # objective first; review card; Enter
   absoloop . -o "Fix the parser crash"  # adopt cwd, review, go
@@ -96,11 +96,11 @@ examples:
 Mission Briefing keys: Enter launch · o objective · e engine · d delivery
                        n rename · g preview /goal · q abort
 
-ZComb Kanban UI (optional · needs Node.js 18+):
-  absoloop --zcomb                      # same briefing/launch as absoloop, plus Kanban
-  absoloop "…" --zcomb                  # objective + launch with Kanban UI
+ZComb Kanban UI (default monitor · needs Node.js 18+):
+  absoloop                              # briefing/launch opens the Kanban UI
+  absoloop --watch                      # classic terminal watcher instead of the UI
   absoloop zcomb [-C ./mission]         # dashboard only (monitor a running mission)
-  → http://localhost:3141
+  → http://localhost:3141  ·  gear menu can switch back to the Watcher
 
 Harness: doctor · providers · run · build · review · cancel · inspect · apply
 
@@ -736,6 +736,10 @@ def runtime_config(objective: str, loop_id: str, delivery_mode: str,
         "no_progress_window": 3,
         "max_wall_seconds": 10800,
         "max_cost_usd": 50.0,
+        # When the budget runs out before the builder could emit a readable
+        # structured report, one small read-only agent pass is allowed beyond
+        # the caps so report.md still says what actually happened.
+        "report_beyond_budget": True,
         "claude": {
             # Higher turn/wall budgets: Builder leads Agent Teams on complex work.
             "builder": {"permission_mode": "acceptEdits", "max_turns": 60,
@@ -1222,8 +1226,9 @@ def watch_command(argv: list[str]) -> int:
         prog="absoloop watch",
         description="Live terminal dashboard for a running mission: phase, "
                     "budgets, and a streaming feed of what the agent is doing "
-                    "right now. Prefer 'absoloop zcomb' for the browser "
-                    "Kanban UI (or 'absoloop --zcomb' to brief + launch with it).")
+                    "right now. The browser Kanban UI ('absoloop zcomb') is "
+                    "the default monitor; launch with --watch to prefer this "
+                    "terminal watcher instead.")
     parser.add_argument("-C", "--project", default=".",
                         help="project directory (default: current directory)")
     parser.add_argument("-n", "--interval", type=float, default=2.0,
@@ -2544,6 +2549,106 @@ def _resolve_target(name: str) -> pathlib.Path:
     return (pathlib.Path.cwd() / pathlib.Path(name).expanduser()).resolve()
 
 
+def web_briefing(brief, ux, zcomb_mod):
+    """Run the Mission Briefing in the browser (ZComb Launch modal).
+
+    Writes a launch request into the project's ZComb state dir, opens the
+    dashboard, and blocks until the operator submits or cancels the modal.
+
+    Returns ``(status, brief)`` where status is ``"launch"`` (brief is the
+    confirmed Briefing), ``"abort"`` (operator cancelled), or ``"fallback"``
+    (web UI unavailable — use the terminal briefing instead).
+    """
+    from absoloop_harness.models import resolve_model
+
+    target = pathlib.Path(brief.target)
+    request = {
+        "objective": brief.objective,
+        "projectName": brief.target_name or ".",
+        "projectFolder": target.name or str(target),
+        "projectPath": str(target),
+        "adopting": brief.adopting,
+        "delivery": brief.delivery,
+        "engine": brief.engine,
+        "model": resolve_model(brief.engine, brief.model),
+        "engines": zcomb_mod.settings_catalog()["engines"],
+        "deliveries": [
+            {"id": mode, "label": mode, "blurb": ux.DELIVERY_BLURBS.get(mode, "")}
+            for mode in ("local", "git", "out")
+        ],
+        "budgets": {
+            "maxIterations": brief.max_iterations,
+            "maxCostUsd": brief.max_cost_usd,
+            "maxWallHours": brief.max_wall_hours,
+        },
+    }
+    try:
+        state_dir = zcomb_mod.begin_web_briefing(target, request)
+    except Exception as exc:
+        print(ux.tint("warn", f"  web briefing unavailable ({exc}) — "
+                            "using the terminal briefing"))
+        return "fallback", None
+    if state_dir is None:
+        return "fallback", None
+
+    url = f"http://localhost:{zcomb_mod.DEFAULT_PORT}"
+    print(ux.tint("accent", "  ∞ ") + ux.tint("bold", "MISSION BRIEFING")
+          + ux.tint("dim", f"  ·  open in your browser → {url}"))
+    print(ux.tint("dim", "    finish the Launch form there · Ctrl-C here to abort "
+                         "(or re-run with --cli for the terminal card)"))
+    print()
+
+    outcome = zcomb_mod.wait_for_web_briefing(state_dir)
+    status = str(outcome.get("status") or "")
+    if status in ("aborted", "cancelled"):
+        print(ux.tint("dim", "  Mission scrubbed."))
+        return "abort", None
+    if status != "submitted":
+        print(ux.tint("warn", f"  web briefing failed "
+                            f"({outcome.get('error') or 'no response'}) — "
+                            "using the terminal briefing"))
+        return "fallback", None
+
+    sub = outcome.get("submission") or {}
+    objective = str(sub.get("objective") or "").strip()
+    if not objective:
+        zcomb_mod.mark_launch_status(state_dir, "error",
+                                     error="objective required")
+        return "fallback", None
+
+    name = str(sub.get("projectName") or brief.target_name or ".").strip() or "."
+    if name != "." and not re.fullmatch(r"[A-Za-z0-9._-]+", name) \
+            and not pathlib.Path(name).expanduser().is_dir():
+        zcomb_mod.mark_launch_status(state_dir, "error",
+                                     error=f"invalid project name: {name}")
+        print(ux.tint("warn", f"  invalid project name from the Launch form: {name}"))
+        return "fallback", None
+
+    engine = str(sub.get("engine") or "").strip()
+    if engine not in ENGINES:
+        engine = brief.engine
+    delivery = str(sub.get("delivery") or "").strip()
+    if delivery not in DELIVERY_MODES:
+        delivery = brief.delivery
+    model = resolve_model(engine, str(sub.get("model") or "").strip())
+
+    path = (pathlib.Path.cwd() if name == "."
+            else pathlib.Path.cwd() / name).resolve()
+    confirmed = __import__("dataclasses").replace(
+        brief,
+        objective=objective,
+        engine=engine,
+        model=model,
+        delivery=delivery,
+        target_name=name,
+        target=str(path),
+        adopting=path.is_dir(),
+        kinds=classify_mission(objective) or ["general"],
+    )
+    zcomb_mod.mark_launch_status(state_dir, "launched")
+    return "launch", confirmed
+
+
 def _engine_labels() -> dict:
     labels = {}
     for engine in ENGINES:
@@ -2668,8 +2773,16 @@ def main(argv: list[str]) -> int:
                         help="scaffold only; do not launch the loop")
     parser.add_argument(
         "--zcomb", action="store_true",
-        help="same briefing/launch as absoloop, then open ZComb Kanban "
-             "(Node.js 18+; dashboard-only: absoloop zcomb)")
+        help="open the ZComb Kanban UI with the launch (already the default; "
+             "kept for compatibility — dashboard-only: absoloop zcomb)")
+    parser.add_argument(
+        "--watch", "--no-zcomb", action="store_true", dest="watch",
+        help="use the classic terminal watcher instead of the ZComb UI "
+             "(opens 'absoloop watch' in a new terminal)")
+    parser.add_argument(
+        "--cli", action="store_true",
+        help="use the classic terminal Mission Briefing card instead of "
+             "the browser Launch window")
     args = parser.parse_args(argv)
     # Flag may arrive via argparse (after extract) only if someone passes it
     # again; prefer the early extract.
@@ -2749,8 +2862,26 @@ def main(argv: list[str]) -> int:
 
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
 
-    # Only ask for the one thing we cannot invent: the objective.
-    if not objective:
+    # Briefing surface: the browser Launch window (default) or the classic
+    # terminal card (--cli / --watch / gear-menu 'watch' preference / no Node).
+    node_ok = bool(shutil.which("node") and shutil.which("npm"))
+    if zcomb_mod is None and node_ok:
+        _ensure_harness_path()
+        from absoloop_harness import zcomb as zcomb_mod
+    monitor_pref = "zcomb"
+    if zcomb_mod is not None:
+        try:
+            monitor_pref = zcomb_mod.monitor_preference(peek_target)
+        except Exception:
+            pass
+    use_web_briefing = (interactive and node_ok
+                        and not args.cli and not args.watch
+                        and not args.yes and not args.no_start
+                        and monitor_pref != "watch")
+
+    # Only ask for the one thing we cannot invent: the objective. The web
+    # Launch window collects it itself, so only the terminal path asks here.
+    if not objective and not use_web_briefing:
         if not interactive:
             print("error: pass -o/--objective or a quoted mission string.",
                   file=sys.stderr)
@@ -2797,7 +2928,31 @@ def main(argv: list[str]) -> int:
             print(ux.tint("dim", "  …"))
         print()
 
-    if interactive and not args.yes and not args.no_start:
+    web_launched = False
+    if use_web_briefing:
+        status, confirmed = web_briefing(brief, ux, zcomb_mod)
+        if status == "abort":
+            return 1
+        if status == "launch":
+            brief = confirmed
+            web_launched = True
+        else:
+            # Web UI unavailable — fall back to the terminal briefing card.
+            use_web_briefing = False
+            if not brief.objective:
+                print(ux.tint("bold", "What's the mission?"))
+                print(ux.tint("dim",
+                              "  one sentence — what should be true when we stop?"))
+                objective = ux.ask("  objective")
+                while not objective:
+                    objective = ux.ask("  objective (required)")
+                brief = __import__("dataclasses").replace(
+                    brief, objective=objective,
+                    kinds=classify_mission(objective) or ["general"])
+
+    if web_launched:
+        pass
+    elif interactive and not args.yes and not args.no_start:
         confirmed = ux.review_loop(
             brief,
             engines=ENGINES,
@@ -2828,9 +2983,11 @@ def main(argv: list[str]) -> int:
     brief = __import__("dataclasses").replace(brief, model=model)
     launch = not args.no_start
     with collect_prep_notes() as prep_notes:
+        # Web launches keep the terminal quiet: gitignore is auto-added
+        # (the recommended default) instead of prompting behind the browser.
         _config, goal_path = scaffold_mission(
             target, brief.objective, brief.delivery, model=brief.model,
-            yes=bool(args.yes))
+            yes=bool(args.yes or web_launched))
     ux.prep_summary(brief, str(goal_path.relative_to(target)),
                     notes=prep_notes, launching=launch)
 
@@ -2849,11 +3006,34 @@ def main(argv: list[str]) -> int:
         print(f"error: engine '{brief.engine}' not on PATH — "
               f"install it or re-run and pick another (e).", file=sys.stderr)
         return 1
-    if want_zcomb:
-        if zcomb_mod is None:
-            _ensure_harness_path()
-            from absoloop_harness import zcomb as zcomb_mod
+    if zcomb_mod is None:
+        _ensure_harness_path()
+        from absoloop_harness import zcomb as zcomb_mod
+    # ZComb is the default monitor. Explicit --zcomb always wins; otherwise
+    # honor --watch or the gear-menu preference (ui-settings.json), and fall
+    # back to the terminal watcher when Node.js is unavailable. Non-TTY
+    # launches (CI, scripts) never auto-open a browser or terminal.
+    monitor_pref = "zcomb"
+    try:
+        monitor_pref = zcomb_mod.monitor_preference(target)
+    except Exception:
+        pass
+    node_ok = bool(shutil.which("node") and shutil.which("npm"))
+    use_zcomb = want_zcomb or (interactive and not args.watch
+                               and monitor_pref != "watch" and node_ok)
+    if use_zcomb:
         zcomb_mod.spawn_background(target)
+    elif interactive:
+        if not node_ok and not args.watch and monitor_pref != "watch":
+            print("  note: Node.js 18+ not found — using the terminal watcher "
+                  "(install node for the ZComb UI)")
+        # Watcher mode: pop the live terminal dashboard alongside the loop.
+        opened = zcomb_mod.open_watcher_terminal(target)
+        if opened.get("ok"):
+            print("  Watcher → opened 'absoloop watch' in a new terminal")
+        else:
+            print(f"  live view: run 'absoloop watch -C {target}' "
+                  "in another terminal")
     return start_loop(target, brief.engine, brief.model, announce=False)
 
 

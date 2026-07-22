@@ -23,19 +23,33 @@ objective ──► /goal contract ──► iterate: builder works, reports don
 | **Bounded** | Hard caps on iterations, wall clock, and dollars, with checkpointed state you can resume or extend. |
 | **Engine-agnostic** | The same mission runs under `claude`, `codex`, or `grok`. |
 | **Two-layer teams** | Absoloop spawns the builder/critic CLI; that process fans out with native Agent Teams / subagents when workstreams are independent. |
-| **Observable** | Console stream + `.absoloop/tmp/monitor.json` + `live.jsonl`, rendered by `absoloop watch` or the optional ZComb Kanban. |
+| **Observable** | Console stream + `.absoloop/tmp/monitor.json` + `live.jsonl`, rendered by the ZComb Kanban (default) or `absoloop watch`. |
 
 ## Mission Briefing
 
 ```bash
-absoloop "Make all tests pass"     # objective-first; review; Enter launches
-absoloop                           # prompt for objective, then review
+absoloop "Make all tests pass"     # objective-first; review in the browser; Launch
+absoloop                           # opens the Launch window; fill in the objective there
 absoloop . -o "Fix the crash"      # adopt cwd with the same briefing
 absoloop my-mission -o "…" -y      # skip review, lock in and launch
 absoloop "…" --no-start            # scaffold only
+absoloop --cli                     # classic terminal briefing card instead
 ```
 
-Keys: `Enter` launch · `o` objective · `e` engine · `m` model ·
+Bare `absoloop` opens the **Launch window** in the ZComb UI — a two-step
+Mission Briefing in the browser:
+
+1. **Mission** — objective (one sentence) + project (`.` adopts the current
+   directory, a name creates a folder). Mission profile chips update live.
+2. **Launch** — engine (PATH-available marked), model, delivery, budgets →
+   **Launch mission**.
+
+The CLI waits in the terminal while you review; cancelling in the browser (or
+`Ctrl-C` in the terminal) scrubs the mission. The classic terminal card is
+still there via `--cli` (also used automatically with `--watch`, without
+Node.js, or when the gear-menu monitor preference is the terminal watcher).
+
+Terminal card keys: `Enter` launch · `o` objective · `e` engine · `m` model ·
 `d` delivery · `n` rename · `g` preview `/goal` · `q` abort.
 
 The briefing defaults each engine to its best available model (`best` for
@@ -157,16 +171,31 @@ absoloop report --terminal
 absoloop zcomb              # browser Kanban UI (Node.js 18+)
 ```
 
-`absoloop --zcomb` runs the same Mission Briefing / launch as bare `absoloop`,
-then opens the vendored [ZComb](https://github.com/BLERBZ/zcomb) dashboard.
-`absoloop zcomb` opens that dashboard alone (no new mission). Both bridge
-`monitor.json` + `live.jsonl` into `.absoloop/zcomb/state/` at
-`http://localhost:3141`.
+Bare `absoloop` / `absoloop new` runs the Mission Briefing / launch and opens
+the vendored [ZComb](https://github.com/BLERBZ/zcomb) dashboard by default
+(no extra flag needed). `absoloop zcomb` opens that dashboard alone (no new
+mission). Both bridge `monitor.json` + `live.jsonl` into
+`.absoloop/zcomb/state/` at `http://localhost:3141`.
+
+Prefer the classic terminal watcher? Launch with `absoloop --watch` (opens
+`absoloop watch` in a new terminal instead of the browser UI), or use the
+gear menu in the ZComb dashboard — its **Monitor** setting switches to the
+Watcher, which opens a terminal running `absoloop watch` and stays the
+default for new missions until switched back. The preference persists in
+`.absoloop/zcomb/ui-settings.json`.
 
 Full agent event streams persist as
 `iteration-NNNN-agent-result.stream.jsonl` / `.events.jsonl`.
 `absoloop report` regenerates `.absoloop/report.md` and opens
 `.absoloop/report.html`.
+
+When a mission stops with `BUDGET_EXHAUSTED` and the last agent run left no
+readable structured report (e.g. it was cut off by a limit mid-run), the
+runner allows one final read-only agent pass **beyond the mission budget** —
+bounded by the engine's critic limits — so the final report still describes
+what was actually accomplished. Its cost is added to the mission total, so
+the overrun is visible. Disable with `"report_beyond_budget": false` in
+`.absoloop/runtime.json`.
 
 ## On-disk layout (mission)
 
@@ -181,7 +210,7 @@ Full agent event streams persist as
   tmp/                    # live telemetry (gitignored)
     monitor.json
     live.jsonl
-  zcomb/state/            # optional Kanban bridge (when --zcomb / zcomb)
+  zcomb/state/            # Kanban bridge (default monitor; also `absoloop zcomb`)
 scripts/absoloop-run      # synced copy of templates/absoloop-run
 ```
 

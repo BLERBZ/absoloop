@@ -10,6 +10,14 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = Number(process.env.ZCOMB_PORT || process.env.PORT || 3141);
 
+/**
+ * Dashboard API version, reported via /api/health. The Absoloop launcher
+ * replaces (rather than retargets) running servers that report an older
+ * version, so UI builds never talk to a server missing newer endpoints.
+ * Bump whenever the REST surface changes (e.g. new endpoints like /api/monitor).
+ */
+const API_VERSION = 2;
+
 /** Mutable binding — retargetable when a new Absoloop run/project activates. */
 let STATE_DIR = resolve(
   process.env.ZCOMB_STATE_DIR || join(__dirname, 'state')
@@ -304,6 +312,58 @@ function saveLoopSettings({ theme, engine, model } = {}) {
 }
 
 /**
+ * Gear-menu monitor switch via the Python bridge. Persists the preference
+ * ('zcomb' | 'watch'); switching to 'watch' also opens a terminal window
+ * running `absoloop watch -C <project>`.
+ */
+function switchMonitor(monitor) {
+  const project = resolveProjectRoot();
+  const home = resolveAbsoloopHome();
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(
+      process.env.PYTHON || 'python3',
+      ['-c',
+        'import json\n'
+        + 'from pathlib import Path\n'
+        + 'from absoloop_harness.zcomb import switch_monitor\n'
+        + `project = Path(${JSON.stringify(project)})\n`
+        + `print(json.dumps(switch_monitor(project, ${JSON.stringify(monitor)})))\n`],
+      {
+        cwd: home,
+        env: process.env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      },
+    );
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.on('data', (chunk) => { stdout += chunk; });
+    child.stderr?.on('data', (chunk) => { stderr += chunk; });
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error('monitor switch timed out'));
+    }, 30_000);
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      try {
+        const line = stdout.trim().split('\n').filter(Boolean).pop() || '{}';
+        const result = JSON.parse(line);
+        if (code !== 0 && result.ok !== true) {
+          reject(new Error(result.error || stderr.trim() || `exit ${code}`));
+          return;
+        }
+        resolvePromise(result);
+      } catch (err) {
+        reject(new Error(stderr.trim() || err?.message || 'invalid monitor response'));
+      }
+    });
+  });
+}
+
+/**
  * Run an Absoloop CLI action against the bridged project.
  * Resume/extend are detached (long-running loop); approve/report/abort wait.
  */
@@ -435,6 +495,7 @@ app.get('/api/metrics', (_req, res) => {
 app.get('/api/health', (_req, res) => {
   res.json({
     ok: true,
+    apiVersion: API_VERSION,
     stateDir: STATE_DIR,
     project: resolveProjectRoot(),
     port: PORT,
@@ -562,6 +623,135 @@ app.post('/api/settings', async (req, res) => {
       error: err?.message || String(err),
     });
   }
+});
+
+/**
+ * Gear menu monitor switch — ZComb UI (default) or the terminal Watcher.
+ * Switching to 'watch' opens `absoloop watch` in a new terminal window.
+ */
+app.post('/api/monitor', async (req, res) => {
+  const project = resolveProjectRoot();
+  if (!existsSync(join(project, '.absoloop'))) {
+    res.status(400).json({
+      ok: false,
+      error: `No .absoloop/ under ${project} — not an Absoloop project`,
+    });
+    return;
+  }
+  const monitor = typeof req.body?.monitor === 'string'
+    ? req.body.monitor.trim().toLowerCase()
+    : '';
+  if (monitor !== 'zcomb' && monitor !== 'watch') {
+    res.status(400).json({
+      ok: false,
+      error: `Unknown monitor '${monitor}'. Allowed: zcomb, watch`,
+    });
+    return;
+  }
+  try {
+    const result = await switchMonitor(monitor);
+    if (result.ok) {
+      // Refresh bridged metrics so settings.monitor is current on next poll.
+      syncDashboardBridge();
+    }
+    res.status(result.ok ? 200 : 400).json(result);
+  } catch (err) {
+    res.status(500).json({
+      ok: false,
+      error: err?.message || String(err),
+    });
+  }
+});
+
+/**
+ * Web Mission Briefing (Launch modal) handshake.
+ *
+ * The Absoloop CLI writes `launch.json` (status: pending) into the state
+ * dir and touches `launch-heartbeat.json` while it waits. The UI polls
+ * GET /api/launch, renders the Launch modal, and POSTs the submission
+ * (or a cancel); the CLI picks it up and starts the loop.
+ */
+const LAUNCH_HEARTBEAT_STALE_MS = 15_000;
+
+function readLaunchState() {
+  const launch = readStateFile('launch.json');
+  if (!launch || typeof launch !== 'object') return { status: 'none' };
+  if (launch.status === 'pending') {
+    // A killed CLI must not leave a zombie modal — require a fresh heartbeat.
+    const beat = readStateFile('launch-heartbeat.json');
+    const beatMs = Number(beat?.ts || 0) * 1000;
+    if (!beatMs || Date.now() - beatMs > LAUNCH_HEARTBEAT_STALE_MS) {
+      return { ...launch, status: 'stale' };
+    }
+  }
+  return launch;
+}
+
+app.get('/api/launch', (_req, res) => {
+  res.json(readLaunchState());
+});
+
+app.post('/api/launch', (req, res) => {
+  const action = String(req.body?.action || '').toLowerCase();
+  const current = readLaunchState();
+
+  if (action === 'cancel') {
+    if (current.status === 'pending') {
+      writeStateFile('launch.json', {
+        ...current,
+        status: 'cancelled',
+        ts: Date.now() / 1000,
+      });
+    }
+    res.json({ ok: true, status: 'cancelled' });
+    return;
+  }
+
+  if (action !== 'submit') {
+    res.status(400).json({
+      ok: false,
+      error: `Unknown launch action '${action}'. Allowed: submit, cancel`,
+    });
+    return;
+  }
+  if (current.status !== 'pending') {
+    res.status(409).json({
+      ok: false,
+      error: `No pending launch request (status: ${current.status})`,
+    });
+    return;
+  }
+
+  const body = req.body?.submission || {};
+  const objective = typeof body.objective === 'string' ? body.objective.trim() : '';
+  if (!objective) {
+    res.status(400).json({ ok: false, error: 'Objective is required' });
+    return;
+  }
+  const projectName = typeof body.projectName === 'string' && body.projectName.trim()
+    ? body.projectName.trim()
+    : '.';
+  if (projectName !== '.' && !/^[A-Za-z0-9._-]+$/.test(projectName)) {
+    res.status(400).json({
+      ok: false,
+      error: 'Project name must be letters/numbers/._- or "."',
+    });
+    return;
+  }
+  const submission = {
+    objective,
+    projectName,
+    engine: typeof body.engine === 'string' ? body.engine.trim() : '',
+    model: typeof body.model === 'string' ? body.model.trim() : '',
+    delivery: typeof body.delivery === 'string' ? body.delivery.trim() : '',
+  };
+  writeStateFile('launch.json', {
+    ...current,
+    status: 'submitted',
+    ts: Date.now() / 1000,
+    submission,
+  });
+  res.json({ ok: true, status: 'submitted', submission });
 });
 
 // Mission quick actions → absoloop approve | resume | extend | report | abort

@@ -8,6 +8,7 @@ import { MissionControls, triggerAction } from './components/MissionControls';
 import { ObjectiveDropdown } from './components/ObjectiveDropdown';
 import { RunResultsPanel } from './components/RunResultsPanel';
 import { SettingsMenu } from './components/SettingsMenu';
+import { LaunchModal, useLaunch } from './components/LaunchModal';
 import { matchesActivityFilter } from './components/ActivityFeed';
 import { ViewModeToggle, type ViewMode } from './components/compact/ViewModeToggle';
 import { CompactMonitor } from './components/compact/CompactMonitor';
@@ -216,6 +217,20 @@ export default function App() {
   const [extendError, setExtendError] = useState<string | null>(null);
   const extendInputRef = useRef<HTMLTextAreaElement | null>(null);
   const frozenElapsedEnd = useRef<Record<string, number>>({});
+
+  // Web Mission Briefing — pending launch requests from the CLI open the
+  // Launch modal; once the CLI confirms the launch, flip to STARTING.
+  const { launch } = useLaunch();
+  const launchVisible = !IS_COMPACT_WINDOW
+    && (launch.status === 'pending' || launch.status === 'submitted')
+    && Boolean(launch.request);
+  const prevLaunchStatus = useRef<string>('');
+  useEffect(() => {
+    if (prevLaunchStatus.current === 'submitted' && launch.status === 'launched') {
+      markRunRestarting();
+    }
+    prevLaunchStatus.current = String(launch.status || '');
+  }, [launch.status, markRunRestarting]);
 
   const toggleAgents = () => setAgentsOpen(open => {
     localStorage.setItem('zc-panel-agents', open ? '0' : '1');
@@ -1166,6 +1181,14 @@ export default function App() {
         onRunRestarting={markRunRestarting}
         onRefresh={refreshNow}
         windowed={IS_COMPACT_WINDOW}
+      />
+    )}
+
+    {launchVisible && (
+      <LaunchModal
+        key={`launch-${launch.ts || 0}`}
+        launch={launch}
+        darkMode={darkMode}
       />
     )}
     </>

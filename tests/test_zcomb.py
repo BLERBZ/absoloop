@@ -1408,6 +1408,8 @@ class DashboardAttachTests(unittest.TestCase):
             state_dir = project / ".absoloop" / "zcomb" / "state"
             state_dir.mkdir(parents=True)
             with mock.patch.object(zcomb, "_port_in_use", return_value=True), \
+                 mock.patch.object(zcomb, "_dashboard_api_version",
+                                   return_value=zcomb.DASHBOARD_API_VERSION), \
                  mock.patch.object(zcomb, "retarget_dashboard",
                                    return_value=True) as retarget, \
                  mock.patch.object(zcomb, "stop_dashboard") as stop, \
@@ -1427,6 +1429,8 @@ class DashboardAttachTests(unittest.TestCase):
             state_dir.mkdir(parents=True)
             fake = mock.Mock()
             with mock.patch.object(zcomb, "_port_in_use", return_value=True), \
+                 mock.patch.object(zcomb, "_dashboard_api_version",
+                                   return_value=zcomb.DASHBOARD_API_VERSION), \
                  mock.patch.object(zcomb, "retarget_dashboard",
                                    return_value=False), \
                  mock.patch.object(zcomb, "stop_dashboard",
@@ -1437,6 +1441,30 @@ class DashboardAttachTests(unittest.TestCase):
                 proc, status = zcomb.ensure_dashboard(project, state_dir, 3141)
             self.assertIs(proc, fake)
             self.assertEqual(status, "restarted")
+            stop.assert_called_once_with(3141)
+            start.assert_called_once()
+
+    def test_ensure_dashboard_restarts_stale_api_version_server(self):
+        """Health-up but older API version → replace instead of retarget,
+        so the UI never 404s on newer endpoints (e.g. /api/monitor)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            state_dir = project / ".absoloop" / "zcomb" / "state"
+            state_dir.mkdir(parents=True)
+            fake = mock.Mock()
+            with mock.patch.object(zcomb, "_port_in_use", return_value=True), \
+                 mock.patch.object(zcomb, "_dashboard_api_version",
+                                   return_value=0), \
+                 mock.patch.object(zcomb, "retarget_dashboard") as retarget, \
+                 mock.patch.object(zcomb, "stop_dashboard",
+                                   return_value=True) as stop, \
+                 mock.patch.object(zcomb, "start_server",
+                                   return_value=fake) as start, \
+                 mock.patch.object(zcomb, "wait_ready", return_value=True):
+                proc, status = zcomb.ensure_dashboard(project, state_dir, 3141)
+            self.assertIs(proc, fake)
+            self.assertEqual(status, "restarted")
+            retarget.assert_not_called()
             stop.assert_called_once_with(3141)
             start.assert_called_once()
 
@@ -1500,6 +1528,104 @@ class LoopSettingsTests(unittest.TestCase):
                 result = zcomb.save_loop_settings(project, engine="grok")
             self.assertFalse(result["ok"])
             self.assertIn("not available", result["error"])
+
+
+class WebBriefingTests(unittest.TestCase):
+    """Launch-modal handshake: launch.json request/response in the state dir."""
+
+    def test_launch_state_roundtrip_and_status_updates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = pathlib.Path(tmp)
+            zcomb.write_launch_state(state_dir, {
+                "status": "pending",
+                "request": {"objective": "", "engine": "claude"},
+            })
+            data = zcomb.read_launch_state(state_dir)
+            self.assertEqual(data["status"], "pending")
+            self.assertEqual(data["request"]["engine"], "claude")
+
+            zcomb.mark_launch_status(state_dir, "launched")
+            data = zcomb.read_launch_state(state_dir)
+            self.assertEqual(data["status"], "launched")
+            # Request payload survives status flips.
+            self.assertEqual(data["request"]["engine"], "claude")
+
+    def test_wait_returns_submission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = pathlib.Path(tmp)
+            zcomb.write_launch_state(state_dir, {
+                "status": "submitted",
+                "submission": {"objective": "Ship it", "engine": "codex"},
+            })
+            outcome = zcomb.wait_for_web_briefing(state_dir, poll=0.01)
+            self.assertEqual(outcome["status"], "submitted")
+            self.assertEqual(outcome["submission"]["objective"], "Ship it")
+
+    def test_wait_returns_cancelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = pathlib.Path(tmp)
+            zcomb.write_launch_state(state_dir, {"status": "cancelled"})
+            outcome = zcomb.wait_for_web_briefing(state_dir, poll=0.01)
+            self.assertEqual(outcome["status"], "cancelled")
+
+    def test_wait_errors_when_request_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = pathlib.Path(tmp)
+            # No launch.json at all — e.g. state dir wiped underneath us.
+            outcome = zcomb.wait_for_web_briefing(state_dir, poll=0.01)
+            self.assertEqual(outcome["status"], "error")
+
+    def test_wait_touches_heartbeat_while_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = pathlib.Path(tmp)
+            zcomb.write_launch_state(state_dir, {"status": "pending"})
+
+            beat_path = state_dir / zcomb.LAUNCH_HEARTBEAT_NAME
+            original_touch = zcomb.touch_launch_heartbeat
+
+            def touch_then_submit(sd):
+                original_touch(sd)
+                zcomb.write_launch_state(sd, {
+                    "status": "submitted",
+                    "submission": {"objective": "go"},
+                })
+
+            with mock.patch.object(zcomb, "touch_launch_heartbeat",
+                                   side_effect=touch_then_submit):
+                outcome = zcomb.wait_for_web_briefing(state_dir, poll=0.01)
+            self.assertEqual(outcome["status"], "submitted")
+            self.assertTrue(beat_path.is_file())
+
+    def test_begin_web_briefing_writes_request_and_opens_browser(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            _write(project / ".absoloop" / "runtime.json",
+                   {"objective": "x", "max_iterations": 1})
+            request = {"objective": "x", "engine": "claude"}
+            with mock.patch.object(zcomb, "ensure_dashboard_built"), \
+                 mock.patch.object(zcomb, "ensure_dashboard",
+                                   return_value=(None, "started")), \
+                 mock.patch.object(zcomb, "open_browser") as opened:
+                state_dir = zcomb.begin_web_briefing(project, request)
+            self.assertIsNotNone(state_dir)
+            data = zcomb.read_launch_state(state_dir)
+            self.assertEqual(data["status"], "pending")
+            self.assertEqual(data["request"], request)
+            self.assertTrue((state_dir / zcomb.LAUNCH_HEARTBEAT_NAME).is_file())
+            opened.assert_called_once()
+
+    def test_begin_web_briefing_reports_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = pathlib.Path(tmp)
+            with mock.patch.object(zcomb, "ensure_dashboard_built"), \
+                 mock.patch.object(zcomb, "ensure_dashboard",
+                                   return_value=(None, "failed")), \
+                 mock.patch.object(zcomb, "open_browser") as opened:
+                state_dir = zcomb.begin_web_briefing(project, {})
+            self.assertIsNone(state_dir)
+            opened.assert_not_called()
+            data = zcomb.read_launch_state(zcomb.project_state_dir(project))
+            self.assertEqual(data["status"], "error")
 
 
 if __name__ == "__main__":

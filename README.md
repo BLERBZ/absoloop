@@ -62,7 +62,7 @@ your ledger.
 | **Hard budgets** | Iterations, wall clock, and dollars — resume or extend anytime. |
 | **Provider-native** | Grok Build, Claude Code, and Codex keep their own auth, tools, and sessions. |
 | **Two-layer teams** | Absoloop owns outer orchestration; each builder fans out with native Agent Teams / subagents. |
-| **Observable** | Live stream + `watch` + optional ZComb Kanban (`--zcomb`) + Markdown report. |
+| **Observable** | ZComb Kanban UI opens by default on launch (terminal `watch` via `--watch` or the gear menu) + Markdown report. |
 | **Stdlib-first** | Core CLI + runner: Python 3.9+, zero pip deps to install. |
 
 <p align="center">
@@ -100,16 +100,19 @@ in the same session. Re-run anytime with `absoloop setup --force`.
 
 ```bash
 absoloop doctor                    # health check anytime
-absoloop "Make all tests pass"     # Mission Briefing → review card → Enter
+absoloop "Make all tests pass"     # Mission Briefing → browser Launch window → go
 ```
 
-**Mission Briefing keys:** `Enter` launch · `o` objective · `e` engine ·
-`m` model · `d` delivery · `n` rename · `g` preview `/goal` · `q` abort ·
-`-y` skip review.
+The Mission Briefing opens as a two-step **Launch window** in the ZComb UI:
+objective + project, then engine · model · delivery → **Launch mission**.
+Prefer the terminal card? `absoloop --cli` keeps the classic flow
+(**keys:** `Enter` launch · `o` objective · `e` engine · `m` model ·
+`d` delivery · `n` rename · `g` preview `/goal` · `q` abort ·
+`-y` skip review).
 
 ```bash
 absoloop status · watch · report   # see, stream, then open the report viewer
-absoloop --zcomb                   # same briefing/launch as absoloop + ZComb UI
+absoloop --watch                   # launch with the terminal watcher instead of the UI
 absoloop zcomb                     # browser Kanban for a running mission
 absoloop approve                   # accept at the human gate
 absoloop reject "use the v2 API"   # steer the next iteration
@@ -203,20 +206,29 @@ absoloop report    # regenerates report.md + opens lite infographic viewer
                    #   --terminal · --no-open · --md-only
 ```
 
-#### ZComb Kanban UI (optional)
+#### ZComb Kanban UI (default monitor)
 
 Browser dashboard with agent cards, Kanban board, and activity feed — vendored
 from [ZComb](https://github.com/BLERBZ/zcomb). Requires **Node.js 18+**.
+Bare `absoloop` / `absoloop new` opens it automatically on launch — no extra
+flag or command needed.
 
 ```bash
-absoloop --zcomb                       # same briefing/launch as absoloop + Kanban
-absoloop "Make all tests pass" --zcomb # objective + launch with Kanban UI
+absoloop                               # briefing/launch — ZComb UI opens by default
+absoloop "Make all tests pass"         # objective + launch, ZComb UI opens
 absoloop zcomb -C ./my-mission         # dashboard only (monitor a running mission)
+absoloop --watch                       # prefer the classic terminal watcher instead
 ```
 
 On launch, opens [http://localhost:3141](http://localhost:3141) and bridges
 `.absoloop/tmp/monitor.json` + `live.jsonl` into `.absoloop/zcomb/state/`.
 Use `absoloop zcomb` anytime to open the dashboard without starting a mission.
+
+**Switching monitors:** the gear menu in the UI has a **Monitor** setting —
+picking *Watcher (CLI)* opens `absoloop watch` in a new terminal and makes the
+watcher the default for new missions (persisted in
+`.absoloop/zcomb/ui-settings.json`) until you switch back. `--zcomb` still
+forces the UI for a single launch; `--watch` does the same for the watcher.
 Details: [`zcomb/README.md`](zcomb/README.md) · [`docs/mission-loop.md`](docs/mission-loop.md).
 
 Telemetry lives under `.absoloop/tmp/` while running; the ledger and
@@ -229,7 +241,7 @@ bin/absoloop                 Public CLI (mission briefing + harness entry)
 bin/absoloop_logo.py         Terminal infinity mark
 absoloop_harness/            Multi-provider harness, briefing UX, report viewer,
                              shortcuts, schedules, ZComb bridge
-zcomb/                       Optional Kanban UI (vendored from BLERBZ/zcomb)
+zcomb/                       Default Kanban UI (vendored from BLERBZ/zcomb)
 templates/absoloop-run       Reference loop runner (copied into projects)
 templates/skills/            Loopers-toolbox skill pack
 tests/                       Characterization + harness suites

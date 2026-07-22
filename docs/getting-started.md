@@ -11,7 +11,7 @@ one; prefer the wizard over hand-editing config.
 | **Python 3.9+** | Stdlib only for the CLI and mission runner — no `pip install` |
 | **At least one provider CLI** | `grok`, `claude`, and/or `codex` on `PATH` and logged in |
 | **Git** | Recommended for missions; **required** for harness worktree isolation |
-| **Node.js 18+** | Optional — only for the ZComb Kanban UI |
+| **Node.js 18+** | Recommended — powers the ZComb Kanban UI, the default mission monitor (without it, launches fall back to the terminal watcher) |
 
 ## 1. Install Absoloop on PATH
 
@@ -78,7 +78,14 @@ without reading credential file contents.
 absoloop "Make all tests pass"
 ```
 
-Review the Mission Briefing card → **Enter** launches. Keys:
+The **Launch window** opens in your browser — a two-step Mission Briefing:
+
+1. **Mission** — objective + project (`.` = this directory).
+2. **Launch** — engine · model · delivery, then **Launch mission**.
+
+The CLI waits while you review; cancel in the browser (or `Ctrl-C` in the
+terminal) to scrub. Prefer the terminal? `absoloop --cli` shows the classic
+briefing card instead:
 
 | Key | Action |
 |---|---|
@@ -91,21 +98,28 @@ Review the Mission Briefing card → **Enter** launches. Keys:
 | `g` | Preview `/goal` contract |
 | `q` | Abort |
 
-Skip the card with `-y`. Scaffold only with `--no-start`.
+Skip review entirely with `-y`. Scaffold only with `--no-start`.
 
 ## 5. While it runs / after
 
+The ZComb Kanban UI opens in your browser automatically when the mission
+launches ([http://localhost:3141](http://localhost:3141)) — that's the default
+monitor, no extra command needed.
+
 ```bash
 absoloop watch     # live terminal dashboard
-absoloop zcomb     # browser Kanban UI for a running mission (Node.js 18+)
+absoloop zcomb     # re-open the browser Kanban UI for a running mission
 absoloop status    # snapshot + next command
 absoloop report    # Markdown + lite viewer
 absoloop approve   # accept at the human gate
 absoloop reject "guidance for the next iteration"
 ```
 
-Tip: `absoloop --zcomb` (or `absoloop "…" --zcomb`) runs the same Mission
-Briefing / launch as bare `absoloop`, then opens the Kanban alongside the loop.
+Prefer the terminal? Launch with `absoloop --watch` to open the classic
+watcher in a new terminal instead of the browser UI, or use the gear menu in
+the ZComb dashboard (**Monitor → Watcher (CLI)**) — that opens `absoloop
+watch` in a terminal and stays your default for new missions until you switch
+back.
 
 Exit codes from the runner: `0` completed · `3` awaiting approval ·
 `2` stopped safely (budget / abort / blocked).
