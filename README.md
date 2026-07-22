@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/absoloop-logo.png" alt="Absoloop" width="420" />
+  <img src="docs/assets/AbsoLoopOS.gif" alt="Absoloop" width="420" />
 </p>
 
 <h1 align="center">Absoloop</h1>
